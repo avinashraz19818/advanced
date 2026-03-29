@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+VENV=".venv"
+APP="advanced.py"
+LOGFILE="bot.log"
+PIDFILE="bot.pid"
+
+if [[ "${1-}" == "logs" || "${1-}" == "log" ]]; then
+  if [ ! -f "$LOGFILE" ]; then
+    echo "No log file yet: $LOGFILE"
+    exit 0
+  fi
+  exec tail -f "$LOGFILE"
+fi
+
+stop_existing() {
+  if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE" || true)
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+      kill "$OLD_PID" || true
+      sleep 2
+      if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill -9 "$OLD_PID" || true
+      fi
+    fi
+    rm -f "$PIDFILE"
+  fi
+
+  for p in $(pgrep -f ".*${VENV}/bin/python3.*$APP|python.*$APP" || true); do
+    kill "$p" || true
+    sleep 1
+    if kill -0 "$p" 2>/dev/null; then
+      kill -9 "$p" || true
+    fi
+  done
+}
+
+ensure_venv() {
+  if [ -d "$VENV" ]; then
+    if [ ! -x "$VENV/bin/python3" ] || ! "$VENV/bin/python3" --version >/dev/null 2>&1; then
+      mv "$VENV" "${VENV}_broken_$(date +%s)"
+    fi
+  fi
+
+  if [ ! -d "$VENV" ]; then
+    python3 -m venv "$VENV"
+  fi
+
+  . "$VENV/bin/activate"
+
+  if [ -f "requirements.txt" ]; then
+    "$VENV/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
+    "$VENV/bin/pip" install -r requirements.txt >/dev/null 2>&1 || true
+  fi
+}
+
+start_bot() {
+  nohup "$VENV/bin/python3" "$APP" > "$LOGFILE" 2>&1 &
+  BOT_PID=$!
+  echo "$BOT_PID" > "$PIDFILE"
+  sleep 5
+  if ! ps -p "$BOT_PID" > /dev/null 2>&1; then
+    tail -30 "$LOGFILE" || true
+    rm -f "$PIDFILE"
+    exit 1
+  fi
+}
+
+stop_existing
+ensure_venv
+start_bot
+
+echo "Bot started in background (pid $(cat "$PIDFILE")). Logs: $LOGFILE"
