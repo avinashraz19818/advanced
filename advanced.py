@@ -36,8 +36,8 @@ from telegram.constants import ParseMode
 
 # ================= CONFIG =================
 MAIN_BOT_TOKEN = "7687421668:AAF3h5GTbqBUVZoXe6OExF5NV3dUwjy5WoU"
-ADMIN_USER_ID = 6484788124
-ADMIN_USERNAME = "@aviii56"
+ADMIN_USER_ID = 8089603563
+ADMIN_USERNAME = "@aviii566"
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
 if _ADMIN_IDS_RAW:
@@ -71,31 +71,162 @@ def _cleanup_support_maps():
             store.pop(k, None)
 
 # ================= PREMIUM EMOJI MAPPING =================
+# Map of emoji to premium ID
 PREMIUM_EMOJI_MAP = {
-    "👋": "5413694143601842851",
-    "🎁": "5449800250032143374",
-    "⭐️": "5924870095925942277",
-    "🔥": "5402406965252989103",
-    "👑": "5431505596316665041",
-    "💎": "5427168083074628963",
-    "💰": "5224257782013769471",
-    "✅": "5336985409220001678",
-    "‼️": "5440660757194744323",
-    "🔒": "5296369303661067030",
-    "✨": "5463297803235113601",
-    "🚀": "5406966974980828470",
-    "🔔": "5458603043203327669",
-    "🔘": "5210708311246126137",
-    "🔽": "5192680362114830442",
-    "🥳": "5355129313878353723",
-    "🤖": "5287684458881756303",
-    "📊": "5231200819986047254",
-    "📞": "5201990176175299013",
-    "👉": "5397582299640375552",
-    "✔️": "5206607081334906820",
-    "📇": "5332724926216428039",
-    "✈️": "5364125616801073577",
-    "⚡️": "5456140674028019486",
+    "❤️‍🔥": "5042225965518816316",
+    "👀": "5039623284056917259",
+    "⚡️": "5042334757040423886",
+    "🔮": "5042302287087666158",
+    "🎁": "5041975203853239332",
+    "🆒": "5039686583284925280",
+    "🥂": "5039774728898741491",
+    "💀": "5042209657527993345",
+    "🔔": "5042111805288089118",
+    "⭐️": "5042176294222037888",
+    "🥸": "5039645755325809616",
+    "📍": "5039775669496579510",
+    "🆗": "5042020176455795565",
+    "🎄": "5039670898064360513",
+    "☃️": "5039936198194234403",
+    "🍪": "5040071919160788440",
+    "🛷": "5042298743739647195",
+    "💎": "5042050649248760772",
+    "🗿": "5040045238823945201",
+    "➡️": "5042341817966658405",
+    "🪩": "5039670228049462451",
+    "👁": "5039984684080038649",
+    "🧝": "5039531487720899631",
+    "🗣️": "5039643534827717738",
+    "🛡": "5042328396193864923",
+    "💙": "5039560388555834382",
+    "🔗": "5042101437237036298",
+    "🧠": "5040030395416969985",
+    "👑": "5039727497143387500",
+    "ℹ️": "5042306247047513767",
+    "👍": "5039544445637231745",
+    "💯": "5042297717242463211",
+    "🐦‍⬛️": "5041866884778034602",
+    "🔝": "5042102141611672423",
+    "😥": "5040018571372004272",
+    "‼️": "5042003580702164014",
+    "🍾": "5042274086332400375",
+    "🪅": "5039685805895844805",
+    "🤭": "5039607036195636113",
+    "🌕": "5039727604517570274",
+    "▶️": "5039753786638205957",
+    "☄️": "5041992177563993101",
+    "🚗": "5039955091755369148",
+    "⚠️": "5039665997506675838",
+    "🦌": "5040030124834030529",
+    "🍭": "5041902056265221148",
+    "☕": "5042264186432783816",
+    "🌲": "5039849968135832729",
+    "🆕": "5041852827350074289",
+    "🍨": "5039790268090418048",
+    "🎤": "5039905162760553480",
+    "🕷": "5039542049045480714",
+    "✔️": "5039844895779455925",
+    "🚫": "5039671744172917707",
+    "🔽": "5042069744673358669",
+    "🧤": "5041833220824368077",
+    "🎀": "5039953030171067177",
+    "©": "5039810295522919687",
+    "🫐": "5041866717274309621",
+    "🗑": "5039614900280754969",
+    "🦄": "5041857809512137718",
+    "🌙": "5041906342642582678",
+    "💬": "5040036030414062506",
+    "🎩": "5042329873662609701",
+    "❌": "5040042498634810056",
+    "💫": "5042200814190330758",
+    "🟢": "5039928501612839813",
+    "⚰️": "5039808607600771831",
+    "🧦": "5039785612345869872",
+    "💵": "5040025580758631490",
+    "🧹": "5039751080808809534",
+    "🔄": "5041837837914211014",
+    "🔴": "5042042652019655612",
+    "👋": "5040033797031070992",
+    "🕯": "5041976440803820473",
+    "🌟": "5039555114335994885",
+    "🍲": "5041847450051019704",
+    "📊": "5042290883949495533",
+    "💰": "5039789890133296083",
+    "🙂": "5039613856603702817",
+    "🎉": "5039778134807806727",
+    "🌛": "5042180842592404417",
+    "🍃": "5042148333984941105",
+    "📣": "5041888071851705019",
+    "🌈": "5041955142060999726",
+    "🍽": "5039834781131474002",
+    "🍑": "5041988947748586361",
+    "📌": "5039600026809009149",
+    "💍": "5042151130008650810",
+    "🫦": "5039661745489052379",
+    "✨": "5040016479722931047",
+    "⛸": "5042179807505286093",
+    "👎": "5042067236412458007",
+    "🤡": "5042127383134470945",
+    "💌": "5041784013384057970",
+    "🔍": "5039649904264217620",
+    "🪦": "5042303713016808496",
+    "⏸": "5042036407137207122",
+    "🔼": "5041845079229072486",
+    "💋": "5041921924783932671",
+    "🥶": "5041892104825996365",
+    "☠️": "5042167377869932162",
+    "❓": "5042094496569885750",
+    "🗓": "5039534051816375152",
+    "🎙": "5041798349984891898",
+    "📉": "5039759318556083411",
+    "😂": "5042169306310247330",
+    "💐": "5039778826297542004",
+    "➕": "5039891861246838069",
+    "💃": "5039960709572592619",
+    "🛍": "5039730920232322000",
+    "🌺": "5042005857034831000",
+    "🌩": "5039980479307055915",
+    "😱": "5042125029492392868",
+    "🦋": "5042131347389285520",
+    "🍄": "5041978437963613455",
+    "🌐": "5042186567783809934",
+    "🔥": "5039644681583985437",
+    "😵‍💫": "5040032289497547835",
+    "❗": "5040034664614462519",
+    "👅": "5039927453640819586",
+    "💡": "5042264341051605743",
+    "✅": "5039793437776282663",
+    "💝": "5042148626042717135",
+    "🎏": "5039725422674183126",
+    "🧶": "5042077862161548006",
+    "🎆": "5039865760730579942",
+    "💕": "5040071927750722576",
+    "🪟": "5042223702071050992",
+    "💩": "5039586205604250698",
+    "🧩": "5039673964671009665",
+    "❄️": "5039672577396573147",
+    "🚩": "5042289131602838715",
+    "🔖": "5039826874096681939",
+    "🏡": "5042022053356504092",
+    "🖥": "5039579582764680065",
+    "📈": "5039808285478224750",
+    "❤️": "5040072842578756396",
+    "💖": "5039643719511311434",
+    "🍰": "5042314635118642120",
+    "🧸": "5042192219960771668",
+    "👈": "5042156073516008537",
+    "🦴": "5041858483822003471",
+    "🧪": "5039551936060195684",
+    "👼": "5042027727008301916",
+    "👻": "5042097984083330584",
+    "🥳": "5041869131045929880",
+    "🐸": "5042295196096662988",
+    "🐈‍⬛": "5039653765439816618",
+    "🍬": "5042271178639541327",
+    "🤫": "5042062739581699323",
+    "🎈": "5039532814865794117",
+    "🎶": "5039771357349413873",
+    "🌹": "5039850573726221609",
 }
 
 # ================= DATABASE =================
@@ -233,10 +364,6 @@ class Database:
     def remove_user_bot(self, user_id):
         try:
             self.mongo.user_bots.delete_many({"user_id": user_id})
-            self.mongo.user_bot_channels.delete_many({"user_id": user_id})
-            self.mongo.user_bot_messages.delete_many({"user_id": user_id})
-            self.mongo.join_requests.delete_many({"owner_user_id": user_id})
-            self.mongo.reachable_users.delete_many({"owner_user_id": user_id})
         except Exception as ex:
             logging.error(f"Error removing user bot for {user_id}: {ex}")
 
@@ -251,6 +378,27 @@ class Database:
             logging.error(f"Error getting subscription for {user_id}: {ex}")
         return None
 
+    def get_all_subscriptions(self):
+        """Get all subscriptions with user info."""
+        results = []
+        try:
+            for sub in self.mongo.subscriptions.find({}):
+                user = self.mongo.users.find_one({"user_id": sub.get("user_id")}) or {}
+                bot = self.mongo.user_bots.find_one({"user_id": sub.get("user_id")}) or {}
+                results.append({
+                    "user_id": sub.get("user_id"),
+                    "username": user.get("username", ""),
+                    "first_name": user.get("first_name", ""),
+                    "subscription_type": sub.get("subscription_type"),
+                    "expiry_date": sub.get("expiry_date"),
+                    "max_channels": sub.get("max_channels"),
+                    "bot_username": bot.get("bot_username", ""),
+                    "bot_active": bot.get("is_active", 0),
+                })
+        except Exception as ex:
+            logging.error(f"Error get_all_subscriptions: {ex}")
+        return results
+
     def add_subscription(self, user_id, sub_type, days):
         try:
             expiry = (datetime.now() + timedelta(days=days)).isoformat()
@@ -263,6 +411,7 @@ class Database:
                  "$setOnInsert": {"created_at": datetime.utcnow().isoformat()}},
                 upsert=True
             )
+            logging.info(f"✅ Added/Updated subscription for user {user_id}: {sub_type}, expires {expiry}")
         except Exception as ex:
             logging.error(f"Error adding subscription for {user_id}: {ex}")
 
@@ -386,6 +535,7 @@ class Database:
     def add_message(self, user_id, channel_id, text, media_id, media_type, media_group_id=None):
         try:
             msg_id = self._next_id("user_bot_messages")
+            # Store the raw text exactly as received
             self.mongo.user_bot_messages.insert_one({
                 "_id": msg_id, "user_id": user_id, "channel_id": channel_id,
                 "content_text": text, "media_id": media_id, "media_type": media_type,
@@ -670,34 +820,80 @@ db = Database()
 user_bot_applications: Dict[int, Application] = {}
 
 
-# ================= PREMIUM TEXT PROCESSING =================
-def process_text_to_premium(raw_text: str, entities: Optional[List[MessageEntity]] = None) -> str:
+# ================= PREMIUM EMOJI PROCESSING =================
+def extract_custom_emoji_entities(text: str, entities: Optional[List[MessageEntity]] = None) -> Dict[str, str]:
     """
-    Convert raw text to HTML with premium emoji tags.
-    Properly handles both custom emoji entities and standard emojis.
+    Extract custom emoji entities and return a mapping of emoji character to premium ID.
+    This preserves the user's original premium emojis.
     """
-    if not raw_text:
-        return ""
+    if not entities:
+        return {}
+    
+    custom_emoji_map = {}
+    for entity in entities:
+        if entity.type == "custom_emoji":
+            emoji_char = text[entity.offset:entity.offset + entity.length]
+            custom_emoji_map[emoji_char] = entity.custom_emoji_id
+    
+    return custom_emoji_map
 
-    # First, handle custom emoji entities (if any)
-    if entities:
-        # Sort entities by offset descending to avoid index shifting
-        sorted_entities = sorted(entities, key=lambda e: e.offset, reverse=True)
-        processed = raw_text
-        for entity in sorted_entities:
-            if entity.type == "custom_emoji":
-                emoji_char = processed[entity.offset:entity.offset + entity.length]
-                premium_tag = f'<tg-emoji emoji-id="{entity.custom_emoji_id}">{emoji_char}</tg-emoji>'
-                processed = processed[:entity.offset] + premium_tag + processed[entity.offset + entity.length:]
-        raw_text = processed
 
-    # Then handle standard emojis from mapping
-    result = raw_text
-    for emoji_char, premium_id in PREMIUM_EMOJI_MAP.items():
-        # Replace all occurrences of the emoji
-        result = result.replace(emoji_char, f'<tg-emoji emoji-id="{premium_id}">{emoji_char}</tg-emoji>')
+def convert_to_premium_format(text: str, custom_emojis: Dict[str, str] = None) -> str:
+    """
+    Convert emojis to Telegram premium format for sending to end users.
+    Preserves user's custom premium emojis and converts standard emojis.
+    """
+    if not text:
+        return text
+    
+    result = text
+    
+    # First, handle user's custom premium emojis (preserve them as is with their IDs)
+    if custom_emojis:
+        for emoji_char, premium_id in custom_emojis.items():
+            # Wrap the emoji with tg-emoji tag using its original ID
+            premium_tag = f'<tg-emoji emoji-id="{premium_id}">{emoji_char}</tg-emoji>'
+            result = result.replace(emoji_char, premium_tag)
+    
+    # Then, convert standard emojis to premium format
+    # Sort by length descending to handle multi-character emojis correctly
+    sorted_emojis = sorted(PREMIUM_EMOJI_MAP.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    for emoji_char, premium_id in sorted_emojis:
+        # Skip if this emoji was already handled as custom
+        if custom_emojis and emoji_char in custom_emojis:
+            continue
+        premium_tag = f'<tg-emoji emoji-id="{premium_id}">{emoji_char}</tg-emoji>'
+        result = result.replace(emoji_char, premium_tag)
     
     return result
+
+
+def process_for_display(text: str, entities: Optional[List[MessageEntity]] = None) -> str:
+    """
+    Process text for display in bot control panel.
+    Shows emojis as normal (without conversion).
+    """
+    if not text:
+        return ""
+    
+    # Just return the raw text - no conversion needed for control panel
+    return text
+
+
+def process_for_sending(text: str, entities: Optional[List[MessageEntity]] = None) -> str:
+    """
+    Process text for sending to end users.
+    Converts emojis to premium format.
+    """
+    if not text:
+        return ""
+    
+    # Extract custom emoji IDs from entities (if provided)
+    custom_emojis = extract_custom_emoji_entities(text, entities) if entities else {}
+    
+    # Convert to premium format
+    return convert_to_premium_format(text, custom_emojis)
 
 
 # ================= HELPER FUNCTIONS =================
@@ -800,7 +996,6 @@ async def send_ephemeral_reply(msg, text: str, seconds: int = 2):
 
 
 def extract_media_from_msg(msg):
-    """Returns (media_id, media_type, text, entities)"""
     text = msg.text or msg.caption or ""
     entities = msg.entities or msg.caption_entities or []
     media_id = None
@@ -830,7 +1025,6 @@ def extract_media_from_msg(msg):
 
 
 def get_entities_from_message(msg):
-    """Return entities based on message type."""
     if msg.text:
         return msg.entities
     elif msg.caption:
@@ -839,38 +1033,36 @@ def get_entities_from_message(msg):
 
 
 async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
-                     text: str = "", markup=None):
-    """
-    Universal media sender with HTML formatting.
-    """
+                     text: str = "", markup=None, entities=None):
     bot = bot_or_context if isinstance(bot_or_context, Bot) else bot_or_context.bot
-
     kwargs = {}
     if markup:
         kwargs["reply_markup"] = markup
-
     try:
+        # Process text for sending - convert emojis to premium format
+        display_text = process_for_sending(text, entities) if text else None
+        
         if media_type == "photo":
-            await bot.send_photo(chat_id, media_id, caption=text or None, parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_photo(chat_id, media_id, caption=display_text, parse_mode=ParseMode.HTML, **kwargs)
         elif media_type == "video":
-            await bot.send_video(chat_id, media_id, caption=text or None, parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_video(chat_id, media_id, caption=display_text, parse_mode=ParseMode.HTML, **kwargs)
         elif media_type == "document":
-            await bot.send_document(chat_id, media_id, caption=text or None, parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_document(chat_id, media_id, caption=display_text, parse_mode=ParseMode.HTML, **kwargs)
         elif media_type == "animation":
-            await bot.send_animation(chat_id, media_id, caption=text or None, parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_animation(chat_id, media_id, caption=display_text, parse_mode=ParseMode.HTML, **kwargs)
         elif media_type == "audio":
-            await bot.send_audio(chat_id, media_id, caption=text or None, parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_audio(chat_id, media_id, caption=display_text, parse_mode=ParseMode.HTML, **kwargs)
         elif media_type == "voice":
-            await bot.send_voice(chat_id, media_id, caption=text or None, parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_voice(chat_id, media_id, caption=display_text, parse_mode=ParseMode.HTML, **kwargs)
         elif media_type == "sticker":
             await bot.send_sticker(chat_id, media_id)
-            if text:
-                await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, **kwargs)
+            if display_text:
+                await bot.send_message(chat_id, display_text, parse_mode=ParseMode.HTML, **kwargs)
         else:
-            await bot.send_message(chat_id, text or ".", parse_mode=ParseMode.HTML, **kwargs)
+            await bot.send_message(chat_id, display_text or ".", parse_mode=ParseMode.HTML, **kwargs)
     except Exception as ex:
         logging.error(f"send_media error: {ex}")
-        # Fallback without HTML
+        # Fallback without HTML parsing
         try:
             if media_type == "photo":
                 await bot.send_photo(chat_id, media_id, caption=text or None, **kwargs)
@@ -922,11 +1114,13 @@ def admin_kb():
          InlineKeyboardButton("🤖 Manage UserBots", callback_data="admin_userbots")],
         [InlineKeyboardButton("➕ Add UserBot", callback_data="admin_add_userbot"),
          InlineKeyboardButton("➕ Add Subscription", callback_data="admin_add_sub")],
+        [InlineKeyboardButton("📋 Subscription List", callback_data="admin_sub_list")],
         [InlineKeyboardButton("🔄 Check Expiry", callback_data="admin_check_expiry"),
          InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("🚀 Start All Userbots", callback_data="admin_start_all"),
-         InlineKeyboardButton("✈️ Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🔔 Send Reminders Now", callback_data="admin_send_reminders")],
+         InlineKeyboardButton("🛑 Stop All Userbots", callback_data="admin_stop_all")],
+        [InlineKeyboardButton("✈️ Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton("🔔 Send Reminders", callback_data="admin_send_reminders")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
     ])
 
@@ -964,7 +1158,6 @@ def userbot_kb(user_id: int):
 
 # ================= SUBSCRIPTION EXPIRY CHECK JOB =================
 async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
-    """Check for expired subscriptions and stop user bots."""
     expired_users = db.get_expired_subscriptions()
     for user_id in expired_users:
         bot_data = db.get_user_bot(user_id)
@@ -980,11 +1173,10 @@ async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
                     logging.error(f"Error stopping expired bot {user_id}: {ex}")
                 user_bot_applications.pop(user_id, None)
             db.set_user_bot_active(user_id, False)
-            
             try:
                 await context.bot.send_message(
                     user_id,
-                    process_text_to_premium("‼️ Your subscription has expired!\n\nYour bot has been paused.\n📞 Contact @aviii56 to renew and reactivate."),
+                    "‼️ Your subscription has expired!\n\nYour bot has been paused.\n📞 Contact @aviii566 to renew and reactivate.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("🔄 Renew Now", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}")
@@ -995,7 +1187,6 @@ async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def subscription_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every 12 hours. Sends reminders at 3 days and 1 day before expiry."""
     _cleanup_support_maps()
     for days_threshold in [3, 1]:
         expiring = db.get_expiring_subscriptions(days_threshold)
@@ -1008,7 +1199,7 @@ async def subscription_reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 if days_threshold == 3:
                     msg = (
                         f"🔔 Subscription Expiry Reminder\n\n"
-                        f"⭐ Plan: {sub_type}\n"
+                        f"⭐️ Plan: {sub_type}\n"
                         f"‼️ Your subscription expires in {days_left} days "
                         f"({expiry_dt.strftime('%d %b %Y')}).\n\n"
                         f"🔥 Renew now to avoid interruption!\n"
@@ -1017,16 +1208,15 @@ async def subscription_reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     msg = (
                         f"‼️ Last Day Reminder!\n\n"
-                        f"⭐ Plan: {sub_type}\n"
+                        f"⭐️ Plan: {sub_type}\n"
                         f"‼️ Your subscription expires TOMORROW "
                         f"({expiry_dt.strftime('%d %b %Y')})!\n\n"
                         f"🚀 Renew immediately to keep your bot running!\n"
                         f"📞 Contact {ADMIN_USERNAME} NOW."
                     )
-                processed_msg = process_text_to_premium(msg, None)
                 try:
                     await context.bot.send_message(
-                        user_id, processed_msg, parse_mode=ParseMode.HTML,
+                        user_id, msg, parse_mode=ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton(
                                 "🔄 Renew Subscription",
@@ -1197,7 +1387,7 @@ async def user_bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_uid = owner_uid if user.id == ADMIN_USER_ID and owner_uid else user.id
     await context.bot.send_message(
         user.id,
-        process_text_to_premium("🤖 Welcome to your Auto Join Request Bot!\n\n🔽 Use the buttons below to configure your bot."),
+        "🤖 Welcome to your Auto Join Request Bot!\n\n🔽 Use the buttons below to configure your bot.",
         parse_mode=ParseMode.HTML,
         reply_markup=userbot_kb(target_uid)
     )
@@ -1280,7 +1470,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "ub_add_channel":
             await q.edit_message_text(
-                process_text_to_premium("✈️ Add Channel\n\n🔽 Add this bot as admin in your channel, then forward any message from that channel here."),
+                "✈️ Add Channel\n\n🔽 Add this bot as admin in your channel, then forward any message from that channel here.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
             )
@@ -1289,7 +1479,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "ub_set_message":
             await q.edit_message_text(
-                process_text_to_premium("✨ Set Welcome Messages\n\nSend one or multiple messages (text/media + caption).\nType <code>done</code> when finished.\n\n🔔 Optional inline buttons: send lines\nText|https://link\n\n🔥 Tip: Use <b>HTML formatting</b> for bold, italic, links, etc."),
+                "✨ Set Welcome Messages\n\nSend one or multiple messages (text/media + caption).\nType <code>done</code> when finished.\n\n🔔 Optional inline buttons: send lines\nText|https://link\n\n🔥 Tip: Use <b>HTML formatting</b> for bold, italic, links, etc.\n\n💎 Premium emojis are supported! Use any emoji and it will be preserved exactly as you send it.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
             )
@@ -1330,7 +1520,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending = db.get_pending_count(managed_uid)
             total_users = db.get_total_requesters_count(managed_uid)
             reachable_users = db.get_reachable_requesters_count(managed_uid)
-            stats_text = process_text_to_premium(
+            stats_text = (
                 f"📊 Bot Stats\n\n"
                 f"✈️ Channels: {len(channels)}\n"
                 f"📇 Total Users: {total_users}\n"
@@ -1357,7 +1547,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "ub_broadcast":
             await q.edit_message_text(
-                process_text_to_premium("✈️ Broadcast to Your Users\n\nSend text/media to broadcast to your users.\n🔔 Buttons format: Text|https://link\n\n🔥 Tip: Use <b>HTML formatting</b> for rich text."),
+                "✈️ Broadcast to Your Users\n\nSend text/media to broadcast to your users.\n🔔 Buttons format: Text|https://link\n\n🔥 Tip: Use <b>HTML formatting</b> for rich text.\n\n💎 Premium emojis will be preserved and converted automatically when sending!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
             )
@@ -1399,6 +1589,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton(f"🗑️ Delete {mid}", callback_data=f"ubm_del_{mid}")
                 ])
             kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+            # Show raw text for control panel (no premium conversion)
             await q.edit_message_text("\n".join(lines)[:3900], parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
         elif data.startswith("ubm_preview_"):
@@ -1549,7 +1740,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def user_bot_start_from_callback(q, uid):
     try:
         await q.edit_message_text(
-            process_text_to_premium("🤖 Welcome to your Auto Join Request Bot!\n\n🔽 Use the buttons below to configure your bot."),
+            "🤖 Welcome to your Auto Join Request Bot!\n\n🔽 Use the buttons below to configure your bot.",
             parse_mode=ParseMode.HTML,
             reply_markup=userbot_kb(uid)
         )
@@ -1616,9 +1807,9 @@ async def show_sub_userbot(q, uid):
         return
     expiry = datetime.fromisoformat(sub[2])
     days = (expiry - datetime.now()).days
-    sub_text = process_text_to_premium(
+    sub_text = (
         f"👑 Subscription Details\n\n"
-        f"⭐ Type: {sub[1]}\n"
+        f"⭐️ Type: {sub[1]}\n"
         f"💎 Max channels: {sub[3]}\n"
         f"🔔 Expiry: {expiry.date()} ({days} days)"
     )
@@ -1694,7 +1885,7 @@ async def accept_all(q, uid, context):
             else:
                 logging.error(f"accept_all error {requester} {channel_id}: {ex}")
                 fail += 1
-    result_text = process_text_to_premium(
+    result_text = (
         f"✅ Accepted: {ok}\n"
         f"✨ Cleaned: {cleaned}\n"
         f"‼️ Failed: {fail}"
@@ -1824,8 +2015,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         mid = ud.pop("editing_text_msg_id")
         row = db.get_message_by_id(mid)
         if row and row[1] == managed_uid:
-            entities = get_entities_from_message(msg)
-            processed_text = process_text_to_premium(msg.text or msg.caption or "", entities)
+            # Store the raw text exactly as received (preserve emojis)
+            processed_text = msg.text or msg.caption or ""
             db.update_message_text(mid, processed_text)
             await msg.reply_text("✅ Text updated.", parse_mode=ParseMode.HTML, reply_markup=userbot_kb(managed_uid))
         return
@@ -1844,7 +2035,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         row = db.get_message_by_id(mid)
         if row and row[1] == managed_uid:
             media_id, media_type, text, entities = extract_media_from_msg(msg)
-            processed_text = process_text_to_premium(text, entities)
+            # Store the raw text exactly as received
+            processed_text = text
             db.update_message_media(mid, media_id, media_type, processed_text)
             await msg.reply_text("✅ Media updated.", parse_mode=ParseMode.HTML, reply_markup=userbot_kb(managed_uid))
         return
@@ -1926,7 +2118,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
             key = f"mg_{media_group_id}"
             arr = ud.get(key, [])
             first_item = len(arr) == 0
-            processed_text = process_text_to_premium(text, entities)
+            # Store the raw text exactly as received (preserve emojis)
+            processed_text = text
             arr.append({"text": processed_text, "media_id": media_id, "media_type": media_type})
             ud[key] = arr
             if first_item:
@@ -1949,7 +2142,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
             ud[job_key] = j
             return
 
-        processed_text = process_text_to_premium(text, entities)
+        # Store the raw text exactly as received (preserve emojis)
+        processed_text = text
         msg_id = db.add_message(managed_uid, channel_id, processed_text, media_id, media_type, None)
         ud["pending_buttons"] = {"msg_id": msg_id, "channel_id": channel_id}
         await msg.reply_text(
@@ -1968,7 +2162,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
 
     if context.user_data.get("broadcast_stage") == "await_message":
         media_id, media_type, text, entities = extract_media_from_msg(msg)
-        processed_text = process_text_to_premium(text, entities)
+        # Store the raw text exactly as received
+        processed_text = text
         draft = {"text": processed_text, "media": media_id, "media_type": media_type}
         context.user_data["broadcast_draft"] = draft
         context.user_data["broadcast_stage"] = "buttons_or_send"
@@ -2146,10 +2341,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
     db.add_user(user.id, user.username or "", user.first_name or "", user.last_name or "")
-    welcome_text = process_text_to_premium(
+    welcome_text = (
         "👋 Welcome to Auto Join Request Bot Manager!\n\n"
         "🚀 Click Setup Bot to begin.\n"
-        "⭐️ Manage your channels with ease!"
+        "⭐️ Manage your channels with ease!\n"
+        "💎 Premium emojis are supported automatically!"
     )
     await update.message.reply_text(
         welcome_text,
@@ -2171,7 +2367,7 @@ async def proof_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user or not is_admin(user.id):
         await update.message.reply_text("Not authorized.", parse_mode=ParseMode.HTML)
         return
-    proof_text = process_text_to_premium(
+    proof_text = (
         "✅ USERBOT ACTIVATION CONFIRMATION\n\n"
         "Your UserBot setup has been completed successfully and is now active.\n\n"
         "Details:\n"
@@ -2187,6 +2383,206 @@ async def proof_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(proof_text, parse_mode=ParseMode.HTML)
 
 
+# ================= ADMIN SUBSCRIPTION LIST =================
+async def show_admin_sub_list(q, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Show paginated subscription list with status indicators."""
+    subs = db.get_all_subscriptions()
+    if not subs:
+        await q.edit_message_text(
+            "‼️ No subscriptions found.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_kb()
+        )
+        return
+
+    now = datetime.now()
+    PAGE_SIZE = 8
+    total = len(subs)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    page_subs = subs[start:start + PAGE_SIZE]
+
+    lines = [f"📋 <b>Subscription List</b> ({total} total) — Page {page+1}/{total_pages}\n"]
+    for s in page_subs:
+        uid = s["user_id"]
+        uname = f"@{s['username']}" if s.get("username") else s.get("first_name", "Unknown")
+        plan = s.get("subscription_type", "?")
+        expiry_str = s.get("expiry_date", "")
+        bot_uname = s.get("bot_username", "")
+        is_running = uid in user_bot_applications
+        bot_active_db = s.get("bot_active", 0)
+
+        try:
+            exp_dt = datetime.fromisoformat(expiry_str)
+            days_left = (exp_dt - now).days
+            if days_left < 0:
+                status = "❌ Expired"
+                exp_display = f"Expired {abs(days_left)}d ago"
+            elif days_left == 0:
+                status = "⚠️ Today"
+                exp_display = "Expires TODAY"
+            elif days_left <= 3:
+                status = "🔴 Critical"
+                exp_display = f"{days_left}d left"
+            elif days_left <= 7:
+                status = "🟡 Soon"
+                exp_display = f"{days_left}d left"
+            else:
+                status = "🟢 Active"
+                exp_display = f"{days_left}d left"
+        except Exception:
+            status = "❓ Unknown"
+            exp_display = expiry_str[:10] if expiry_str else "N/A"
+
+        bot_status = "🤖🟢" if is_running else ("🤖🔴" if bot_uname else "🚫")
+        bot_info = f"@{bot_uname}" if bot_uname else "No bot"
+
+        lines.append(
+            f"\n<b>{uname}</b> ({uid})\n"
+            f"  ⭐️ {plan} | {status} | {exp_display}\n"
+            f"  {bot_status} {bot_info}"
+        )
+
+    text = "\n".join(lines)
+
+    kb = []
+    # Pagination row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"admin_sublist_pg_{page-1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"admin_sublist_pg_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+
+    kb.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+
+    await q.edit_message_text(
+        text[:4000],
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+# ================= ADMIN USERBOT CONTROL PANEL =================
+async def show_admin_userbot_control(q, context: ContextTypes.DEFAULT_TYPE):
+    """Advanced userbot control panel — start/stop individual or all."""
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        await q.edit_message_text(
+            "‼️ No userbots found.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_kb()
+        )
+        return
+
+    running_count = len(user_bot_applications)
+    total_count = len(bots)
+
+    lines = [
+        f"🤖 <b>UserBot Control Panel</b>\n",
+        f"🟢 Running: {running_count} / {total_count}\n",
+        "─────────────────────────\n"
+    ]
+    for uid, token, buser, active in bots:
+        is_running = uid in user_bot_applications
+        sub = db.get_subscription(uid)
+        has_valid_sub = False
+        if sub:
+            try:
+                exp = datetime.fromisoformat(sub[2])
+                has_valid_sub = exp > datetime.now()
+            except Exception:
+                pass
+        status_icon = "🟢" if is_running else "🔴"
+        sub_icon = "✅" if has_valid_sub else "❌"
+        lines.append(f"{status_icon} @{buser or 'N/A'} ({uid}) {sub_icon}")
+
+    kb = []
+    # Individual bot controls
+    for uid, token, buser, active in bots:
+        is_running = uid in user_bot_applications
+        row = []
+        if is_running:
+            row.append(InlineKeyboardButton(
+                f"🛑 Stop @{buser or uid}", callback_data=f"admin_ub_stop_{uid}"))
+        else:
+            row.append(InlineKeyboardButton(
+                f"▶️ Start @{buser or uid}", callback_data=f"admin_ub_start_{uid}"))
+        row.append(InlineKeyboardButton("🔎 Info", callback_data=f"admin_ub_info_{uid}"))
+        kb.append(row)
+
+    # Bulk controls
+    kb.append([
+        InlineKeyboardButton("🚀 Start All", callback_data="admin_start_all"),
+        InlineKeyboardButton("🛑 Stop All", callback_data="admin_stop_all"),
+    ])
+    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="admin_userbots")])
+    kb.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+
+    await q.edit_message_text(
+        "\n".join(lines)[:4000],
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def show_admin_ub_info(q, uid_target: int, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed info about a specific userbot."""
+    bot_data = db.get_user_bot(uid_target)
+    sub = db.get_subscription(uid_target)
+    user_doc = db.mongo.users.find_one({"user_id": uid_target}) or {}
+    is_running = uid_target in user_bot_applications
+
+    uname = user_doc.get("username", "")
+    fname = user_doc.get("first_name", "")
+
+    lines = [f"🔎 <b>UserBot Info</b>\n"]
+    lines.append(f"👤 User: {fname} {'@'+uname if uname else ''} ({uid_target})")
+
+    if bot_data:
+        lines.append(f"🤖 Bot: @{bot_data[2] or 'N/A'}")
+        lines.append(f"🔘 DB Active Flag: {'Yes' if bot_data[3] else 'No'}")
+        lines.append(f"⚡️ Actually Running: {'🟢 Yes' if is_running else '🔴 No'}")
+    else:
+        lines.append("🤖 Bot: Not configured")
+
+    if sub:
+        try:
+            exp = datetime.fromisoformat(sub[2])
+            days_left = (exp - datetime.now()).days
+            lines.append(f"⭐️ Plan: {sub[1]}")
+            lines.append(f"📅 Expiry: {exp.strftime('%d %b %Y')} ({days_left}d left)")
+        except Exception:
+            lines.append(f"⭐️ Plan: {sub[1] if sub else 'None'}")
+    else:
+        lines.append("⭐️ Subscription: None")
+
+    channels = db.get_user_channels(uid_target) or []
+    total_users = db.get_total_requesters_count(uid_target)
+    reachable = db.get_reachable_requesters_count(uid_target)
+    lines.append(f"✈️ Channels: {len(channels)}")
+    lines.append(f"👥 Total Users: {total_users} | Reachable: {reachable}")
+
+    kb = []
+    if bot_data:
+        if is_running:
+            kb.append([InlineKeyboardButton("🛑 Stop Bot", callback_data=f"admin_ub_stop_{uid_target}")])
+        else:
+            kb.append([InlineKeyboardButton("▶️ Start Bot", callback_data=f"admin_ub_start_{uid_target}")])
+        kb.append([InlineKeyboardButton("🗑️ Remove Bot", callback_data=f"admin_remove_bot_{uid_target}")])
+
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")])
+
+    await q.edit_message_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+# ================= CALLBACK HANDLER =================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.from_user:
@@ -2225,8 +2621,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_bot = db.get_user_bot(uid)
             if user_bot:
                 bot_username = user_bot[2]
+                is_running = uid in user_bot_applications
+                status_text = "🟢 Running" if is_running else "🔴 Stopped"
                 await q.edit_message_text(
-                    f"🤖 Bot already linked: @{bot_username}\n🔽 Tap below to open or remove it.",
+                    f"🤖 Bot already linked: @{bot_username}\n🔘 Status: {status_text}\n🔽 Tap below to manage it.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔗 Open My Bot",
@@ -2262,21 +2660,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "admin_all_users":
             await show_all_users(q)
 
+        elif data == "admin_sub_list":
+            if not is_admin(uid):
+                return
+            await show_admin_sub_list(q, context, page=0)
+
+        elif data.startswith("admin_sublist_pg_"):
+            if not is_admin(uid):
+                return
+            page = int(data.split("_")[-1])
+            await show_admin_sub_list(q, context, page=page)
+
         elif data == "admin_userbots":
-            bots = db.get_all_user_bots() or []
-            kb = []
-            for b in bots:
-                tuid, _, buser, active = b
-                if buser:
-                    label = f"🤖 @{buser} ({tuid}) {'🟢' if active else '🔴'}"
-                    kb.append([InlineKeyboardButton(label, callback_data=f"admin_take_{tuid}")])
-            if not kb:
-                kb.append([InlineKeyboardButton("No UserBots Found",
-                                                callback_data="admin_panel")])
-            kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-            await q.edit_message_text("🤖 Select userbot to control:",
-                                      parse_mode=ParseMode.HTML,
-                                      reply_markup=InlineKeyboardMarkup(kb))
+            if not is_admin(uid):
+                return
+            await show_admin_userbot_control(q, context)
 
         elif data == "admin_add_userbot":
             await q.edit_message_text(
@@ -2286,6 +2684,78 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]),
             )
             context.user_data["admin_add_userbot"] = True
+
+        elif data.startswith("admin_ub_info_"):
+            if not is_admin(uid):
+                return
+            tuid = int(data.split("_")[-1])
+            await show_admin_ub_info(q, tuid, context)
+
+        elif data.startswith("admin_ub_start_"):
+            if not is_admin(uid):
+                return
+            tuid = int(data.split("_")[-1])
+            bot_data = db.get_user_bot(tuid)
+            if not bot_data or not bot_data[1]:
+                await q.edit_message_text("‼️ UserBot not found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            sub = db.get_subscription(tuid)
+            if not sub:
+                await q.edit_message_text(
+                    f"‼️ User {tuid} has no subscription.",
+                    parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            try:
+                exp = datetime.fromisoformat(sub[2])
+                if exp < datetime.now():
+                    await q.edit_message_text(
+                        f"‼️ User {tuid} subscription expired.",
+                        parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                    return
+            except Exception:
+                pass
+            if tuid in user_bot_applications:
+                await q.edit_message_text(
+                    f"ℹ️ Bot @{bot_data[2]} already running.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")]]))
+                return
+            try:
+                await start_user_bot(bot_data[1], tuid)
+                db.set_user_bot_active(tuid, True)
+                await q.edit_message_text(
+                    f"✅ Bot @{bot_data[2]} started for user {tuid}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")]]))
+            except Exception as ex:
+                await q.edit_message_text(
+                    f"‼️ Failed to start: {ex}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")]]))
+
+        elif data.startswith("admin_ub_stop_"):
+            if not is_admin(uid):
+                return
+            tuid = int(data.split("_")[-1])
+            bot_data = db.get_user_bot(tuid)
+            buser = bot_data[2] if bot_data else str(tuid)
+            if tuid not in user_bot_applications:
+                await q.edit_message_text(
+                    f"ℹ️ Bot @{buser} is not running.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")]]))
+                return
+            try:
+                await stop_user_bot(tuid)
+                await q.edit_message_text(
+                    f"🛑 Bot @{buser} stopped for user {tuid}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")]]))
+            except Exception as ex:
+                await q.edit_message_text(
+                    f"‼️ Failed to stop: {ex}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_userbots")]]))
 
         elif data.startswith("admin_take_"):
             tuid = int(data.split("_")[2])
@@ -2336,7 +2806,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "admin_add_sub":
             await q.edit_message_text(
-                "⭐ Send: user_id days plan(Basic/Pro)",
+                "⭐️ Send: user_id days plan(Basic/Pro)",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
@@ -2350,6 +2820,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "admin_start_all":
             await start_all_userbots(q)
+
+        elif data == "admin_stop_all":
+            if not is_admin(uid):
+                return
+            stopped = 0
+            failed = 0
+            for owner_uid in list(user_bot_applications.keys()):
+                try:
+                    await stop_user_bot(owner_uid)
+                    stopped += 1
+                except Exception as ex:
+                    logging.error(f"stop_all error {owner_uid}: {ex}")
+                    failed += 1
+            result_text = f"🛑 Stopped: {stopped}\n‼️ Failed: {failed}"
+            await q.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=admin_kb())
 
         elif data == "admin_broadcast":
             await q.edit_message_text("✈️ Choose broadcast target:",
@@ -2366,7 +2851,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["admin_broadcast"] = True
             context.user_data["admin_broadcast_target"] = None
             await q.edit_message_text(
-                "✈️ Send broadcast text/media for ALL userbots users.\n\n🔥 Use <b>HTML formatting</b> for rich text.",
+                "✈️ Send broadcast text/media for ALL userbots users.\n\n🔥 Use <b>HTML formatting</b> for rich text.\n\n💎 Premium emojis will be preserved and converted automatically when sending!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
@@ -2391,7 +2876,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["admin_broadcast"] = True
             context.user_data["admin_broadcast_target"] = tuid
             await q.edit_message_text(
-                f"✈️ Send broadcast text/media for userbot owner: {tuid}\n\n🔥 Use <b>HTML formatting</b> for rich text.",
+                f"✈️ Send broadcast text/media for userbot owner: {tuid}\n\n🔥 Use <b>HTML formatting</b> for rich text.\n\n💎 Premium emojis will be preserved and converted automatically when sending!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
@@ -2430,9 +2915,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         expiry_dt = datetime.fromisoformat(sub["expiry_date"])
                         days_left = (expiry_dt - datetime.now()).days
-                        msg_text = process_text_to_premium(
+                        msg_text = (
                             f"🔔 Subscription Expiry Reminder\n\n"
-                            f"⭐ Plan: {sub_type}\n"
+                            f"⭐️ Plan: {sub_type}\n"
                             f"‼️ Expires in {days_left} day(s) "
                             f"({expiry_dt.strftime('%d %b %Y')}).\n\n"
                             f"📞 Contact {ADMIN_USERNAME} to renew."
@@ -2474,9 +2959,9 @@ async def show_subscription(q, uid):
         expiry = datetime.fromisoformat(sub[2])
         days = (expiry - datetime.now()).days
         status = "✅ Active" if days > 0 else "❌ Expired"
-        sub_text = process_text_to_premium(
+        sub_text = (
             f"👑 Subscription Details\n\n"
-            f"⭐ Type: {sub[1]}\n"
+            f"⭐️ Type: {sub[1]}\n"
             f"💎 Max channels: {sub[3]}\n"
             f"🔔 Expiry: {expiry.date()} ({days} days)\n"
             f"🔘 Status: {status}"
@@ -2489,17 +2974,17 @@ async def show_subscription(q, uid):
 async def handle_sub_purchase(q, data):
     if data == "sub_basic":
         await q.edit_message_text(
-            "💰 Selected Basic Rs.2599/mo (1 channel).\n📞 Contact @aviii56 to pay.",
+            "💰 Selected Basic Rs.2599/mo (1 channel).\n📞 Contact @aviii566 to pay.",
             parse_mode=ParseMode.HTML,
             reply_markup=subscription_kb())
     elif data == "sub_pro":
         await q.edit_message_text(
-            "💎 Selected Pro Rs.3999/mo (5 channels).\n📞 Contact @aviii56 to pay.",
+            "💎 Selected Pro Rs.3999/mo (5 channels).\n📞 Contact @aviii566 to pay.",
             parse_mode=ParseMode.HTML,
             reply_markup=subscription_kb())
     elif data == "sub_renew":
         await q.edit_message_text(
-            "📞 Contact @aviii56 to renew.",
+            "📞 Contact @aviii566 to renew.",
             parse_mode=ParseMode.HTML,
             reply_markup=subscription_kb())
 
@@ -2543,10 +3028,10 @@ async def show_stats(q):
     counts = db.get_userbot_user_counts()
     per = "\n".join([f"@{b or 'N/A'} users:{c}" for _, b, c in counts]) or "(none)"
     total_userbot_users = sum(c for _, _, c in counts)
-    text = process_text_to_premium(
+    text = (
         f"📊 Stats\n\n"
         f"📇 Total users: {total_users}\n"
-        f"⭐ Active subs: {active_subs}\n"
+        f"⭐️ Active subs: {active_subs}\n"
         f"🤖 Userbots (total): {total_bots}\n"
         f"🔘 Userbots running: {running}\n\n"
         f"✈️ Per userbot users:\n{per}\n\n"
@@ -2559,27 +3044,30 @@ async def start_all_userbots(q):
     bots = db.get_all_user_bots()
     started = 0; failed = 0
     for uid, token, buser, active in bots:
-        if active == 0:
-            sub = db.get_subscription(uid)
-            if sub:
-                expiry = datetime.fromisoformat(sub[2])
-                if expiry < datetime.now():
-                    logging.info(f"Skipping {uid} - expired subscription")
-                    continue
-            else:
-                logging.info(f"Skipping {uid} - no subscription")
+        sub = db.get_subscription(uid)
+        if not sub:
+            logging.info(f"Skipping {uid} - no subscription")
+            continue
+        try:
+            expiry = datetime.fromisoformat(sub[2])
+            if expiry < datetime.now():
+                logging.info(f"Skipping {uid} - subscription expired")
                 continue
-                
+        except Exception as ex:
+            logging.error(f"Error checking expiry for {uid}: {ex}")
+            continue
         if uid in user_bot_applications:
+            logging.info(f"Bot for {uid} already running")
             continue
         try:
             await start_user_bot(token, uid)
             db.set_user_bot_active(uid, True)
             started += 1
+            logging.info(f"✅ Started user bot @{buser} for user {uid}")
         except Exception as ex:
             logging.error(f"start_all error {uid}: {ex}")
             failed += 1
-    result_text = process_text_to_premium(f"✅ Started: {started}\n‼️ Failed: {failed}")
+    result_text = f"✅ Started: {started}\n‼️ Failed: {failed}"
     await q.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=admin_kb())
 
 
@@ -2600,29 +3088,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 token = parts[1]
                 test_bot = Bot(token=token, request=None)
                 me = await test_bot.get_me()
-                
+
                 sub = db.get_subscription(target_id)
                 if not sub:
                     await msg.reply_text(
-                        process_text_to_premium(f"‼️ User {target_id} has no subscription. Add subscription first."),
+                        f"‼️ User {target_id} has no subscription. Add subscription first.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=admin_kb())
+                    context.user_data.pop("admin_add_userbot", None)
                     return
-                
+
                 expiry = datetime.fromisoformat(sub[2])
                 if expiry < datetime.now():
                     await msg.reply_text(
-                        process_text_to_premium(f"‼️ User {target_id} subscription expired. Renew first."),
+                        f"‼️ User {target_id} subscription expired. Renew first.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=admin_kb())
+                    context.user_data.pop("admin_add_userbot", None)
                     return
-                
+
                 db.add_user(target_id, "", "", "")
                 db.add_user_bot(target_id, token, me.username)
                 await start_user_bot(token, target_id)
                 db.set_user_bot_active(target_id, True)
-                
-                notice = process_text_to_premium(
+
+                notice = (
                     "✅ USERBOT ACTIVATION CONFIRMATION\n\n"
                     "Your UserBot setup has been completed successfully and is now active.\n\n"
                     "Details:\n"
@@ -2632,7 +3122,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• Start: {datetime.utcnow().strftime('%d %B %Y')}\n"
                     f"• Expiry: {expiry.strftime('%d %B %Y')}\n"
                     "• Status: Active\n\n"
-                    "Open your bot and click Start to begin."
+                    "Open your bot and click Start to begin.\n\n"
+                    "💎 Premium emojis will be preserved exactly as you set them!"
                 )
                 try:
                     await test_bot.send_message(chat_id=target_id, text=notice, parse_mode=ParseMode.HTML)
@@ -2642,9 +3133,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(chat_id=target_id, text=notice, parse_mode=ParseMode.HTML)
                     except Exception as e2:
                         logging.warning(f"userbot notice fallback failed: {e2}")
-                        
+
                 await msg.reply_text(
-                    process_text_to_premium(f"✅ UserBot added for user {target_id}\n🤖 Bot: @{me.username}\n⭐ Subscription: {sub[1]}"),
+                    f"✅ UserBot added for user {target_id}\n🤖 Bot: @{me.username}\n⭐️ Subscription: {sub[1]}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=admin_kb())
             except ValueError:
@@ -2661,27 +3152,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             test_bot = Bot(token=token, request=None)
             me = await test_bot.get_me()
-            
+
             sub = db.get_subscription(user.id)
             if not sub:
                 await msg.reply_text(
-                    process_text_to_premium("‼️ You don't have an active subscription. Contact @aviii56 to purchase."),
+                    "‼️ You don't have an active subscription. Contact @aviii566 to purchase.",
                     parse_mode=ParseMode.HTML)
                 context.user_data.pop("waiting_token", None)
                 return
-                
+
             expiry = datetime.fromisoformat(sub[2])
             if expiry < datetime.now():
                 await msg.reply_text(
-                    process_text_to_premium("‼️ Your subscription has expired. Contact @aviii56 to renew."),
+                    "‼️ Your subscription has expired. Contact @aviii566 to renew.",
                     parse_mode=ParseMode.HTML)
                 context.user_data.pop("waiting_token", None)
                 return
-                
+
             db.add_user_bot(user.id, token, me.username)
             await start_user_bot(token, user.id)
             db.set_user_bot_active(user.id, True)
-            await msg.reply_text(process_text_to_premium(f"✅ Bot set: @{me.username}"), parse_mode=ParseMode.HTML, reply_markup=userbot_kb(user.id))
+            await msg.reply_text(f"✅ Bot set: @{me.username}\n\n💎 Premium emojis will be preserved exactly as you set them!", parse_mode=ParseMode.HTML, reply_markup=userbot_kb(user.id))
         except Exception as ex:
             await msg.reply_text(f"Invalid token: {ex}", parse_mode=ParseMode.HTML)
         finally:
@@ -2696,19 +3187,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 days = int(parts[1])
                 plan = parts[2].capitalize()
                 db.add_subscription(target, plan, days)
-                
+
                 bot_data = db.get_user_bot(target)
-                if bot_data and bot_data[2]:
-                    if target not in user_bot_applications:
+                bot_started = False
+                if bot_data and bot_data[1] and bot_data[2]:
+                    if target in user_bot_applications:
+                        try:
+                            await stop_user_bot(target)
+                        except Exception as stop_ex:
+                            logging.error(f"Stop before restart failed for {target}: {stop_ex}")
+
+                    try:
                         await start_user_bot(bot_data[1], target)
                         db.set_user_bot_active(target, True)
-                        await context.bot.send_message(
-                            target,
-                            process_text_to_premium(f"✅ Your subscription has been renewed/activated!\n\n⭐ Plan: {plan}\n📅 Duration: {days} days\n\nYour bot is now active. Click /start to use it."),
-                            parse_mode=ParseMode.HTML
-                        )
-                
-                await msg.reply_text(process_text_to_premium(f"✅ Added {plan} {days}d for {target}"), parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                        bot_started = True
+                        logging.info(f"✅ Auto-started bot for {target} after subscription add")
+                    except Exception as start_ex:
+                        logging.error(f"Auto-start failed for {target}: {start_ex}")
+
+                try:
+                    bot_notice = ""
+                    if bot_data and bot_started:
+                        bot_notice = f"\n🤖 Bot @{bot_data[2]} has been restarted automatically."
+                    elif bot_data and not bot_started:
+                        bot_notice = "\n⚠️ Bot restart failed. Please contact admin."
+                    else:
+                        bot_notice = "\n📌 Add your bot token via Setup Bot to activate."
+
+                    await context.bot.send_message(
+                        target,
+                        f"✅ Your subscription has been renewed/activated!\n\n"
+                        f"⭐️ Plan: {plan}\n"
+                        f"📅 Duration: {days} days{bot_notice}\n\n"
+                        f"Click /start to use your bot.\n\n"
+                        f"💎 Premium emojis will be preserved exactly as you set them!",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to notify user {target}: {e}")
+
+                status_msg = f"✅ Added {plan} {days}d for {target}"
+                if bot_data and bot_started:
+                    status_msg += f"\n🚀 Bot @{bot_data[2]} auto-started!"
+                elif bot_data:
+                    status_msg += f"\n⚠️ Bot auto-start failed — check logs."
+                else:
+                    status_msg += "\n📌 No bot configured for this user yet."
+
+                await msg.reply_text(
+                    status_msg,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=admin_kb())
             except Exception as ex:
                 await msg.reply_text(f"‼️ Error: {ex}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         else:
@@ -2739,7 +3268,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_broadcast") and is_admin(user.id):
         media_id, media_type, text, entities = extract_media_from_msg(msg)
-        processed_text = process_text_to_premium(text, entities)
+        # Store the raw text exactly as received
+        processed_text = text
         draft = {
             "text": processed_text, "media": media_id, "media_type": media_type,
             "target_uid": context.user_data.get("admin_broadcast_target"),
@@ -2940,6 +3470,16 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
     total_sent = 0; total_fail = 0
 
     for uid, token, buser, active in bots:
+        sub = db.get_subscription(uid)
+        if not sub:
+            continue
+        try:
+            expiry = datetime.fromisoformat(sub[2])
+            if expiry < datetime.now():
+                continue
+        except Exception:
+            continue
+
         if uid in user_bot_applications:
             bot_instance = user_bot_applications[uid].bot
         else:
@@ -3017,7 +3557,9 @@ async def main():
         level=logging.INFO
     )
     logging.info("🚀 Starting bot system...")
+    logging.info(f"💎 Premium emojis loaded: {len(PREMIUM_EMOJI_MAP)}")
 
+    # Stop bots for expired subscriptions on startup
     expired_users = db.get_expired_subscriptions()
     for user_id in expired_users:
         bot_data = db.get_user_bot(user_id)
@@ -3028,12 +3570,13 @@ async def main():
                     await app.updater.stop()
                     await app.stop()
                     await app.shutdown()
-                    logging.info(f"🛑 Stopped user bot for expired subscription on startup: {user_id}")
+                    logging.info(f"🛑 Stopped expired bot on startup: {user_id}")
                 except Exception as ex:
                     logging.error(f"Error stopping expired bot {user_id}: {ex}")
                 user_bot_applications.pop(user_id, None)
             db.set_user_bot_active(user_id, False)
 
+    # Start all valid bots
     bots = db.get_all_user_bots()
     if bots:
         logging.info(f"Found {len(bots)} user bots to start")
@@ -3052,16 +3595,16 @@ async def main():
             except Exception as ex:
                 logging.error(f"Error checking expiry for {uid}: {ex}")
                 continue
-                
             try:
                 await start_user_bot(token, uid)
                 db.set_user_bot_active(uid, True)
-                logging.info(f"✅ Started user bot @{buser}")
+                logging.info(f"✅ Started user bot @{buser} for user {uid}")
             except Exception as ex:
                 logging.error(f"❌ Failed to start user bot {uid}: {ex}")
     else:
         logging.info("No user bots found in database")
 
+    # Main bot setup
     app = ApplicationBuilder().token(MAIN_BOT_TOKEN).concurrent_updates(True).connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30).build()
 
     app.add_handler(CommandHandler("start", start_command))
@@ -3078,6 +3621,7 @@ async def main():
     ))
     app.add_error_handler(error_handler)
 
+    # Schedule jobs
     app.job_queue.run_repeating(
         subscription_reminder_job,
         interval=43200,
@@ -3097,6 +3641,7 @@ async def main():
     logging.info("✅ Main bot started successfully")
     logging.info("🔔 Subscription reminder job scheduled (every 12 hours)")
     logging.info("🕐 Expired subscription check job scheduled (every 1 hour)")
+    logging.info(f"💎 Premium emoji support active with {len(PREMIUM_EMOJI_MAP)} emojis")
 
     try:
         await asyncio.Event().wait()
