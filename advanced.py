@@ -1952,14 +1952,40 @@ async def handle_public_userbot_callback(update: Update, context: ContextTypes.D
             await q.answer()
         except Exception:
             pass
+        # Mark user as reachable so they receive future broadcasts
+        if owner_uid and bot_id:
+            try:
+                db.mark_reachable(owner_uid, bot_id, uid)
+            except Exception:
+                pass
+        # Send live chat header to user
         try:
-            await send_premium_message(context.bot, 
+            await send_premium_message(context.bot,
                 chat_id,
                 UIFormatter.live_chat_header(),
                 parse_mode=ParseMode.HTML
             )
         except Exception:
             pass
+        # Notify owner and admin that user wants live chat support
+        if owner_uid and bot_id:
+            try:
+                user_obj = q.from_user
+                user_mention = f"@{user_obj.username}" if user_obj.username else f"{user_obj.first_name} (ID: {uid})"
+                notify_text = (
+                    f"<blockquote>\U0001f4ac <b>LIVE CHAT REQUEST</b></blockquote>\n\n"
+                    f"User {user_mention} ne Live Chat Support click kiya hai.\n"
+                    f"User ID: <code>{uid}</code>"
+                )
+                inbox_ids = set(ADMIN_USER_IDS)
+                inbox_ids.add(owner_uid)
+                for aid in inbox_ids:
+                    try:
+                        await send_premium_message(context.bot, aid, notify_text, parse_mode=ParseMode.HTML)
+                    except Exception as e2:
+                        logging.error(f"live_chat notify failed to {aid}: {e2}")
+            except Exception as ex:
+                logging.error(f"live_chat_support notify error: {ex}")
         return
 
 
@@ -3122,6 +3148,11 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                 except Exception as e2:
                     logging.error(f"userbot support relay failed to {aid}: {e2}")
             if delivered > 0:
+                # Mark user as reachable so future broadcasts reach them
+                try:
+                    db.mark_reachable(owner_uid, bot_id, uid)
+                except Exception:
+                    pass
                 await send_ephemeral_reply(msg,
                                            "✅ Message sent to support. Please wait for reply.", 2)
             else:
