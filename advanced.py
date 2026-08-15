@@ -2882,6 +2882,8 @@ async def show_admin_ub_info(q, bot_id_target: str, context: ContextTypes.DEFAUL
             kb.append([btn("Stop Bot", f"admin_ub_stop_{bot_id_target}", "danger", "🛑")])
         else:
             kb.append([btn("Start Bot", f"admin_ub_start_{bot_id_target}", "success", "🚀")])
+        # Token change option directly in the Info panel — fixes revoked/stolen token.
+        kb.append([btn("Update Token", f"admin_ub_uptoken_{bot_id_target}", "danger", "🔐")])
         kb.append([btn("Remove Bot", f"admin_remove_bot_{bot_id_target}", "danger", "🗑"), btn("Back", "admin_userbots", "primary", "🔙")])
         await safe_edit_message_text(q, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     except Exception as ex:
@@ -3494,6 +3496,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_ub_info(q, bot_id, context)
             return
 
+        if data.startswith("admin_ub_uptoken_"):
+            if not is_admin(uid):
+                return
+            bot_id = data.replace("admin_ub_uptoken_", "")
+            bot_data = db.get_user_bot(bot_id)
+            if not bot_data:
+                await safe_edit_message_text(q, f"{pe('❌')} UserBot not found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            context.user_data["admin_ub_uptoken_bot_id"] = bot_id
+            await safe_edit_message_text(q,
+                f"<blockquote>{pp('🔐')} <b>UPDATE USERBOT TOKEN</b></blockquote>\n\n"
+                f"{pp('🤖')} @{bot_data.get('bot_username') or 'N/A'} (<code>{bot_id}</code>)\n\n"
+                "Abhi wala token revoked/invalid hai to naya BotFather token bhejein:\n"
+                "<code>123456:ABC...new_token...</code>\n\n"
+                "<i>Bot naye token ke saath turant restart ho jayega.</i>",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"admin_ub_info_{bot_id}", "primary", "🔙")]]))
+            return
+
         if data.startswith("admin_remove_bot_"):
             if not is_admin(uid):
                 return
@@ -3588,6 +3608,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     if not msg:
+        return
+
+    # Admin: update a userbot's token (from the "Update Token" button in UserBot Info)
+    if context.user_data.get("admin_ub_uptoken_bot_id") and is_admin(user.id):
+        bot_id = context.user_data.get("admin_ub_uptoken_bot_id")
+        new_token = (msg.text or "").strip()
+        bot_data = db.get_user_bot(bot_id)
+        if not bot_data:
+            context.user_data.pop("admin_ub_uptoken_bot_id", None)
+            await reply_premium_message(msg, f"{pe('❌')} UserBot not found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            return
+        info, err = await validate_bot_token(new_token)
+        if not info:
+            await reply_premium_message(msg,
+                f"{pe('❌')} <b>Invalid or revoked token.</b>\n\n{err}\n\n"
+                "BotFather se naya valid token bana ke dobara bhejein.",
+                parse_mode=ParseMode.HTML)
+            return
+        existing = db.get_user_bot_by_token(new_token)
+        if existing and existing.get("bot_id") != bot_id:
+            await reply_premium_message(msg,
+                f"{pe('❌')} Token already linked to @{existing.get('bot_username') or existing['bot_id']}.",
+                parse_mode=ParseMode.HTML)
+            return
+        db.update_user_bot_token(bot_id, new_token, info.username)
+        started = await restart_user_bot(bot_id, new_token=new_token)
+        db.set_user_bot_active(bot_id, 1 if started else 0)
+        context.user_data.pop("admin_ub_uptoken_bot_id", None)
+        await reply_premium_message(msg,
+            f"<blockquote>{pp('🔐')} <b>USERBOT TOKEN UPDATED</b></blockquote>\n\n"
+            f"{pp('🤖')} @{info.username} (<code>{bot_id}</code>)\n"
+            f"{pp('✅')} {'Restarted with new token.' if started else 'Token saved but start failed.'}",
+            parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        # Notify the bot owner too
+        try:
+            await send_premium_message(context.bot, bot_data["user_id"],
+                f"<blockquote>{pp('🔐')} <b>YOUR BOT TOKEN WAS UPDATED BY ADMIN</b></blockquote>\n\n"
+                f"{pp('🤖')} @{info.username} naye token ke saath start ho gaya hai.",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
         return
 
     if context.user_data.get("waiting_token") and not is_admin(user.id):
