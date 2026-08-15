@@ -29,6 +29,23 @@ LOG_FILE="bot.log"
 REQUIREMENTS_FILE="requirements.txt"
 MAX_WAIT=10  # Max seconds to wait for bot to start
 
+# SECURITY: Load secrets from .env if present (never hardcode tokens in code).
+# Put this in .env (not committed):
+#   MAIN_BOT_TOKEN="123456:ABC..."
+#   ADMIN_USER_IDS="111,222"
+if [ -f ".env" ]; then
+    log_info "Loading environment from .env ..."
+    set -a
+    # shellcheck disable=SC1091
+    source ".env"
+    set +a
+fi
+
+if [ -z "${MAIN_BOT_TOKEN:-}" ]; then
+    log_warning "MAIN_BOT_TOKEN is not set! Add it to .env (see note below) or export it, "
+    log_warning "otherwise the bot will refuse to start (token is no longer hardcoded)."
+fi
+
 # Logging function
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"

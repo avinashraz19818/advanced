@@ -31,7 +31,11 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TimedOut
+try:
+    from telegram.error import InvalidToken
+except ImportError:  # older PTB versions don't export InvalidToken
+    InvalidToken = type("InvalidToken", (Exception,), {})
 
 # ================= RETRY DECORATOR =================
 def retry_async(max_retries=3, delay=1, backoff=2):
@@ -81,7 +85,16 @@ def make_aware(dt):
     return dt
 
 # ================= CONFIG =================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7687421668:AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE")
+# SECURITY: The main bot token is NEVER hardcoded anymore. A token that is
+# committed to source code can be leaked/stolen (that is exactly what happened
+# before: the old hardcoded token got revoked by Telegram after a third party
+# started a rogue instance of this bot with the same token, which caused the
+# endless "Conflict: terminated by other getUpdates request" spam in bot.log
+# and the mysterious extra "member kick/ban" behaviour users saw).
+#
+# Set it via environment variable instead, e.g. in your shell/.env:
+#   export MAIN_BOT_TOKEN="123456789:AAA..."
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "").strip()
 ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
@@ -318,7 +331,10 @@ def bot_management_kb(bot_id: str, user_id: int) -> InlineKeyboardMarkup:
         ])
         lines.append([btn("Broadcast to Users", f"ub_broadcast_{bot_id}", "success", "✈️")])
         lines.append([btn(f"Subscription — {days_left}d left", f"ub_subscription_{bot_id}", "primary", "📅")])
-    else:
+    # Token replacement is always available to the bot owner/admin — if the token
+    # was revoked/stolen (that's the "token chori" issue), this is how to swap it.
+    lines.append([btn("Update Token", f"ub_update_token_{bot_id}", "danger", "🔐")])
+    if not is_active:
         lines.append([btn("Get Subscription", f"sub_for_bot_{bot_id}", "danger", "⚠️")])
     lines.append([btn_url("Contact Admin", f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", "primary", "📞")])
     lines.append([btn("Back to Main", "main_menu", "primary", "🔙")])
@@ -516,6 +532,23 @@ class Database:
 
     def remove_user_bot(self, bot_id: str):
         self._execute("DELETE FROM user_bots WHERE bot_id=%s", (bot_id,))
+
+    def update_user_bot_token(self, bot_id: str, token: str, username: str):
+        """Replace a userbot's token (used when the old token was revoked/stolen)."""
+        self._execute(
+            "UPDATE user_bots SET bot_token=%s, bot_username=%s WHERE bot_id=%s",
+            (token, username, bot_id),
+        )
+
+    def update_user_bot_username(self, bot_id: str, username: str):
+        self._execute(
+            "UPDATE user_bots SET bot_username=%s WHERE bot_id=%s",
+            (username, bot_id),
+        )
+
+    def get_user_bot_by_token(self, token: str):
+        """Look up a bot by its token (used to guard against duplicate token registration)."""
+        return self._fetchone("SELECT * FROM user_bots WHERE bot_token=%s", (token,))
 
     def get_subscription_for_bot(self, bot_id: str):
         s = self._fetchone("SELECT * FROM bot_subscriptions WHERE bot_id=%s ORDER BY expiry_date DESC LIMIT 1", (bot_id,))
@@ -1735,6 +1768,20 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 await safe_edit_message_text(q, f"Error: {ex}", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
         return
 
+    if data == f"ub_update_token_{bot_id}":
+        ud = _runtime_store(context, f"{uid}_{bot_id}")
+        ud["waiting_new_token"] = bot_id
+        context.user_data[f"waiting_new_token_{bot_id}"] = True
+        await safe_edit_message_text(q,
+            f"<blockquote>{pp('🔐')} <b>UPDATE BOT TOKEN</b></blockquote>\n\n"
+            "Agar aapka bot token revoke/stolen ho gaya hai (bot band ho gaya ya "
+            "kisi aur ne bhi use kar raha hai) to yahan new BotFather token bhejein.\n\n"
+            "BotFather se naya token generate karke yahan paste karein:\n"
+            "<code>123456:ABC...new_token...</code>\n\n"
+            "<i>Bot turant naye token ke saath restart ho jayega.</i>",
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")]]))
+        return
+
     if data == f"ub_stats_{bot_id}":
         channels = db.get_bot_channels(bot_id) or []
         total = db.get_total_requesters_count(bot_id)
@@ -2160,6 +2207,49 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
     ud = _runtime_store(context, f"{uid}_{bot_id}")
     extracted = MessageManager.extract_from_message(msg)
 
+    # Handle NEW TOKEN submission (token was revoked/stolen, replacing it now)
+    if ud.get("waiting_new_token") or context.user_data.get(f"waiting_new_token_{bot_id}"):
+        new_token = (msg.text or "").strip()
+        if not new_token:
+            await reply_premium_message(msg, f"{pe('❌')} Please send the new BotFather token.", parse_mode=ParseMode.HTML)
+            return
+        info, err = await validate_bot_token(new_token)
+        if not info:
+            await reply_premium_message(msg,
+                f"{pe('❌')} <b>Invalid or revoked token.</b>\n\n{err}\n\n"
+                "BotFather se ek naya valid token generate karke dobara bhejein.",
+                parse_mode=ParseMode.HTML)
+            return
+        # Guard: do not let the same token be registered twice under another bot.
+        existing = db.get_user_bot_by_token(new_token)
+        if existing and existing.get("bot_id") != bot_id:
+            await reply_premium_message(msg,
+                f"{pe('❌')} This token is already linked to another bot on our system "
+                f"({existing.get('bot_username') or existing['bot_id']}). Please use a different one.",
+                parse_mode=ParseMode.HTML)
+            return
+        old_token = db.get_user_bot(bot_id).get("bot_token") if db.get_user_bot(bot_id) else None
+        db.update_user_bot_token(bot_id, new_token, info.username)
+        # Clear the waiting state for this user and this bot
+        ud.pop("waiting_new_token", None)
+        context.user_data.pop(f"waiting_new_token_{bot_id}", None)
+        # Restart the bot with the fresh token
+        started = await restart_user_bot(bot_id, new_token=new_token)
+        db.set_user_bot_active(bot_id, 1 if started else 0)
+        status_text = f"{pe('✅')} Bot restarted successfully!" if started else f"{pe('⚠️')} Token saved but bot failed to start."
+        await reply_premium_message(msg,
+            f"<blockquote>{pp('🔐')} <b>TOKEN UPDATED</b></blockquote>\n\n"
+            f"{pp('🤖')} <b>Bot:</b> @{info.username}\n"
+            f"<b>Bot ID:</b> <code>{bot_id}</code>\n\n"
+            f"{status_text}\n\n"
+            f"<i>Purana (stolen/revoked) token ab use nahi hoga. Agar us token wala "
+            f"rogue instance chal raha hai to BotFather se purana token revoke karna "
+            f"na bhoolein.</i>",
+            parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
+        if old_token and old_token != new_token:
+            logging.info(f"Token updated for bot {bot_id}: old -> new")
+        return
+
     if ud.get("editing_text_msg_id"):
         mid = ud.pop("editing_text_msg_id")
         row = db.get_message_by_id(mid)
@@ -2567,6 +2657,62 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
 
 
 # ================= USER BOT LIFECYCLE =================
+async def validate_bot_token(token: str):
+    """Verify a bot token is valid and return (bot_info, error_str).
+
+    Returns (None, error) on failure so callers can show a friendly message
+    instead of crashing with an InvalidToken/Unauthorized traceback."""
+    token = (token or "").strip()
+    if not token:
+        return None, "Token is empty."
+    if ":" not in token:
+        return None, "Invalid token format. Send a valid BotFather token (e.g. 123456:ABC...)."
+    try:
+        probe = Bot(token=token)
+        info = await probe.get_me()
+        return info, None
+    except Exception as ex:
+        return None, f"Invalid or revoked token: {ex}"
+
+
+async def _cleanup_userbot_app(bot_id: str):
+    """Safely stop and remove a userbot Application instance (no DB side-effects)."""
+    if bot_id in user_bot_applications:
+        try:
+            app = user_bot_applications[bot_id]
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception:
+            pass
+        user_bot_applications.pop(bot_id, None)
+
+
+async def restart_user_bot(bot_id: str, new_token: str = None):
+    """Stop a running userbot and (optionally) restart it with a fresh token.
+
+    Used after a token has been revoked/stolen so the bot comes back online
+    with the replacement token instead of looping on Conflict errors."""
+    bot_data = db.get_user_bot(bot_id)
+    if not bot_data:
+        return False
+    token = new_token or bot_data.get("bot_token")
+    owner_id = bot_data["user_id"]
+    # Stop any existing instance first so we don't run two pollers on the same token.
+    await _cleanup_userbot_app(bot_id)
+    if not token:
+        db.set_user_bot_active(bot_id, False)
+        return False
+    try:
+        await start_user_bot(token, bot_id, owner_id)
+        db.set_user_bot_active(bot_id, True)
+        return True
+    except Exception as ex:
+        logging.error(f"restart_user_bot failed for {bot_id}: {ex}")
+        db.set_user_bot_active(bot_id, False)
+        return False
+
+
 async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.bot_data["bot_id"] = bot_id
@@ -2578,9 +2724,20 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
+    app.add_error_handler(error_handler)
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    # SECURITY: clear any webhook that a rogue instance may have set with this
+    # (possibly stolen) token, then drop stale queued updates. Otherwise polling
+    # and an attacker's webhook fight for the same token.
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as ex:
+        logging.warning(f"delete_webhook failed for {bot_id}: {ex}")
+    await app.updater.start_polling(
+        allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"],
+        drop_pending_updates=True,
+    )
     user_bot_applications[bot_id] = app
     try:
         for ch in db.get_bot_channels(bot_id) or []:
@@ -3436,6 +3593,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting_token") and not is_admin(user.id):
         token = msg.text.strip()
         if ":" in token and len(token) > 10:
+            # SECURITY: never allow a token that's already linked to someone else.
+            existing = db.get_user_bot_by_token(token)
+            if existing:
+                context.user_data.pop("waiting_token", None)
+                await reply_premium_message(msg,
+                    f"{pe('❌')} This token is already linked to another bot "
+                    f"(@{existing.get('bot_username') or existing['bot_id']}). "
+                    f"BotFather se ek naya, unused token bana ke bhejein.",
+                    parse_mode=ParseMode.HTML)
+                return
             try:
                 test_bot = Bot(token=token)
                 bot_info = await test_bot.get_me()
@@ -3453,6 +3620,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) == 2 and parts[0].isdigit():
             target = int(parts[0])
             token = parts[1]
+            existing = db.get_user_bot_by_token(token)
+            if existing:
+                context.user_data.pop("admin_add_userbot", None)
+                await reply_premium_message(msg,
+                    f"{pe('❌')} Token already linked to @{existing.get('bot_username') or existing['bot_id']}.",
+                    parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
             try:
                 test_bot = Bot(token=token)
                 bot_info = await test_bot.get_me()
@@ -3688,7 +3862,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err_str = str(context.error)
-    logging.error(f"Update {update} caused error {err_str}")
+    err_cls = type(context.error).__name__
+    logging.error(f"Update {update} caused error {err_cls}: {err_str}")
     if "Message is not modified" in err_str:
         return
     if "Query is too old" in err_str:
@@ -3697,6 +3872,40 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         return
     if "NetworkError" in err_str or "ReadError" in err_str:
         logging.warning(f"Network error (will retry later): {err_str}")
+        return
+    # TOKEN THEFT / DUPLICATE INSTANCE DETECTION
+    if isinstance(context.error, Conflict) or "terminated by other getUpdates" in err_str:
+        bot_id = None
+        owner_id = None
+        if context.application is not None and getattr(context.application, "bot_data", None):
+            bot_id = context.application.bot_data.get("bot_id")
+            owner_id = context.application.bot_data.get("owner_id")
+        logging.error(
+            f"⚠️ TOKEN CONFLICT — another instance is polling the same bot token "
+            f"(bot_id={bot_id}). This is usually a stolen/shared token. "
+            f"Use /userbot <id> <new_token> (admin) or the 'Update Token' button "
+            f"to replace the token."
+        )
+        if bot_id and bot_id in user_bot_applications:
+            # Stop our own poller so we stop fighting the rogue instance.
+            try:
+                await _cleanup_userbot_app(bot_id)
+                db.set_user_bot_active(bot_id, False)
+                if owner_id:
+                    await send_premium_message(context.bot, owner_id,
+                        f"<blockquote>{pp('⚠️')} <b>BOT TOKEN CONFLICT DETECTED</b></blockquote>\n\n"
+                        "Aapke bot ka token kisi aur instance se bhi use ho raha hai "
+                        "(ye 'token chori' wali problem hai). Bot ko protect karne ke "
+                        "liye ise roka gaya.\n\n"
+                        "Naya token set karne ke liye 'Update Token' button dabayein ya "
+                        "admin se /userbot command ke through naya token dalein.",
+                        parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        return
+    if isinstance(context.error, InvalidToken) or "Unauthorized" in err_str:
+        logging.error("⚠️ INVALID/REVOKED TOKEN. This bot's token is no longer valid. "
+                      "Replace it via /userbot or the 'Update Token' button.")
         return
 
 
@@ -3725,6 +3934,72 @@ async def proof_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user or not is_admin(user.id):
         return
     await reply_premium_message(update.message, f"{pp('✅')} Bot is running fine.", parse_mode=ParseMode.HTML)
+
+
+async def admin_userbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to replace a userbot's token and restart it.
+
+    Usage:
+      /userbot @bot_username NEW_TOKEN
+      /userbot <bot_id> NEW_TOKEN
+      /userbot            -> shows help
+
+    This is the fix for the "token chori" problem: when a client's token is
+    revoked/stolen, the admin can inject the fresh token and the bot starts again
+    with the new token instead of looping on Conflict errors.
+    """
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    msg = update.message
+    parts = (msg.text or "").strip().split()
+    if len(parts) < 3:
+        await reply_premium_message(msg,
+            f"<blockquote>{pp('🔐')} <b>/USERBOT — UPDATE USERBOT TOKEN</b></blockquote>\n\n"
+            "Usage:\n"
+            "<code>/userbot @bot_username NEW_TOKEN</code>\n"
+            "<code>/userbot bot_id NEW_TOKEN</code>\n\n"
+            "Ye command revoked/stolen token wale userbot ka naya token set karke "
+            "use turant restart kar deti hai.",
+            parse_mode=ParseMode.HTML)
+        return
+    identifier = parts[1]
+    new_token = parts[2]
+    bot = None
+    if identifier.startswith("@"):
+        bot = db.get_bot_by_username(identifier.lstrip("@"))
+    else:
+        bot = db.get_user_bot(identifier)
+    if not bot:
+        await reply_premium_message(msg, f"{pe('❌')} UserBot {identifier} not found.", parse_mode=ParseMode.HTML)
+        return
+    bot_id = bot["bot_id"]
+    info, err = await validate_bot_token(new_token)
+    if not info:
+        await reply_premium_message(msg, f"{pe('❌')} Invalid or revoked token: {err}", parse_mode=ParseMode.HTML)
+        return
+    existing = db.get_user_bot_by_token(new_token)
+    if existing and existing.get("bot_id") != bot_id:
+        await reply_premium_message(msg,
+            f"{pe('❌')} Token already linked to {existing.get('bot_username') or existing['bot_id']}.",
+            parse_mode=ParseMode.HTML)
+        return
+    db.update_user_bot_token(bot_id, new_token, info.username)
+    started = await restart_user_bot(bot_id, new_token=new_token)
+    db.set_user_bot_active(bot_id, 1 if started else 0)
+    await reply_premium_message(msg,
+        f"<blockquote>{pp('🔐')} <b>USERBOT TOKEN UPDATED</b></blockquote>\n\n"
+        f"{pp('🤖')} @{info.username} (<code>{bot_id}</code>)\n"
+        f"{pp('✅')} {'Restarted with new token.' if started else 'Token saved but start failed.'}",
+        parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+    # Notify the owner too
+    try:
+        await send_premium_message(context.bot, bot["user_id"],
+            f"<blockquote>{pp('🔐')} <b>YOUR BOT TOKEN WAS UPDATED BY ADMIN</b></blockquote>\n\n"
+            f"{pp('🤖')} @{info.username} naye token ke saath start ho gaya hai.",
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 # ================= MAIN =================
@@ -3775,6 +4050,11 @@ async def main():
     else:
         logging.info("No user bots found in database")
 
+    if not MAIN_BOT_TOKEN:
+        logging.error("MAIN_BOT_TOKEN is not set! Refusing to start. "
+                      "Export it first, e.g.  export MAIN_BOT_TOKEN='123456:ABC...'")
+        raise SystemExit(1)
+
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
         connection_pool_size=100,
@@ -3790,6 +4070,7 @@ async def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("proof", proof_text_command))
     app.add_handler(CommandHandler("prooftext", proof_text_command))
+    app.add_handler(CommandHandler("userbot", admin_userbot_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, handle_message))
     app.add_error_handler(error_handler)
@@ -3799,7 +4080,15 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    # SECURITY: ensure no leftover webhook (from a previous/rogue instance) hijacks updates.
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as ex:
+        logging.warning(f"Main bot delete_webhook failed: {ex}")
+    await app.updater.start_polling(
+        allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"],
+        drop_pending_updates=True,
+    )
     logging.info(f"{pp('✅')} Main bot started successfully")
 
     try:
