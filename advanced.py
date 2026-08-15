@@ -3373,16 +3373,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\nChoose target:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Specific UserBot", "admin_bcast_target_select", "primary", "🎯")],
-                [btn("All UserBots", "admin_bcast_target_all", "success", "🌐")],
+                [btn("UserBot ke Users", "admin_bcast_target_select", "primary", "🎯")],
+                [btn("All UserBots' Users", "admin_bcast_target_all", "success", "🌐")],
+                [btn("UserBot Owners/Admins", "admin_bcast_target_owners", "success", "👑")],
                 [btn("Back", "admin_panel", "primary", "🔙")],
             ]))
+            return
+
+        if data == "admin_bcast_target_owners":
+            if not is_admin(uid):
+                return
+            context.user_data["admin_broadcast"] = True
+            context.user_data["admin_broadcast_owners"] = True
+            context.user_data["admin_broadcast_target"] = None
+            await safe_edit_message_text(q, f"<blockquote>{pp('👑')} <b>BROADCAST TO USERBOT OWNERS/ADMINS</b></blockquote>\n\nSend text or media. Ye message SIRF har userbot ke owner (admin) ko jayega — end-users ko NAHI.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
             return
 
         if data == "admin_bcast_target_all":
             if not is_admin(uid):
                 return
             context.user_data["admin_broadcast"] = True
+            context.user_data["admin_broadcast_owners"] = False
             context.user_data["admin_broadcast_target"] = None
             await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO ALL</b></blockquote>\n\nSend text or media to broadcast to all userbots' users.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
             return
@@ -3390,6 +3401,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_bcast_target_select":
             if not is_admin(uid):
                 return
+            context.user_data["admin_broadcast_owners"] = False
             bots = db.get_all_user_bots() or []
             if not bots:
                 await safe_edit_message_text(q, f"{pe('❌')} No userbots found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
@@ -3550,13 +3562,18 @@ async def preview_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message_text(q, f"{pe('❌')} Preview failed: {str(ex)}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
     target_bot = draft.get("target_bot")
-    target_label = f"userbot {target_bot}" if target_bot else "ALL userbots"
+    if draft.get("target_owners"):
+        target_label = "ALL userbot owners/admins"
+    elif target_bot:
+        target_label = f"userbot {target_bot}"
+    else:
+        target_label = "ALL userbots' users"
     await safe_edit_message_text(q, f"{pe('✅')} Preview sent above.\n{pe('✈️')} Confirm broadcast to <b>{target_label}</b>?", parse_mode=ParseMode.HTML, reply_markup=confirm_kb("admin_bcast_confirm", "admin_panel"))
 
 
 async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
     draft = context.user_data.get("admin_broadcast_draft", {})
-    for key in ["admin_broadcast", "admin_broadcast_stage", "admin_broadcast_target"]:
+    for key in ["admin_broadcast", "admin_broadcast_stage", "admin_broadcast_target", "admin_broadcast_owners"]:
         context.user_data.pop(key, None)
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft to send.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
@@ -3567,8 +3584,26 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message_text(q, f"{pe('✈️')} Admin broadcast started...", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
     total_sent = 0
     total_fail = 0
+    owners_mode = bool(draft.get("target_owners"))
+
     for bot in bots:
         bot_id = bot["bot_id"]
+        owner_id = bot["user_id"]
+
+        # Owner-only broadcast: message goes only to this userbot's owner/admin,
+        # NOT to the end-users. Sent via the MAIN bot (context.bot).
+        if owners_mode:
+            try:
+                await send_media(context.bot, owner_id, draft.get("media"), draft.get("media_type") or "text",
+                                 draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
+                                 entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+                total_sent += 1
+            except Forbidden:
+                total_fail += 1
+            except Exception:
+                total_fail += 1
+            continue
+
         sub = db.get_subscription_for_bot(bot_id)
         if not sub:
             continue
@@ -3596,7 +3631,13 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
                 total_fail += 1
             except Exception:
                 total_fail += 1
-    target_label = f"userbot {draft['target_bot']}" if draft.get("target_bot") else "ALL userbots"
+
+    if owners_mode:
+        target_label = "ALL userbot owners/admins"
+    elif draft.get("target_bot"):
+        target_label = f"userbot {draft['target_bot']}"
+    else:
+        target_label = "ALL userbots' users"
     await safe_edit_message_text(q, f"<blockquote>{pp('✅')} <b>ADMIN BROADCAST COMPLETE</b></blockquote>\n\n{pp('📤')} Target: {target_label}\n{pp('✅')} Sent: {total_sent}\n{pp('❌')} Failed: {total_fail}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
     context.user_data.pop("admin_broadcast_draft", None)
 
@@ -3832,6 +3873,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_name": extracted.get("file_name"),
             "mime_type": extracted.get("mime_type"),
             "target_bot": context.user_data.get("admin_broadcast_target"),
+            "target_owners": bool(context.user_data.get("admin_broadcast_owners")),
         }
         context.user_data["admin_broadcast_draft"] = draft
         context.user_data["admin_broadcast_stage"] = "await_buttons"
