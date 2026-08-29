@@ -1021,6 +1021,83 @@ def test_userbots_survive_invalid_main_token():
         advanced.user_bot_applications.clear()
 
 
+
+def test_polling_noise_filter_downgrades_hiccup():
+    """100-line traceback ki jagah ek WARNING line - bot.log readable rahe."""
+    import logging as _logging
+    rec = _logging.LogRecord("telegram.ext.Updater", _logging.ERROR, __file__, 1,
+                             "Exception happened while polling for updates.", (), None)
+    rec.exc_info = (RuntimeError, RuntimeError("boom"), None)
+    assert advanced.PollingNoiseFilter().filter(rec) is True
+    assert rec.levelno == _logging.WARNING, rec.levelno
+    assert rec.exc_info is None, "traceback should be dropped"
+    assert "retry" in rec.msg, rec.msg
+
+    # doosre errors untouched rehne chahiye
+    rec2 = _logging.LogRecord("telegram.ext.Updater", _logging.ERROR, __file__, 1,
+                              "Something else broke", (), None)
+    advanced.PollingNoiseFilter().filter(rec2)
+    assert rec2.levelno == _logging.ERROR
+
+
+def test_health_check_restarts_dead_polling():
+    """Watchdog: polling band ho to main bot aur userbot dono wapas start hon."""
+    db = make_world()
+    started = []
+    polling_started = []
+
+    class DeadUpdater:
+        running = False
+
+        async def start_polling(self, *a, **k):
+            polling_started.append("main")
+
+    async def fake_start_user_bot(token, bot_id, owner_id):
+        started.append(bot_id)
+
+    app = types.SimpleNamespace(updater=DeadUpdater())
+    ctx = types.SimpleNamespace(application=types.SimpleNamespace(updater=DeadUpdater()),
+                                  user_data={}, bot=FakeBot())
+    advanced.user_bot_applications[BOT_ID] = app
+    old_start = advanced.start_user_bot
+    advanced.start_user_bot = fake_start_user_bot
+    try:
+        asyncio.run(advanced.health_check_job(ctx))
+    finally:
+        advanced.start_user_bot = old_start
+        advanced.user_bot_applications.pop(BOT_ID, None)
+
+    assert polling_started == ["main"], polling_started
+    assert started == [BOT_ID], started
+
+
+def test_health_check_leaves_healthy_bots_alone():
+    db = make_world()
+    started = []
+
+    class LiveUpdater:
+        running = True
+
+        async def start_polling(self, *a, **k):
+            started.append("should-not-happen")
+
+    ctx = types.SimpleNamespace(application=types.SimpleNamespace(updater=LiveUpdater()),
+                                user_data={}, bot=FakeBot())
+    advanced.user_bot_applications[BOT_ID] = types.SimpleNamespace(updater=LiveUpdater())
+    old_start = advanced.start_user_bot
+
+    async def fake_start(*a, **k):
+        started.append("userbot-should-not-happen")
+
+    advanced.start_user_bot = fake_start
+    try:
+        asyncio.run(advanced.health_check_job(ctx))
+    finally:
+        advanced.start_user_bot = old_start
+        advanced.user_bot_applications.pop(BOT_ID, None)
+    assert started == [], started
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

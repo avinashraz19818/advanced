@@ -71,6 +71,32 @@ def retry_async(max_retries=3, delay=1, backoff=2):
         return wrapper
     return decorator
 
+class PollingNoiseFilter(logging.Filter):
+    """Bot.log ko readable rakhta hai.
+
+    'Exception happened while polling for updates' ek *network hiccup* hai - PTB ka
+    polling loop iske baad khud retry karta hai (network_retry_loop: max_retries=-1,
+    repeat_on_success=True). Isliye 100-line traceback ki jagah ek line dikhate hain.
+    """
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "Exception happened while polling for updates" in msg:
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+            record.exc_info = None
+            record.exc_text = None
+            record.msg = ("Network hiccup while polling (Telegram se connection toota) - "
+                          "bot khud retry kar raha hai, kuch karna nahi hai.")
+            record.args = ()
+        return True
+
+
+logging.getLogger("telegram.ext.Updater").addFilter(PollingNoiseFilter())
+
+
 # ================= TIMEZONE HELPER =================
 def now_aware():
     return datetime.now(timezone.utc)
@@ -4099,6 +4125,7 @@ async def _run_main():
 
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")
     app.job_queue.run_repeating(check_expired_subscriptions_job, interval=3600, first=120, name="expired_subscriptions_check")
+    app.job_queue.run_repeating(health_check_job, interval=300, first=120, name="health_check")
 
     try:
         await app.initialize()
@@ -4130,6 +4157,42 @@ async def _run_main():
             except Exception:
                 pass
         logging.info(f"{pp('✅')} All bots stopped")
+
+
+async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """Watchdog: agar kisi bot ki polling chupchap band ho jaye to use wapas chalao.
+
+    Network errors par PTB khud retry karta hai, lekin agar kisi wajah se updater
+    'running' nahi raha (process hiccup, purana poller, etc.) to clients ke bots
+    offline ho jaate hain aur pata bhi nahi chalta. Isliye har 5 minute me check.
+    """
+    allowed = ["message", "callback_query", "chat_member", "chat_join_request", "inline_query"]
+
+    # main bot
+    try:
+        updater = getattr(context.application, "updater", None)
+        if updater is not None and not updater.running:
+            logging.warning("Main bot polling not running - restarting polling")
+            await updater.start_polling(allowed_updates=allowed)
+    except Exception as ex:
+        logging.error(f"health_check: main bot restart failed: {ex}")
+
+    # userbots
+    for bid in list(user_bot_applications.keys()):
+        try:
+            app = user_bot_applications.get(bid)
+            if app is None:
+                continue
+            updater = getattr(app, "updater", None)
+            if updater is not None and not updater.running:
+                bot_data = db.get_user_bot(bid)
+                if not bot_data:
+                    continue
+                logging.warning(f"userbot {bid} polling not running - restarting it")
+                await start_user_bot(bot_data["bot_token"], bid, bot_data["user_id"])
+                db.set_user_bot_active(bid, True)
+        except Exception as ex:
+            logging.error(f"health_check: userbot {bid} restart failed: {ex}")
 
 
 async def main():
