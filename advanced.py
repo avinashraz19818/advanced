@@ -1427,11 +1427,11 @@ def buttons_to_markup(buttons_json: Optional[str]):
             row_btns = []
             for btn_data in row:
                 text = btn_data.get('text', '')
-                # Legacy rows (saved before the emoji fix) stored a stripped label
-                # plus an "icon_id". Keep rendering those exactly as before so old
-                # bots look unchanged. New rows carry the emoji inside the text and
-                # have no icon_id at all.
-                icon_id = btn_data.get('icon_id') if not has_emoji(text) else None
+                # icon_id is present only when the owner typed a PREMIUM/custom emoji
+                # (or for legacy rows). Telegram inline-button text is a plain string,
+                # so a custom emoji can only be shown via icon_custom_emoji_id - we
+                # apply whatever was stored here.
+                icon_id = btn_data.get('icon_id')
                 if btn_data.get('url'):
                     api_kwargs = {"style": "primary"}
                     if icon_id:
@@ -1450,7 +1450,18 @@ def buttons_to_markup(buttons_json: Optional[str]):
         return None
 
 
-def buttons_json_from_text(text: str):
+def buttons_json_from_text(text: str, custom_map: Optional[dict] = None):
+    """Build button rows from "Label|url" lines.
+
+    custom_map = {emoji_char: custom_emoji_id} from EmojiManager.extract_from_entities()
+    (the message the owner actually sent, premium-emoji entities included).
+
+    Emoji behaviour (jaisa owner chahta hai):
+      * NORMAL emoji  -> stays inside the button text, exactly as typed.
+      * PREMIUM/custom emoji -> Telegram ka inline-button text ek plain string hai, isliye
+        wo character text me premium nahi dikh sakta. Use icon_custom_emoji_id ke roop me
+        button par lagaya jata hai (aur text se hata diya jata hai taaki double na dikhe).
+    """
     if not text:
         return None
     json_rows = []
@@ -1468,13 +1479,19 @@ def buttons_json_from_text(text: str):
             url = part[idx + 1:].strip()
             if not label or not url:
                 continue
-            # FIX (owner's own emoji): the label is stored verbatim - emoji included.
-            # No icon_id is written for new buttons, so Telegram shows the emoji the
-            # owner actually typed instead of the default link icon.
-            json_row.append({
-                "text": label,
-                "url": url
-            })
+            icon_id = None
+            display = label
+            if custom_map:
+                for ch, eid in custom_map.items():
+                    if ch and ch in display:
+                        icon_id = eid
+                        display = display.replace(ch, "").strip()
+            btn_entry = {"text": display if icon_id else label, "url": url}
+            if icon_id:
+                if not btn_entry["text"]:
+                    btn_entry["text"] = "Button"
+                btn_entry["icon_id"] = icon_id
+            json_row.append(btn_entry)
         if json_row:
             json_rows.append(json_row)
     return json.dumps(json_rows) if json_rows else None
@@ -2389,7 +2406,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         mid = ud.pop("editing_buttons_msg_id")
         row = db.get_message_by_id(mid)
         if row and row["bot_id"] == bot_id:
-            btn_json = buttons_json_from_text(msg.text or "")
+            btn_json = buttons_json_from_text(msg.text or "", extracted["emoji_map"])
             db.update_message_buttons(mid, btn_json or "[]")
             await reply_premium_message(msg, f"{pe('✅')} Buttons updated.", parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[btn(f"{pe('🔙')} Back to Messages", f"ubmm_{bot_id}_{row['channel_id']}", "primary", "🔙")]]))
@@ -2462,7 +2479,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         msg_id = info.get("msg_id")
         msg_ids = info.get("msg_ids") or ([] if msg_id is None else [msg_id])
         append_mode = info.get("append", False)
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", extracted["emoji_map"])
         if btn_json:
             for _id in msg_ids:
                 if append_mode:
@@ -2563,7 +2580,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
 
     if context.user_data.get(f"broadcast_stage_{bot_id}") == "await_buttons":
         draft = context.user_data.get(f"broadcast_draft_{bot_id}", {})
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", extracted["emoji_map"])
         if btn_json:
             draft["buttons_json"] = btn_json
             context.user_data[f"broadcast_draft_{bot_id}"] = draft
@@ -2594,8 +2611,9 @@ INLINE_BUTTONS_HELP = (
     "{icon} <b>Send Inline Buttons</b>\n\n"
     "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
     "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>\n\n"
-    "<b>Emoji:</b> aap label mein jo emoji likhoge, button par wahi dikhega —\n"
-    "koi default icon force nahi hoga."
+    "<b>Emoji:</b> normal emoji text me hi rahega jaisa likha hai.\n"
+    "Premium/custom emoji button ke <b>icon</b> ke roop me set hoga\n"
+    "(Telegram inline-button text plain hota hai, isliye premium emoji icon me dikhta hai)."
 )
 
 
@@ -3858,7 +3876,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_set_leave_btns_idx") is not None and is_admin(user.id):
         idx = context.user_data.pop("admin_set_leave_btns_idx")
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "",
+            EmojiManager.extract_from_entities(msg.text or "", list(msg.entities or msg.caption_entities or [])))
         if btn_json:
             cfg = db.get_leave_recovery_config()
             messages = cfg.get("messages", [])
@@ -3915,7 +3934,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_broadcast_stage") == "await_buttons" and is_admin(user.id):
         draft = context.user_data.get("admin_broadcast_draft", {})
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "",
+            EmojiManager.extract_from_entities(msg.text or "", list(msg.entities or msg.caption_entities or [])))
         if btn_json:
             draft["buttons_json"] = btn_json
             context.user_data["admin_broadcast_draft"] = draft

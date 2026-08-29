@@ -1098,6 +1098,57 @@ def test_health_check_leaves_healthy_bots_alone():
     assert started == [], started
 
 
+
+class FakeCustomEmoji:
+    def __init__(self, offset, length, custom_emoji_id):
+        self.type = "custom_emoji"
+        self.offset = offset
+        self.length = length
+        self.custom_emoji_id = custom_emoji_id
+
+
+def test_premium_emoji_becomes_button_icon():
+    """Screenshot fix: premium/custom emoji button ke ICON me set hota hai, normal nahi."""
+    # owner ne "Loss Recovery🏆|https://x" bheja jaha 🏆 premium/custom tha
+    cm = {"🏆": "5042101437237036298"}
+    js = advanced.buttons_json_from_text("Loss Recovery🏆|https://t.me/x", cm)
+    entry = json.loads(js)[0][0]
+    assert entry["text"] == "Loss Recovery", entry
+    assert entry["icon_id"] == "5042101437237036298", entry
+
+    b = advanced.buttons_to_markup(js).inline_keyboard[0][0]
+    assert b.text == "Loss Recovery"
+    assert b.api_kwargs.get("icon_custom_emoji_id") == "5042101437237036298", b.to_dict()
+
+
+def test_normal_emoji_stays_in_text_no_icon():
+    js = advanced.buttons_json_from_text("🎁 Gift Code|https://t.me/g", {})
+    entry = json.loads(js)[0][0]
+    assert entry["text"] == "🎁 Gift Code", entry
+    assert "icon_id" not in entry, entry
+    b = advanced.buttons_to_markup(js).inline_keyboard[0][0]
+    assert b.text == "🎁 Gift Code"
+    assert not b.api_kwargs.get("icon_custom_emoji_id"), b.to_dict()
+
+
+def test_extract_from_entities_builds_custom_map():
+    text = "VIP⭕"  # ⭕ custom_emoji ke roop me, 1 utf16 unit? use 🏆 (2 units) for realism
+    text2 = "Loss Recovery🏆"
+    # 🏆 ke liye utf16 length = 2
+    ent = FakeCustomEmoji(offset=len("Loss Recovery"), length=2, custom_emoji_id="999")
+    cm = advanced.EmojiManager.extract_from_entities(text2, [ent])
+    assert cm == {"🏆": "999"}, cm
+
+
+def test_mixed_emoji_label():
+    """Normal + premium dono hone par premium icon banega, normal text me rahega."""
+    cm = {"🏆": "123"}
+    js = advanced.buttons_json_from_text("🎁 Gift🏆|https://x", cm)
+    entry = json.loads(js)[0][0]
+    assert entry["text"] == "🎁 Gift", entry
+    assert entry["icon_id"] == "123", entry
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":
