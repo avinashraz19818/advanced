@@ -403,6 +403,38 @@ def _extract_last_id(parts: list) -> int:
             return v
     return 0
 
+
+# Callback prefixes that belong to a userbot's manage panel. The main bot shows the
+# very same panel (manage_bot_...), so it has to recognise these too - otherwise
+# every button of that panel is dead on the main bot and the owner/admin only gets
+# the menu back again and again.
+MANAGED_CB_PREFIXES = ("ub_", "ubm_", "ubmm_", "setmsg_", "setbtn_", "setbtng",
+                       "bcast_", "delmsg_", "removechan_", "toggleauto_")
+
+
+def managed_bot_id_from_data(data: str, uid: int) -> Optional[str]:
+    """Return the bot_id a manage-panel callback belongs to, or None.
+
+    bot_id is "<user_id>_<n>", so it is matched as a sequence of "_"-separated
+    tokens inside the callback data (works for ubmm_<bot>_<chan>_<msg> too).
+    """
+    if not data or not data.startswith(MANAGED_CB_PREFIXES):
+        return None
+    candidates = [b["bot_id"] for b in (db.get_user_bots_by_owner(uid) or [])]
+    if is_admin(uid):
+        candidates += [b["bot_id"] for b in (db.get_all_user_bots() or [])]
+    tokens = data.split("_")
+    best = None
+    for bid in candidates:
+        bid_tokens = str(bid).split("_")
+        n = len(bid_tokens)
+        for i in range(len(tokens) - n + 1):
+            if tokens[i:i + n] == bid_tokens:
+                if best is None or len(str(bid)) > len(str(best)):
+                    best = bid
+                break
+    return best
+
 # ================= DATABASE =================
 DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/advanced_bot"
 
@@ -771,6 +803,25 @@ class Database:
 # ================= GLOBALS =================
 db = Database()
 user_bot_applications: Dict[str, Application] = {}
+
+
+# ================= LEAVE RECOVERY HELPERS =================
+def leave_recovery_channel_enabled(cfg: dict, channel_id) -> bool:
+    """Per-channel leave-recovery switch.
+
+    FIX: default is OFF for everybody. Earlier an unconfigured channel was treated
+    as ON, so switching the global flag on silently enabled leave recovery for every
+    channel of every userbot. Now a channel is active only when it was explicitly
+    switched ON in the per-channel settings (already-configured channels keep
+    working exactly as before).
+    """
+    if not cfg:
+        return False
+    channel_configs = cfg.get("channel_configs") or {}
+    try:
+        return bool(channel_configs.get(str(int(channel_id)), False))
+    except (TypeError, ValueError):
+        return bool(channel_configs.get(str(channel_id), False))
 
 
 # ================= EMOJI MANAGER =================
@@ -1263,6 +1314,22 @@ def render_dynamic_text(text: Optional[str], user=None, extra: Optional[dict] = 
     return rendered
 
 
+# Emoji detection regex - used to decide whether a button label already carries the
+# owner's own emoji (in that case we must NOT attach a default icon on top of it).
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF\U00002B00-\U00002BFF\U0000FE00-\U0000FE0F"
+    "\U0001F900-\U0001F9FF\u2764\u2765\u203C\u2049\u3030\u303D\u3297\u3299]"
+)
+
+
+def has_emoji(text: Optional[str]) -> bool:
+    """True when the text contains at least one emoji/pictograph character."""
+    if not text:
+        return False
+    return bool(_EMOJI_RE.search(text))
+
+
 def parse_buttons_text(text: Optional[str]):
     if not text:
         return []
@@ -1280,18 +1347,11 @@ def parse_buttons_text(text: Optional[str]):
             label = part[:idx].strip()
             url = part[idx + 1:].strip()
             if label and url:
-                icon_id = None
-                display_label = label
-                for emoji_char, eid in EMOJI_IDS.items():
-                    if label.startswith(emoji_char):
-                        icon_id = eid
-                        display_label = label[len(emoji_char):].strip()
-                        break
-                if not icon_id:
-                    icon_id = EMOJI_IDS.get("🔗", "5042101437237036298")
+                # FIX: the owner's own emoji stays exactly as typed inside the
+                # button text. We no longer strip it and no longer force the
+                # default "link" icon on top of it.
                 row_buttons.append(InlineKeyboardButton(
-                    display_label or label, url=url,
-                    api_kwargs={"style": "primary", "icon_custom_emoji_id": icon_id}
+                    label, url=url, api_kwargs={"style": "primary"}
                 ))
         if row_buttons:
             buttons.append(row_buttons)
@@ -1310,11 +1370,17 @@ def buttons_to_markup(buttons_json: Optional[str]):
             row_btns = []
             for btn_data in row:
                 text = btn_data.get('text', '')
-                icon_id = btn_data.get('icon_id') or EMOJI_IDS.get("🔗", "5042101437237036298")
+                # Legacy rows (saved before the emoji fix) stored a stripped label
+                # plus an "icon_id". Keep rendering those exactly as before so old
+                # bots look unchanged. New rows carry the emoji inside the text and
+                # have no icon_id at all.
+                icon_id = btn_data.get('icon_id') if not has_emoji(text) else None
                 if btn_data.get('url'):
+                    api_kwargs = {"style": "primary"}
+                    if icon_id:
+                        api_kwargs["icon_custom_emoji_id"] = icon_id
                     row_btns.append(InlineKeyboardButton(
-                        text, url=btn_data['url'],
-                        api_kwargs={"style": "primary", "icon_custom_emoji_id": icon_id}
+                        text, url=btn_data['url'], api_kwargs=api_kwargs
                     ))
                 elif btn_data.get('cb'):
                     row_btns.append(InlineKeyboardButton(text, callback_data=btn_data['cb']))
@@ -1345,19 +1411,12 @@ def buttons_json_from_text(text: str):
             url = part[idx + 1:].strip()
             if not label or not url:
                 continue
-            icon_id = None
-            display_label = label
-            for emoji_char, eid in EMOJI_IDS.items():
-                if label.startswith(emoji_char):
-                    icon_id = eid
-                    display_label = label[len(emoji_char):].strip()
-                    break
-            if not icon_id:
-                icon_id = EMOJI_IDS.get("🔗", "5042101437237036298")
+            # FIX (owner's own emoji): the label is stored verbatim - emoji included.
+            # No icon_id is written for new buttons, so Telegram shows the emoji the
+            # owner actually typed instead of the default link icon.
             json_row.append({
-                "text": display_label or label,
-                "url": url,
-                "icon_id": icon_id
+                "text": label,
+                "url": url
             })
         if json_row:
             json_rows.append(json_row)
@@ -1642,6 +1701,61 @@ def _runtime_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict:
     return context.user_data[key]
 
 
+# Transient "the bot is waiting for your next message" flags. When one of these is
+# left behind (user pressed a back/cancel button that did not clean up, or the flow
+# was interrupted) the next message the owner sends gets swallowed by the wrong
+# branch - which is exactly why setting a second message kept failing and the menu
+# kept popping up again.
+FLOW_STATE_KEYS = (
+    "setting_message", "messages", "pending_buttons", "pending_buttons_group",
+    "pending_buttons_group_addmore", "waiting_buttons",
+    "editing_text_msg_id", "editing_media_msg_id", "editing_buttons_msg_id",
+    "adding_channel",
+)
+
+
+def clear_flow_state(context: ContextTypes.DEFAULT_TYPE, uid: int, bot_id: str) -> None:
+    """Drop every pending-input flag of this owner for this bot."""
+    ud = context.user_data.get(f"{uid}_{bot_id}")
+    if isinstance(ud, dict):
+        for key in FLOW_STATE_KEYS:
+            ud.pop(key, None)
+    for key in FLOW_STATE_KEYS:
+        context.user_data.pop(f"{key}_{bot_id}", None)
+
+
+def has_active_flow(context: ContextTypes.DEFAULT_TYPE, uid: int, bot_id: str) -> bool:
+    """True while the bot is waiting for a message/media from this owner for this bot."""
+    ud = context.user_data.get(f"{uid}_{bot_id}") or {}
+    if not isinstance(ud, dict):
+        return False
+    for key in ("setting_message", "waiting_buttons", "adding_channel",
+                "editing_text_msg_id", "editing_media_msg_id", "editing_buttons_msg_id"):
+        if ud.get(key):
+            return True
+    for key in ("setting_message", "waiting_buttons", "adding_channel"):
+        if context.user_data.get(f"{key}_{bot_id}"):
+            return True
+    if context.user_data.get(f"broadcast_stage_{bot_id}"):
+        return True
+    return False
+
+
+def bot_for(bot_id: str, context: ContextTypes.DEFAULT_TYPE):
+    """Return the Bot object that must talk to this userbot's users.
+
+    When the owner/admin drives the panel from the MAIN bot, context.bot is the main
+    bot - using it would send DMs/join-request approvals from the wrong account.
+    """
+    app = user_bot_applications.get(bot_id)
+    if app is not None:
+        try:
+            return app.bot
+        except Exception:
+            pass
+    return context.bot
+
+
 async def sync_pending_join_requests_for_channel(bot_id: str, channel_id: int, bot):
     try:
         if not hasattr(bot, 'get_chat_join_requests'):
@@ -1712,15 +1826,42 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML)
         return
 
+    # FIX: "Set Inline Button" used to be a dead button. The dedicated
+    # handle_set_buttons_callback handler is registered AFTER the generic one, and
+    # in python-telegram-bot only the FIRST matching handler of a group runs - so
+    # these two callback shapes landed here, matched nothing and silently did
+    # nothing. Route them explicitly (and they are also registered first now).
+    if data == f"setbtng_{bot_id}" or data.startswith(f"setbtn_{bot_id}_"):
+        await handle_set_buttons_callback(update, context, bot_id, owner_id)
+        return
+
     if data == "main_menu":
+        clear_flow_state(context, uid, bot_id)
         user = q.from_user
         await safe_edit_message_text(q, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML,
             reply_markup=bot_management_kb(bot_id, uid))
         return
 
     if data == f"back_to_manage_{bot_id}" or data == f"manage_bot_{bot_id}":
+        # Going back to the manage menu ends any half-finished input flow, otherwise
+        # a stale state (waiting_buttons / editing_*) keeps eating the next messages.
+        clear_flow_state(context, uid, bot_id)
         await safe_edit_message_text(q, f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>", parse_mode=ParseMode.HTML,
             reply_markup=bot_management_kb(bot_id, uid))
+        return
+
+    if data == f"sub_for_bot_{bot_id}":
+        await safe_edit_message_text(q, UIFormatter.subscription_required(), parse_mode=ParseMode.HTML,
+            reply_markup=subscription_plans_kb(bot_id))
+        return
+
+    if data == f"sub_basic_{bot_id}" or data == f"sub_pro_{bot_id}":
+        plan = "Basic" if data.startswith("sub_basic_") else "Pro"
+        await safe_edit_message_text(q,
+            f"<blockquote>{pp('💰') if plan == 'Basic' else pp('⚡️')} <b>{plan} PLAN SELECTED</b></blockquote>\n\n"
+            f"{'Rs2599/month — 1 channel' if plan == 'Basic' else 'Rs3999/month — 5 channels'}\n\n"
+            f"{pp('📞')} Contact {ADMIN_USERNAME} to complete payment.",
+            parse_mode=ParseMode.HTML, reply_markup=subscription_plans_kb(bot_id))
         return
 
     if data == f"ub_subscription_{bot_id}":
@@ -1761,6 +1902,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if not channels:
             await safe_edit_message_text(q, f"{pe('❌')} Add a channel first.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
             return
+        # Always start from a clean slate: a leftover waiting_buttons/editing_* flag
+        # from a previous (aborted) attempt would otherwise swallow the new message.
+        clear_flow_state(context, uid, bot_id)
         ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["setting_message"] = True
         context.user_data[f"setting_message_{bot_id}"] = True
@@ -1931,10 +2075,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         msg_id = _extract_last_id(parts)
         ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["editing_buttons_msg_id"] = msg_id
-        await safe_edit_message_text(q,
-            f"{pe('🔘')} <b>Send Inline Buttons</b>\n\n"
-            "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
-            "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>",
+        await safe_edit_message_text(q, INLINE_BUTTONS_HELP.format(icon=pe('🔘')),
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"ub_manage_messages_{bot_id}", "danger", "❌")]]))
         return
 
@@ -1946,6 +2087,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     if data == f"setmsg_more_{bot_id}":
+        clear_flow_state(context, uid, bot_id)
         ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["setting_message"] = True
         context.user_data[f"setting_message_{bot_id}"] = True
@@ -1976,8 +2118,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["waiting_buttons"] = {"msg_id": msg_id, "append": True}
         await safe_edit_message_text(q,
-            f"{pe('🔘')} Send more inline buttons to append:\n\n"
-            "<code>Button Label|https://link</code>",
+            f"{pe('🔘')} <b>Send more inline buttons to append</b>\n\n"
+            "<code>Button Label|https://link</code>\n\n"
+            "<i>Emoji aap jo likhoge wahi rahega.</i>",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
         return
 
@@ -1987,16 +2130,27 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if grp:
             ud["waiting_buttons"] = {"msg_ids": grp.get("msg_ids"), "append": True}
         await safe_edit_message_text(q,
-            f"{pe('🔘')} Send more buttons to append:",
+            f"{pe('🔘')} <b>Send more buttons to append</b>\n\n<code>Button Label|https://link</code>",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
         return
+
+    # Nothing matched. Never leave the owner staring at a button that does nothing:
+    # tell him the menu below is the way forward.
+    logging.warning(f"Unhandled userbot callback '{data}' for bot {bot_id} by {uid}")
+    try:
+        await safe_edit_message_text(q,
+            f"{pe('⚠️')} Ye button purane session ka hai — kaam nahi karega.\nNeeche menu se dobara try karein.",
+            parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
+    except Exception:
+        pass
+    return
 
 
 async def accept_all(q, bot_id: str, owner_id: int, context):
     try:
         channels = db.get_bot_channels(bot_id) or []
         for ch in channels:
-            await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], context.bot)
+            await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], bot_for(bot_id, context))
     except Exception:
         pass
     pending = db.get_pending_requests(bot_id)
@@ -2005,9 +2159,10 @@ async def accept_all(q, bot_id: str, owner_id: int, context):
         return
     ok = 0
     cleaned = 0
+    ub_bot = bot_for(bot_id, context)
     for req in pending:
         try:
-            await context.bot.approve_chat_join_request(req["channel_id"], req["requester_id"])
+            await ub_bot.approve_chat_join_request(req["channel_id"], req["requester_id"])
             db.mark_request_status(req["id"], 'approved')
             ok += 1
         except Exception as ex:
@@ -2213,9 +2368,10 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
 
         if channel_chat and channel_chat.type in ['channel', 'group', 'supergroup']:
             ch = channel_chat
+            ub_bot = bot_for(bot_id, context)
             try:
                 try:
-                    member = await context.bot.get_chat_member(ch.id, context.bot.id)
+                    member = await ub_bot.get_chat_member(ch.id, ub_bot.id)
                     if member.status not in ['administrator', 'creator']:
                         await reply_premium_message(msg, f"{pe('❌')} Bot is not an admin in this channel!\n\nPlease add bot as admin first, then try again.", parse_mode=ParseMode.HTML)
                         return
@@ -2232,7 +2388,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                         return
 
                 db.add_channel(bot_id, ch.id, getattr(ch, 'username', None), ch.title or "Channel")
-                await sync_pending_join_requests_for_channel(bot_id, ch.id, context.bot)
+                await sync_pending_join_requests_for_channel(bot_id, ch.id, ub_bot)
 
                 ud["adding_channel"] = False
                 context.user_data.pop(f"adding_channel_{bot_id}", None)
@@ -2369,7 +2525,21 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
         return
 
-    await reply_premium_message(msg, f"{pe('🔽')} Use buttons to manage.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
+    await reply_premium_message(msg,
+        f"{pe('🔽')} <b>Koi setup flow active nahi hai.</b>\n\n"
+        f"Naya message set karne ke liye pehle <b>Set Message(s)</b> dabao,\n"
+        f"phir apna message yahan bhejo.\n\n"
+        f"(Buttons se hi setup hota hai - direct message bhejne se save nahi hoga.)",
+        parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
+
+
+INLINE_BUTTONS_HELP = (
+    "{icon} <b>Send Inline Buttons</b>\n\n"
+    "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
+    "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>\n\n"
+    "<b>Emoji:</b> aap label mein jo emoji likhoge, button par wahi dikhega —\n"
+    "koi default icon force nahi hoga."
+)
 
 
 async def handle_set_buttons_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -2383,31 +2553,37 @@ async def handle_set_buttons_callback(update: Update, context: ContextTypes.DEFA
     uid = q.from_user.id
     ud = _runtime_store(context, f"{uid}_{bot_id}")
     data = q.data
+    help_text = INLINE_BUTTONS_HELP.format(icon=pe("🔘"))
 
     if data == f"setbtng_{bot_id}":
         grp = ud.get("pending_buttons_group")
         if not grp or not grp.get("msg_ids"):
             await safe_edit_message_text(q, f"{pe('❌')} Group not found. Send media group again.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
             return
+        # A media-group button request replaces any other pending input, so a stale
+        # editing_/setting_message flag can't steal the button lines.
+        clear_flow_state(context, uid, bot_id)
+        ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["waiting_buttons"] = {"msg_ids": grp.get("msg_ids")}
-        await safe_edit_message_text(q,
-            f"{pe('🔘')} <b>Send Inline Buttons</b>\n\n"
-            "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
-            "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>\n\n"
-            "Emoji in button text is preserved exactly as you type.",
+        await safe_edit_message_text(q, help_text,
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
         return
 
     if data.startswith(f"setbtn_{bot_id}_"):
         parts = data.split("_")
         msg_id = _extract_last_id(parts)
+        row = db.get_message_by_id(msg_id) if msg_id else None
+        if not row or row.get("bot_id") != bot_id:
+            await safe_edit_message_text(q, f"{pe('❌')} Message not found (it may have been deleted).",
+                parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
+            return
+        clear_flow_state(context, uid, bot_id)
+        ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["waiting_buttons"] = {"msg_id": msg_id}
-        await safe_edit_message_text(q,
-            f"{pe('🔘')} <b>Send Inline Buttons</b>\n\n"
-            "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
-            "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>\n\n"
-            "Emoji in button text is preserved exactly as you type.",
+        await safe_edit_message_text(q, help_text,
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+        return
+
 
 
 async def delete_pending_leave_recovery_messages(bot_id: str, user_id: int, target_channel_id: int, bot: Bot) -> int:
@@ -2432,11 +2608,10 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     leave_cfg = db.get_leave_recovery_config()
     if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id") and int(leave_cfg["target_channel_id"]) == int(chat.id)):
-        channel_configs = leave_cfg.get("channel_configs", {})
-        chan_key = str(chat.id)
-        chan_enabled = channel_configs.get(chan_key, True)
-        if chan_enabled:
-            await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
+        # NOTE: this is the TARGET (recovery) channel - cleaning up the old
+        # "please rejoin" DMs must NOT depend on the per-source-channel switch
+        # (that one only decides whether recovery DMs get SENT, default OFF).
+        await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
         try:
             await jr.approve()
         except Exception as ex:
@@ -2526,10 +2701,8 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
     if not leave_cfg.get("enabled") or not target_channel_id or not target_link or int(target_channel_id) == int(cmu.chat.id):
         return
 
-    channel_configs = leave_cfg.get("channel_configs", {})
-    source_chan_key = str(cmu.chat.id)
-    if not channel_configs.get(source_chan_key, True):
-        logging.info(f"Leave recovery disabled for channel {cmu.chat.id}, skipping.")
+    if not leave_recovery_channel_enabled(leave_cfg, cmu.chat.id):
+        logging.info(f"Leave recovery disabled (default OFF) for channel {cmu.chat.id}, skipping.")
         return
 
     try:
@@ -2571,10 +2744,16 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.bot_data["bot_id"] = bot_id
     app.bot_data["owner_id"] = owner_id
+    bid = re.escape(bot_id)
     app.add_handler(CommandHandler("start", lambda u, c: user_bot_start(u, c, bot_id, owner_id)))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_public_userbot_callback(u, c, bot_id), pattern=r'^(start_now|live_chat_support)$'))
-    app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
-    app.add_handler(CallbackQueryHandler(lambda u, c: handle_set_buttons_callback(u, c, bot_id, owner_id), pattern=f"^setbtn_{bot_id}_"))
+    # IMPORTANT (order matters): python-telegram-bot runs only the FIRST matching
+    # handler inside a group. The "Set Inline Button" callbacks must be registered
+    # BEFORE the generic one, otherwise the generic pattern swallows them and the
+    # button silently does nothing.
+    app.add_handler(CallbackQueryHandler(lambda u, c: handle_set_buttons_callback(u, c, bot_id, owner_id),
+                                         pattern=f"^(setbtn_{bid}_|setbtng_{bid}$)"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|removechan_|back_to_manage_|manage_bot_|toggleauto_|sub_for_bot_|sub_basic_|sub_pro_|setbtn_addmore_|setbtng_addmore_).*{bid}|^main_menu$"))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
@@ -2610,7 +2789,9 @@ async def preview_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: 
         await safe_edit_message_text(q, f"{pe('❌')} No draft found.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
     try:
-        await send_media(context, owner_id, draft.get("media"), draft.get("media_type") or "text",
+        # bot_for(): when this panel is driven from the MAIN bot, context.bot would be
+        # the main bot - the broadcast/preview has to come from the userbot itself.
+        await send_media(bot_for(bot_id, context), owner_id, draft.get("media"), draft.get("media_type") or "text",
                          draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
                          entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
     except Exception as ex:
@@ -2632,9 +2813,10 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
     await safe_edit_message_text(q, f"{pe('✈️')} Broadcasting...", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
     sent = 0
     fail = 0
+    bc_bot = bot_for(bot_id, context)
     for r in reqs:
         try:
-            await send_media(context, r, draft.get("media"), draft.get("media_type") or "text",
+            await send_media(bc_bot, r, draft.get("media"), draft.get("media_type") or "text",
                              draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
                              entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
             db.mark_reachable(bot_id, r)
@@ -2837,11 +3019,11 @@ def leave_recovery_status_text() -> str:
     messages = cfg.get("messages", [])
     msg_count = len(messages)
 
-    channel_configs = cfg.get("channel_configs", {})
+    channel_configs = cfg.get("channel_configs") or {}
     chan_lines = []
     for cid, enabled in channel_configs.items():
         chan_lines.append(f"  • <code>{cid}</code> → {'🟢 ON' if enabled else '🔴 OFF'}")
-    chan_text = "\n".join(chan_lines) if chan_lines else "  (Global setting applies to all)"
+    chan_text = "\n".join(chan_lines) if chan_lines else "  (Koi channel ON nahi hai — default sabke liye OFF hai)"
 
     msgs_preview = ""
     for i, m in enumerate(messages[:3]):
@@ -2905,7 +3087,7 @@ def leave_recovery_channels_kb() -> InlineKeyboardMarkup:
 
     rows = []
     for cid, title in list(all_channels.items())[:20]:
-        enabled = channel_configs.get(cid, True)
+        enabled = bool(channel_configs.get(cid, False))
         status_icon = "🟢" if enabled else "🔴"
         rows.append([btn(f"{status_icon} {title[:25]}", f"admin_leave_chan_toggle_{cid}", "primary", "⚙️")])
 
@@ -2935,6 +3117,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "main_menu":
             user = q.from_user
+            context.user_data.pop("managing_bot_id", None)
             await safe_edit_message_text(q, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
             for key in list(context.user_data.keys()):
                 if key.startswith(("broadcast_stage_", "broadcast_draft_", "adding_channel_", "setting_message_")):
@@ -2956,7 +3139,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if bot_data.get("user_id") != uid and not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
+            # Remember which bot this panel belongs to, so the owner/admin can keep
+            # working from the MAIN bot (set messages, add channel, buttons...).
+            context.user_data["managing_bot_id"] = bot_id
             await safe_edit_message_text(q, f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>\n\nBot: @{bot_data['bot_username']}\nBot ID: {bot_id}", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
+            return
+
+        # ---- USERBOT MANAGE-PANEL CALLBACKS ON THE MAIN BOT -------------------
+        # bot_management_kb() is shown here too, but none of its ub_*/setmsg_*/...
+        # callbacks used to be handled by the main bot: clicking them did nothing
+        # and any text the user typed only brought the menu back. Delegate them to
+        # the same code the userbot itself uses.
+        managed_bot = managed_bot_id_from_data(data, uid)
+        if managed_bot:
+            m_bot_data = db.get_user_bot(managed_bot)
+            if not m_bot_data:
+                await safe_edit_message_text(q, f"{pe('❌')} Bot not found!", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
+                return
+            if not is_bot_owner(managed_bot, uid):
+                await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
+                return
+            context.user_data["managing_bot_id"] = managed_bot
+            m_owner = m_bot_data.get("user_id") or uid
+            if data.startswith(f"setbtn_{managed_bot}_") or data == f"setbtng_{managed_bot}":
+                await handle_set_buttons_callback(update, context, managed_bot, m_owner)
+            else:
+                await user_bot_callback(update, context, managed_bot, m_owner)
             return
 
         if data.startswith("sub_for_bot_"):
@@ -2969,6 +3177,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_id = parts[2] if len(parts) > 2 and parts[2] not in ["basic", "pro"] else None
             plan = "Basic" if "basic" in data else "Pro"
             await safe_edit_message_text(q, f"<blockquote>{pp('💰') if plan == 'Basic' else pp('⚡️')} <b>{plan} PLAN SELECTED</b></blockquote>\n\n{'Rs2599/month — 1 channel' if plan == 'Basic' else 'Rs3999/month — 5 channels'}\n\n{pp('📞')} Contact {ADMIN_USERNAME} to complete payment.", parse_mode=ParseMode.HTML, reply_markup=subscription_plans_kb(bot_id))
+            return
+
+        if data == "human_verify":
+            db.mark_user_verified(uid)
+            await safe_edit_message_text(q, UIFormatter.verification_success(q.from_user.first_name or ""),
+                parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
             return
 
         if data == "admin_panel":
@@ -3168,7 +3382,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Toggle leave recovery ON/OFF for each channel.\n"
                 "🟢 = Leave recovery active for this channel\n"
                 "🔴 = Leave recovery disabled for this channel\n\n"
-                "<i>By default all channels are ON.</i>",
+                "<i>Default: har channel ke liye OFF. Jisko chahiye usko manually ON karein.</i>",
                 parse_mode=ParseMode.HTML, reply_markup=leave_recovery_channels_kb())
             return
 
@@ -3177,8 +3391,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             chan_id = data.replace("admin_leave_chan_toggle_", "")
             cfg = db.get_leave_recovery_config()
-            channel_configs = cfg.get("channel_configs", {})
-            current = channel_configs.get(chan_id, True)
+            channel_configs = cfg.get("channel_configs") or {}
+            current = bool(channel_configs.get(chan_id, False))
             channel_configs[chan_id] = not current
             cfg["channel_configs"] = channel_configs
             db.set_leave_recovery_config(cfg)
@@ -3433,21 +3647,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    if context.user_data.get("waiting_token") and not is_admin(user.id):
-        token = msg.text.strip()
-        if ":" in token and len(token) > 10:
-            try:
-                test_bot = Bot(token=token)
-                bot_info = await test_bot.get_me()
-                bot_id = db.add_user_bot(user.id, token, bot_info.username)
-                context.user_data.pop("waiting_token", None)
-                await reply_premium_message(msg, f"<blockquote>{pp('✅')} <b>BOT ADDED SUCCESSFULLY</b></blockquote>\n\n{pp('🤖')} @{bot_info.username}\nBot ID: <code>{bot_id}</code>\n\n{pp('⚠️')} You need a subscription to activate your bot.\n{pp('📞')} Contact {ADMIN_USERNAME} to subscribe.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(user.id))
-            except Exception as ex:
-                await reply_premium_message(msg, f"{pe('❌')} Invalid token or bot error: {ex}\n\nPlease try again.", parse_mode=ParseMode.HTML)
-        else:
-            await reply_premium_message(msg, f"{pe('❌')} Invalid token format. Please send the correct BotFather token.", parse_mode=ParseMode.HTML)
-        return
-
     if context.user_data.get("admin_add_userbot") and is_admin(user.id):
         parts = msg.text.strip().split()
         if len(parts) == 2 and parts[0].isdigit():
@@ -3463,6 +3662,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_premium_message(msg, f"{pe('❌')} Error: {ex}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         else:
             await reply_premium_message(msg, f"{pe('❌')} Format: <code>user_id bot_token</code>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        return
+
+    # FIX: "Add New Bot" used to be blocked for admins (`and not is_admin(...)`), so an
+    # admin who pasted a token only ever got "Use menu" + the menu back - again and
+    # again, because waiting_token was never cleared. Admins can add their own bot now.
+    if context.user_data.get("waiting_token"):
+        token = (msg.text or "").strip()
+        if ":" in token and len(token) > 10:
+            try:
+                test_bot = Bot(token=token)
+                bot_info = await test_bot.get_me()
+                bot_id = db.add_user_bot(user.id, token, bot_info.username)
+                context.user_data.pop("waiting_token", None)
+                await reply_premium_message(msg, f"<blockquote>{pp('✅')} <b>BOT ADDED SUCCESSFULLY</b></blockquote>\n\n{pp('🤖')} @{bot_info.username}\nBot ID: <code>{bot_id}</code>\n\n{pp('⚠️')} You need a subscription to activate your bot.\n{pp('📞')} Contact {ADMIN_USERNAME} to subscribe.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(user.id))
+            except Exception as ex:
+                context.user_data.pop("waiting_token", None)
+                await reply_premium_message(msg, f"{pe('❌')} Invalid token or bot error: {ex}\n\nPlease try again.", parse_mode=ParseMode.HTML)
+        else:
+            context.user_data.pop("waiting_token", None)
+            await reply_premium_message(msg, f"{pe('❌')} Invalid token format. Please send the correct BotFather token.", parse_mode=ParseMode.HTML)
         return
 
     if context.user_data.get("admin_add_sub") and is_admin(user.id):
@@ -3624,6 +3843,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_premium_message(msg, f"{pe('❌')} No valid buttons.\n\nFormat:\n• <code>Button Label|https://link</code>\n• <code>Label One|https://link1 || Label Two|https://link2</code>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         context.user_data["admin_broadcast_stage"] = "await_send"
         return
+
+    # ---- USERBOT SETUP FLOW DRIVEN FROM THE MAIN BOT -------------------------
+    # The manage panel of a userbot is reachable from the main bot as well. While a
+    # flow is active there (set message / set buttons / add channel / edit ...), the
+    # typed message belongs to that flow - not to the support inbox and not to the
+    # "Use menu" fallback.
+    managing_bot_id = context.user_data.get("managing_bot_id")
+    if managing_bot_id and is_bot_owner(managing_bot_id, user.id) and has_active_flow(context, user.id, managing_bot_id):
+        admin_flow_active = (
+            context.user_data.get("admin_add_userbot")
+            or context.user_data.get("admin_add_sub")
+            or context.user_data.get("admin_set_leave_target")
+            or context.user_data.get("admin_set_leave_msg")
+            or context.user_data.get("admin_set_default_first_msg")
+            or context.user_data.get("admin_broadcast")
+            or context.user_data.get("admin_broadcast_stage")
+            or context.user_data.get("admin_edit_leave_msg_idx") is not None
+            or context.user_data.get("admin_set_leave_btns_idx") is not None
+        )
+        if not admin_flow_active:
+            m_bot_data = db.get_user_bot(managing_bot_id) or {}
+            await handle_user_bot_message(update, context, managing_bot_id, m_bot_data.get("user_id") or user.id)
+            return
 
     # Admin reply to support message
     if is_admin(user.id) and msg.reply_to_message:
