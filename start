@@ -21,6 +21,15 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Load .env (bot token etc.) if present - real environment variables win.
+if [ -f ".env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+    echo "[INFO] .env loaded"
+fi
+
 # Configuration
 BOT_SCRIPT="advanced.py"
 VENV_DIR=".venv"

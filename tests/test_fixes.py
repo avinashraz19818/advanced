@@ -54,6 +54,7 @@ if "psycopg2" not in sys.modules:
     sys.modules["psycopg2.extras"] = extras
 
 import advanced  # noqa: E402
+from telegram.error import InvalidToken  # noqa: E402
 from telegram import Update  # noqa: E402  (only for isinstance-free duck typing)
 
 
@@ -285,6 +286,32 @@ class FakeDB(advanced.Database):
 
     def get_default_first_message(self):
         return "Hello {first_name}"
+
+    # -- misc used by the admin userbot screens / lifecycle
+    def get_user(self, user_id):
+        return {"user_id": user_id, "username": "someone", "first_name": "Someone"}
+
+    def get_total_requesters_count(self, bot_id):
+        return len(self.join_requests)
+
+    def get_reachable_requesters_count(self, bot_id):
+        return len([r for r in self.reachable if r[0] == bot_id])
+
+    def set_user_bot_active(self, bot_id, active):
+        if bot_id in self.bots:
+            self.bots[bot_id]["is_active"] = 1 if active else 0
+
+    def get_requesters_for_bot(self, bot_id):
+        return []
+
+    def get_pending_requests(self, bot_id):
+        return []
+
+    def get_expired_subscriptions(self):
+        return []
+
+    def get_all_subscriptions(self):
+        return []
 
     # -- settings (leave recovery config lives here)
     def get_setting(self, key, default=None):
@@ -735,6 +762,263 @@ def test_join_request_cleanup_on_target_channel():
     asyncio.run(advanced.handle_join_request(upd, ctx, BOT_ID, CLIENT))
     assert db.leave_msgs[0]["deleted"] is True, db.leave_msgs
     assert approved == [4242]
+
+
+
+def test_bot_add_token_option_is_admin_only():
+    """Token/bot-add option sirf admin panel me - client ke panel se hat gaya."""
+    db = make_world()
+    advanced.ADMIN_USER_IDS.add(ADMIN)
+
+    client_kb = advanced.main_menu_kb(CLIENT)
+    client_cbs = [b.callback_data for row in client_kb.inline_keyboard for b in row]
+    assert "add_new_bot" not in client_cbs, client_cbs
+
+    admin_kb = advanced.main_menu_kb(ADMIN)
+    admin_cbs = [b.callback_data for row in admin_kb.inline_keyboard for b in row]
+    assert "add_new_bot" in admin_cbs, admin_cbs
+
+    # client callback kare to refuse ho, waiting_token set na ho
+    ctx = FakeContext()
+    stranger = FakeUser(CLIENT, "Client")
+    q = FakeQuery("add_new_bot", stranger)
+    asyncio.run(advanced.callback_handler(FakeUpdate(stranger, query=q), ctx))
+    assert ctx.user_data.get("waiting_token") is None, ctx.user_data
+    assert "sirf admin" in (last_text(q.edits) or ""), q.edits
+
+
+def test_admin_opens_client_bot_panel_from_admin_panel():
+    """Admin ko client ke bot ka full control milta hai (manage_bot_<client bot>)."""
+    db = make_world()
+    admin = FakeUser(ADMIN, "Admin")
+    advanced.ADMIN_USER_IDS.add(ADMIN)
+    ctx = FakeContext()
+
+    q = FakeQuery(f"manage_bot_{BOT_ID}", admin)
+    asyncio.run(advanced.callback_handler(FakeUpdate(admin, query=q), ctx))
+    assert ctx.user_data.get("managing_bot_id") == BOT_ID
+    assert "MANAGE BOT" in (last_text(q.edits) or ""), q.edits
+
+    # admin sets a message for the client's bot from the main bot
+    q2 = FakeQuery(f"ub_set_message_{BOT_ID}", admin)
+    asyncio.run(advanced.callback_handler(FakeUpdate(admin, query=q2), ctx))
+    m = FakeMessage("Admin ne set kiya", admin)
+    asyncio.run(advanced.handle_message(FakeUpdate(admin, message=m), ctx))
+    msgs = db.get_messages(CHANNEL, BOT_ID)
+    assert len(msgs) == 1 and msgs[0]["content_text"] == "Admin ne set kiya", msgs
+
+    # admin ke manage panel me "Manage Panel" button hota hai
+    info_kb = None
+    q3 = FakeQuery(f"admin_ub_info_{BOT_ID}", admin)
+    asyncio.run(advanced.callback_handler(FakeUpdate(admin, query=q3), ctx))
+    info_kb = q3.edits[-1]["reply_markup"]
+    cbs = [b.callback_data for row in info_kb.inline_keyboard for b in row]
+    assert f"manage_bot_{BOT_ID}" in cbs, cbs
+
+
+def test_client_message_goes_to_setup_flow_not_support():
+    """Client (non-admin) ka message support inbox me nahi, apne flow me jaana chahiye."""
+    db = make_world()
+    client = FakeUser(CLIENT, "Client")
+    ctx = FakeContext()
+    q = FakeQuery(f"manage_bot_{BOT_ID}", client)
+    asyncio.run(advanced.callback_handler(FakeUpdate(client, query=q), ctx))
+    q2 = FakeQuery(f"ub_set_message_{BOT_ID}", client)
+    asyncio.run(advanced.callback_handler(FakeUpdate(client, query=q2), ctx))
+
+    m = FakeMessage("Client ka message", client)
+    asyncio.run(advanced.handle_message(FakeUpdate(client, message=m), ctx))
+    assert len(db.get_messages(CHANNEL, BOT_ID)) == 1
+    assert not any("Message sent to support" in (x.text or "") for x in m.replies), [x.text for x in m.replies]
+
+
+def test_start_user_bot_is_idempotent():
+    """Do baar start karne par purana poller band hona chahiye (getUpdates conflict fix)."""
+    db = make_world()
+    built = []
+
+    class FakeUpdater:
+        def __init__(self):
+            self.stopped = False
+
+        async def start_polling(self, *a, **k):
+            pass
+
+        async def stop(self):
+            self.stopped = True
+
+    class FakeApp:
+        def __init__(self):
+            self.handlers = {}
+            self.bot_data = {}
+            self.updater = FakeUpdater()
+            self.bot = FakeBot()
+            self.stopped = False
+            self.shutdown_called = False
+
+        def add_handler(self, h, group=0):
+            self.handlers.setdefault(group, []).append(h)
+
+        async def initialize(self):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            self.stopped = True
+
+        async def shutdown(self):
+            self.shutdown_called = True
+
+    class FakeBuilder:
+        def token(self, t):
+            return self
+
+        def concurrent_updates(self, v):
+            return self
+
+        def request(self, r):
+            return self
+
+        def build(self):
+            app = FakeApp()
+            built.append(app)
+            return app
+
+    old_builder = advanced.ApplicationBuilder
+    advanced.ApplicationBuilder = FakeBuilder
+    try:
+        asyncio.run(advanced.start_user_bot("1234:fake", BOT_ID, CLIENT))
+        asyncio.run(advanced.start_user_bot("1234:fake", BOT_ID, CLIENT))
+    finally:
+        advanced.ApplicationBuilder = old_builder
+        advanced.user_bot_applications.pop(BOT_ID, None)
+
+    assert len(built) == 2, built
+    assert built[0].stopped and built[0].shutdown_called, "old instance must be shut down"
+    assert not built[1].stopped
+
+
+def test_main_stops_userbots_on_fatal_error():
+    """main() failure par userbots band hone chahiye (orphan pollers = setup flow loss)."""
+    calls = []
+
+    async def boom():
+        raise InvalidToken("The token was rejected by the server")
+
+    async def fake_stop():
+        calls.append("stopped")
+
+    old_run, old_stop = advanced._run_main, advanced.stop_all_userbots
+    advanced._run_main, advanced.stop_all_userbots = boom, fake_stop
+    try:
+        try:
+            asyncio.run(advanced.main())
+            raise AssertionError("main() must re-raise")
+        except InvalidToken:
+            pass
+    finally:
+        advanced._run_main, advanced.stop_all_userbots = old_run, old_stop
+    assert calls == ["stopped"], calls
+
+
+def test_dotenv_is_loaded():
+    path = "/tmp/_adv_test.env"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# comment\nMAIN_BOT_TOKEN=111:from-dotenv\nQUOTED=\"abc\"\n")
+    os.environ.pop("QUOTED", None)
+    advanced._load_dotenv(path)
+    assert os.environ.get("MAIN_BOT_TOKEN") == "111:from-dotenv" or os.environ.get("QUOTED") == "abc"
+    assert os.environ.get("QUOTED") == "abc", os.environ.get("QUOTED")
+
+
+
+def test_userbots_survive_invalid_main_token():
+    """Real _run_main(): main token kharab ho to userbots chalte rahein, process na mare."""
+    db = make_world()
+    db.bots[BOT_ID]["bot_token"] = "1234:userbot-token"
+    created = []
+
+    class FakeJobQueue:
+        def run_repeating(self, *a, **k):
+            return None
+
+    class FakeUpdater:
+        async def start_polling(self, *a, **k):
+            pass
+
+        async def stop(self):
+            pass
+
+    class FakeApp:
+        def __init__(self, token, bad):
+            self.token, self.bad = token, bad
+            self.handlers = {}
+            self.bot_data = {}
+            self.updater = FakeUpdater()
+            self.bot = FakeBot()
+            self.job_queue = FakeJobQueue()
+
+        def add_handler(self, h, group=0):
+            self.handlers.setdefault(group, []).append(h)
+
+        def add_error_handler(self, h, *a, **k):
+            self.error_handler = h
+
+        async def initialize(self):
+            if self.bad:
+                raise InvalidToken("The token was rejected by the server")
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def shutdown(self):
+            pass
+
+    class FakeBuilder:
+        def __init__(self):
+            self._token = None
+
+        def token(self, t):
+            self._token = t
+            return self
+
+        def concurrent_updates(self, v):
+            return self
+
+        def request(self, r):
+            return self
+
+        def build(self):
+            bad = (self._token == advanced.MAIN_BOT_TOKEN)
+            app = FakeApp(self._token, bad)
+            created.append(app)
+            return app
+
+    old_builder = advanced.ApplicationBuilder
+    advanced.ApplicationBuilder = FakeBuilder
+    task = None
+    try:
+        task = asyncio.get_event_loop_policy().new_event_loop().create_task(advanced._run_main())
+        loop = task.get_loop()
+        loop.run_until_complete(asyncio.sleep(0.2))
+        assert not task.done(), "process must keep running (userbots alive)"
+        assert BOT_ID in advanced.user_bot_applications, advanced.user_bot_applications
+        # main bot app ban gaya tha aur uska initialize fail hua
+        assert any(a.bad for a in created)
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                task.get_loop().run_until_complete(task)
+            except (asyncio.CancelledError, Exception):
+                pass
+        advanced.ApplicationBuilder = old_builder
+        advanced.user_bot_applications.clear()
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

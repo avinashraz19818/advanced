@@ -31,7 +31,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, TimedOut
 
 # ================= RETRY DECORATOR =================
 def retry_async(max_retries=3, delay=1, backoff=2):
@@ -81,7 +81,34 @@ def make_aware(dt):
     return dt
 
 # ================= CONFIG =================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7687421668:AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE")
+def _load_dotenv(path: str = None) -> None:
+    """Read KEY=VALUE lines from a local .env file (real env vars always win).
+
+    Bot token ko code me edit karne ki zaroorat nahi - repo folder me .env banao:
+        MAIN_BOT_TOKEN=123456:ABC-xyz...
+    (.env .gitignore me hai, isliye token git me kabhi nahi jayega.)
+    """
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+    except Exception as ex:
+        logging.warning(f"Could not read .env: {ex}")
+
+
+_load_dotenv()
+
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "").strip() or "7687421668:AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE"
 ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
@@ -271,9 +298,13 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 is_active = expiry > now_aware()
             status = "🟢" if is_active else "🔴"
             lines.append([btn(f"{status} @{bot_username}", f"manage_bot_{bot_id}", "primary", "🤖")])
-        lines.append([btn("Add New Bot", "add_new_bot", "success", "➕")])
+        if is_admin(uid):
+            lines.append([btn("Add New Bot", "add_new_bot", "success", "➕")])
     else:
-        lines.append([btn("Create New Bot", "add_new_bot", "success", "➕")])
+        if is_admin(uid):
+            lines.append([btn("Create New Bot", "add_new_bot", "success", "➕")])
+    # NOTE: bot add karne ka (token) option sirf ADMIN panel me hai. Clients apna bot
+    # admin se add karwate hain.
     lines.append([btn_url("Contact Admin", f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", "primary", "📞")])
     if is_admin(uid):
         lines.append([btn("Admin Panel", "admin_panel", "danger", "👑")])
@@ -2740,7 +2771,26 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
 
 
 # ================= USER BOT LIFECYCLE =================
+async def stop_all_userbots():
+    """Shut down every userbot Application (used before a restart, so the next
+    attempt does not create a second polling session for the same token)."""
+    for bid in list(user_bot_applications.keys()):
+        try:
+            await stop_user_bot(bid)
+        except Exception as ex:
+            logging.warning(f"stop_all_userbots: {bid}: {ex}")
+
+
 async def start_user_bot(token: str, bot_id: str, owner_id: int):
+    # Idempotent: if this userbot is already polling, stop the old Application first.
+    # Without this, every retry of main() added a second poller for the same token
+    # and the owner's in-memory setup flow (context.user_data) was lost.
+    if bot_id in user_bot_applications:
+        logging.info(f"userbot {bot_id} already running - restarting it cleanly")
+        try:
+            await stop_user_bot(bot_id)
+        except Exception as ex:
+            logging.warning(f"could not stop previous instance of {bot_id}: {ex}")
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.bot_data["bot_id"] = bot_id
     app.bot_data["owner_id"] = owner_id
@@ -2869,6 +2919,7 @@ async def show_admin_userbot_control(q, context: ContextTypes.DEFAULT_TYPE):
             row.append(btn(f"Start @{bot['bot_username'] or bot['bot_id']}", f"admin_ub_start_{bot['bot_id']}", "success", "🚀"))
         row.append(btn("Info", f"admin_ub_info_{bot['bot_id']}", "primary", "📊"))
         kb.append(row)
+        kb.append([btn(f"Manage @{bot['bot_username'] or bot['bot_id']}", f"manage_bot_{bot['bot_id']}", "primary", "⚙️")])
     kb.append([btn("Start All", "admin_start_all", "success", "🚀"), btn("Stop All", "admin_stop_all", "danger", "🛑")])
     kb.append([btn("Refresh", "admin_userbots", "primary", "🔄"), btn("Back to Admin", "admin_panel", "primary", "🔙")])
     await safe_edit_message_text(q, "\n".join(lines)[:4000], parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
@@ -2903,6 +2954,9 @@ async def show_admin_ub_info(q, bot_id_target: str, context: ContextTypes.DEFAUL
         lines.append(f"{pp('✈️')} <b>Channels:</b> {len(channels)}")
         lines.append(f"{pp('👥')} <b>Total Users:</b> {total_users} | <b>Reachable:</b> {reachable}")
         kb = []
+        # Admin ko client ke bot ka pura control yahan se milta hai (set message,
+        # channel, buttons, broadcast...) - same panel jo client ko dikhta hai.
+        kb.append([btn("Manage Panel (Full Control)", f"manage_bot_{bot_id_target}", "success", "⚙️")])
         if is_running:
             kb.append([btn("Stop Bot", f"admin_ub_stop_{bot_id_target}", "danger", "🛑")])
         else:
@@ -3125,6 +3179,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "add_new_bot":
+            # Bot add karne ka option sirf admin ke liye (clients admin se karwate hain).
+            if not is_admin(uid):
+                await safe_edit_message_text(q,
+                    f"{pe('❌')} Bot add karne ka option sirf admin ke liye hai.\n\n"
+                    f"Apna bot add karwane ke liye {ADMIN_USERNAME} se contact karein.",
+                    parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
+                return
             await safe_edit_message_text(q, f"<blockquote>{pp('🔐')} <b>ADD YOUR BOT</b></blockquote>\n\nSend your BotFather API token to link your bot:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "main_menu", "primary", "🔙")]]))
             context.user_data["waiting_token"] = True
             return
@@ -3667,7 +3728,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FIX: "Add New Bot" used to be blocked for admins (`and not is_admin(...)`), so an
     # admin who pasted a token only ever got "Use menu" + the menu back - again and
     # again, because waiting_token was never cleared. Admins can add their own bot now.
-    if context.user_data.get("waiting_token"):
+    if context.user_data.get("waiting_token") and is_admin(user.id):
         token = (msg.text or "").strip()
         if ":" in token and len(token) > 10:
             try:
@@ -3970,7 +4031,7 @@ async def proof_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ================= MAIN =================
-async def main():
+async def _run_main():
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
 
@@ -4039,10 +4100,22 @@ async def main():
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")
     app.job_queue.run_repeating(check_expired_subscriptions_job, interval=3600, first=120, name="expired_subscriptions_check")
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
-    logging.info(f"{pp('✅')} Main bot started successfully")
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+        logging.info(f"{pp('✅')} Main bot started successfully")
+    except InvalidToken as ex:
+        # Main bot ka token kharab ho to bhi clients ke userbots chalte rahenge -
+        # sirf admin/client panel band rahega jab tak token fix nahi hota.
+        logging.error(f"{pp('❌')} MAIN BOT TOKEN INVALID: {ex}")
+        logging.error(
+            "Naya token set karo aur restart karo:\n"
+            "  1) @BotFather -> /mybots -> apna bot -> API Token\n"
+            "  2) Bot folder me .env file me likho:  MAIN_BOT_TOKEN=<naya-token>\n"
+            "  3) bash start"
+        )
+        logging.warning(f"{pp('⚠️')} Admin/client panel BAND rahega, lekin {len(user_bot_applications)} userbot(s) chal rahe hain.")
 
     try:
         await asyncio.Event().wait()
@@ -4059,14 +4132,49 @@ async def main():
         logging.info(f"{pp('✅')} All bots stopped")
 
 
+async def main():
+    """Runs the whole system. On ANY failure the userbots are stopped too, so the
+    next attempt starts clean instead of leaving orphan pollers behind (those caused
+    'Conflict: terminated by other getUpdates request' and made the owner's setup
+    flow forget its state)."""
+    try:
+        await _run_main()
+    except BaseException:
+        try:
+            await stop_all_userbots()
+        except Exception as ex:
+            logging.warning(f"cleanup after fatal error failed: {ex}")
+        raise
+
+
+MAX_START_RETRIES = 5
+
+
 if __name__ == "__main__":
+    attempts = 0
     while True:
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
             logging.info(f"{pp('🛑')} Stopped by user")
             break
+        except InvalidToken as ex:
+            # Permanent: retrying can never succeed, it only floods bot.log.
+            logging.error(f"{pp('❌')} MAIN BOT TOKEN INVALID: {ex}")
+            logging.error(
+                "Naya token set karo aur restart karo:\n"
+                "  1) @BotFather -> /mybots -> apna bot -> API Token (revoke kiya hai to naya copy karo)\n"
+                "  2) Bot folder me .env file banao (ya edit karo) aur likho:\n"
+                "       MAIN_BOT_TOKEN=<naya-token>\n"
+                "  3) bash start\n"
+                "(.env .gitignore me hai - token git me nahi jayega.)"
+            )
+            break
         except Exception as ex:
+            attempts += 1
             logging.error(f"{pp('❌')} Fatal error: {ex}")
-            logging.info(f"{pp('🔄')} Restarting in 10 seconds...")
+            if attempts >= MAX_START_RETRIES:
+                logging.error(f"{pp('🛑')} {MAX_START_RETRIES} baar fail hua - restart band. bot.log check karo.")
+                break
+            logging.info(f"{pp('🔄')} Restarting in 10 seconds... (attempt {attempts}/{MAX_START_RETRIES})")
             time.sleep(10)
