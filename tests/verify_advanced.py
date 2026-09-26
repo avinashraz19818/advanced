@@ -1236,6 +1236,18 @@ def test_user_account_mode():
         check("login: api_id/hash missing par hint", run(A.ua_login_start(779, "+919876543210")) == "error:api")
         A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = saved_id, saved_hash
 
+    # --- .env se credentials (panel nahi) + startup status log
+    saved_pair = (A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH)
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = "12380656", "d927c13beaaf5110f25c505b7c071273"
+    check("env creds: ready mila", A.ua_credentials_available() is True
+          and A.user_account_credentials()[0] == 12380656, str(A.user_account_credentials()))
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = "", ""
+    check("env creds: missing -> off", A.ua_credentials_available() is False)
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = saved_pair
+    src_now = open(A.__file__, encoding="utf-8").read()
+    check("startup log: ready line", "user account mode ready" in src_now)
+    check("startup log: off line + hint", "user account mode OFF" in src_now and "TELEGRAM_API_HINT" in src_now)
+
     # --- adapter: text (premium emoji + buttons -> links)
     client = FakeTLClient()
     sender = A.UserAccountSender("ua123", 999, client, phone="+919876543210",

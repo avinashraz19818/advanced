@@ -4852,6 +4852,12 @@ def user_account_credentials(row: Optional[dict] = None):
     return api_id, api_hash
 
 
+def ua_credentials_available(row: Optional[dict] = None) -> bool:
+    """User account mode ke liye api_id + api_hash dono set hain?"""
+    api_id, api_hash = user_account_credentials(row)
+    return bool(api_id and api_hash)
+
+
 async def start_user_account(bot_id: str, owner_id: int = 0, row: Optional[dict] = None,
                              quiet: bool = False, client_factory=None) -> bool:
     """Saved session (StringSession) se MTProto client chalu karo + handlers lagao."""
@@ -7100,6 +7106,17 @@ async def main():
         logging.info(f"{pp('🌐')} FORCE_IPV4=1 - sirf IPv4 use hoga (IPv6 route ki wajah se "
                      f"aane wale httpx.ReadError ke liye)")
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
+    # .env se user-account credentials pick hue ya nahi - ek line me saaf dikh jaye
+    if not TELETHON_AVAILABLE:
+        logging.info(f"{pp('👤')} user account mode OFF: telethon install nahi hai "
+                     f"(server par: pip install telethon, phir ./start)")
+    elif ua_credentials_available():
+        _api_id, _ = user_account_credentials()
+        logging.info(f"{pp('👤')} user account mode ready (api_id "
+                     f"{str(_api_id)[:3]}***, api_hash ***) - panel me '👤 User Account' option chalu hai")
+    else:
+        logging.info(f"{pp('👤')} user account mode OFF: TELEGRAM_API_ID / TELEGRAM_API_HASH .env me nahi hain\n"
+                     f"{TELEGRAM_API_HINT}")
 
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:
