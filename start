@@ -29,6 +29,12 @@ LOG_FILE="bot.log"
 REQUIREMENTS_FILE="requirements.txt"
 MAX_WAIT=10  # Max seconds to wait for bot to start
 
+# Token check (.env recommended, warna MAIN_BOT_TOKEN environment variable)
+if [ ! -f "$SCRIPT_DIR/.env" ] && [ -z "${MAIN_BOT_TOKEN:-}" ]; then
+    echo -e "${YELLOW}[WARN] .env nahi mila aur MAIN_BOT_TOKEN set nahi hai.${NC}"
+    echo -e "${YELLOW}[WARN] Banao:  echo 'MAIN_BOT_TOKEN=<BotFather_token>' > .env${NC}"
+fi
+
 # Logging function
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"

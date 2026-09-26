@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, TimedOut
 
 # ================= RETRY DECORATOR =================
 def retry_async(max_retries=3, delay=1, backoff=2):
@@ -81,8 +81,66 @@ def make_aware(dt):
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
+# ================= LOG SECURITY (secret masking) =================
+TOKEN_RE = re.compile(r"\d{6,12}:[A-Za-z0-9_\-]{30,}")
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+
+def mask_secrets(text) -> str:
+    """Bot tokens ko kabhi log/error me mat dikhao.
+
+    Ek leaked token Telegram khud revoke kar deta hai (aur public repo me padha
+    hua token poore internet ke liye open hota hai), isliye har log line se
+    pehle token mask ho jata hai."""
+    if not isinstance(text, str):
+        text = str(text)
+    return TOKEN_RE.sub(lambda m: f"{m.group(0).split(':', 1)[0]}:***MASKED***", text)
+
+
+class MaskingFormatter(logging.Formatter):
+    """Formatter jo traceback ke andar chhupe tokens ko bhi mask karta hai."""
+
+    def format(self, record):
+        return mask_secrets(super().format(record))
+
+
+def install_log_masking():
+    """Root logger ke saare handlers par masking formatter laga do."""
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+    for handler in root.handlers:
+        handler.setFormatter(MaskingFormatter(LOG_FORMAT))
+
+
+def load_env_file():
+    """MAIN_BOT_TOKEN / DATABASE_URL ko .env se load karo (repo me secret commit na ho)."""
+    candidates = [os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ".env"]
+    for path in candidates:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if key.startswith("export "):  # shell-style .env bhi chale
+                        key = key[len("export "):].strip()
+                    os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+        except Exception:
+            continue
+
+
 # ================= CONFIG =================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7687421668:AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE")
+load_env_file()
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "").strip()
+MAIN_BOT_TOKEN_HINT = (
+    "BotFather -> /mybots -> apna bot -> API Token -> Revoke -> NAYA token copy karo,\n"
+    "phir server par:  cd ~/advanced && echo 'MAIN_BOT_TOKEN=<naya_token>' > .env && ./start\n"
+    "(Naya token kabhi GitHub/chat me mat bhejo - Telegram use turant revoke kar deta hai.)")
 ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
@@ -531,7 +589,7 @@ def _extract_last_id(parts: list) -> int:
     return 0
 
 # ================= DATABASE =================
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/advanced_bot"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/advanced_bot")
 
 try:
     import psycopg2
@@ -3559,8 +3617,73 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
 
 
 # ================= USER BOT LIFECYCLE =================
+TOKEN_FAILURES: List[Dict[str, Any]] = []
+
+
+def _tuned_request():
+    """Userbot apps ke liye bhi wahi network profile (warna default 5s timeout par
+    flaky VPS networks me httpx.ReadError aata rehta hai)."""
+    from telegram.request import HTTPXRequest
+    return HTTPXRequest(
+        connection_pool_size=100,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+
+
+async def _cleanup_failed_app(app):
+    """Aadhe initialize hue application ko safely band karo."""
+    for step in ("updater", "stop", "shutdown"):
+        try:
+            if step == "updater":
+                if app.updater:
+                    await app.updater.stop()
+            elif step == "stop":
+                await app.stop()
+            else:
+                await app.shutdown()
+        except Exception:
+            pass
+
+
+def remember_token_failure(bot_id: str, owner_id: int, reason: str = ""):
+    """Ek hi bot ke liye ek baar record karo (restart loop me spam na ho)."""
+    for fail in TOKEN_FAILURES:
+        if fail["bot_id"] == bot_id:
+            return
+    TOKEN_FAILURES.append({"bot_id": bot_id, "owner_id": owner_id or 0, "reason": mask_secrets(reason)})
+
+
+async def flush_token_failures(bot=None):
+    """Dead userbot token ki khabar owner + admin ko do (ek-ek baar)."""
+    if not bot or not TOKEN_FAILURES:
+        return
+    pending = list(TOKEN_FAILURES)
+    TOKEN_FAILURES.clear()
+    for fail in pending:
+        text = (f"<blockquote>{pp('⚠️')} <b>USERBOT TOKEN INVALID</b></blockquote>\n\n"
+                f"{pp('🤖')} Bot ID: <code>{fail['bot_id']}</code>\n"
+                f"{pp('❌')} Telegram ne is bot ka token reject kar diya (revoke/delete ho gaya lagta hai).\n\n"
+                "BotFather -> /mybots -> apna bot -> API Token -> <b>Revoke</b> se naya token lo,\n"
+                "phir panel se purana bot hata ke naya token dobara add karo.")
+        targets = {int(x) for x in ADMIN_USER_IDS}
+        if fail.get("owner_id"):
+            targets.add(int(fail["owner_id"]))
+        for uid in targets:
+            try:
+                await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+            except Exception as ex:
+                logging.warning(f"Token warning owner {uid} ko nahi bhej paye: {mask_secrets(ex)}")
+
+
 async def start_user_bot(token: str, bot_id: str, owner_id: int):
-    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
+    try:
+        app = ApplicationBuilder().token(token).concurrent_updates(True).request(_tuned_request()).build()
+    except Exception as ex:
+        logging.error(f"{pp('❌')} User bot {bot_id} bana nahi paya: {mask_secrets(ex)}")
+        return False
     app.bot_data["bot_id"] = bot_id
     app.bot_data["owner_id"] = owner_id
     app.add_handler(CommandHandler("start", lambda u, c: user_bot_start(u, c, bot_id, owner_id)))
@@ -3571,9 +3694,26 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    except (InvalidToken, Forbidden) as ex:
+        # Token revoke/delete ho gaya - retry karne ka koi fayda nahi. Sirf is bot ko
+        # band karo, main bot chalta rahe (pehle ye poore bot ko restart loop me daal deta tha).
+        logging.error(f"{pp('❌')} User bot {bot_id} ka token Telegram ne reject kar diya "
+                      f"({mask_secrets(ex)}) - is bot ko band kiya, naya token chahiye")
+        await _cleanup_failed_app(app)
+        try:
+            db.set_user_bot_active(bot_id, False)
+        except Exception:
+            pass
+        remember_token_failure(bot_id, owner_id, str(ex))
+        return False
+    except Exception as ex:
+        logging.error(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
+        await _cleanup_failed_app(app)
+        return False
     user_bot_applications[bot_id] = app
     try:
         for ch in db.get_bot_channels(bot_id) or []:
@@ -3836,10 +3976,12 @@ async def ensure_broadcast_subscription(bot_id: str, bot_token: Optional[str] = 
         return False
     try:
         if bot_token and bot_id not in user_bot_applications:
-            await start_user_bot(bot_token, bot_id, owner_id or 0)
-            db.set_user_bot_active(bot_id, True)
+            if await start_user_bot(bot_token, bot_id, owner_id or 0):
+                db.set_user_bot_active(bot_id, True)
+            else:
+                logging.warning(f"{bot_id}: trial subscription added but bot start nahi ho paya")
     except Exception as ex:
-        logging.error(f"auto-start after trial subscription failed for {bot_id}: {ex}")
+        logging.error(f"auto-start after trial subscription failed for {bot_id}: {mask_secrets(ex)}")
     return True
 
 
@@ -4009,7 +4151,9 @@ async def start_all_userbots(q):
         except Exception:
             continue
         try:
-            await start_user_bot(bot["bot_token"], bot_id, bot["user_id"])
+            if not await start_user_bot(bot["bot_token"], bot_id, bot["user_id"]):
+                failed += 1
+                continue
             db.set_user_bot_active(bot_id, True)
             started += 1
         except Exception:
@@ -4571,7 +4715,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         exp = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
                         if exp > now_aware():
-                            await start_user_bot(bot_data["bot_token"], bot_id, bot_data["user_id"])
+                            if not await start_user_bot(bot_data["bot_token"], bot_id, bot_data["user_id"]):
+                                await safe_edit_message_text(q, f"{pe('❌')} Bot start nahi ho paya - token invalid lagta hai (naya token add karo).", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                                return
                             await safe_edit_message_text(q, f"{pe('✅')} Bot @{bot_data['bot_username']} started.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
                         else:
                             await safe_edit_message_text(q, f"{pe('❌')} Subscription expired.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
@@ -4804,7 +4950,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("admin_add_sub", None)
             await reply_premium_message(msg, f"{pe('✅')} Subscription added!\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             try:
-                await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"])
+                started = await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"])
+                if started is False:
+                    raise RuntimeError("token invalid - naya token add karo")
                 db.set_user_bot_active(bot["bot_id"], True)
                 await send_premium_message(context.bot, bot["user_id"], f"<blockquote>{pp('✅')} <b>BOT ACTIVATED</b></blockquote>\n\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days\n\nYour bot is now running!", parse_mode=ParseMode.HTML)
             except Exception as e:
@@ -5045,26 +5193,9 @@ async def proof_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ================= MAIN =================
-async def main():
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-    logging.info(f"{pp('🚀')} Starting Premium Bot System...")
-
-    expired_bots = db.get_expired_subscriptions()
-    for bot_id in expired_bots:
-        bot_data = db.get_user_bot(bot_id)
-        if bot_data and bot_data["is_active"] == 1:
-            if bot_id in user_bot_applications:
-                try:
-                    app = user_bot_applications[bot_id]
-                    await app.updater.stop()
-                    await app.stop()
-                    await app.shutdown()
-                    logging.info(f"{pp('🛑')} Stopped expired bot on startup: {bot_id}")
-                except Exception as ex:
-                    logging.error(f"Error stopping expired bot {bot_id}: {ex}")
-                user_bot_applications.pop(bot_id, None)
-            db.set_user_bot_active(bot_id, False)
-
+async def start_bots_on_boot():
+    """Boot par pehle se saved userbots ko chalu karo (isolated - koi bhi error
+    main bot ko nahi rokta)."""
     bots = db.get_all_user_bots()
     if bots:
         logging.info(f"Found {len(bots)} user bots to start")
@@ -5084,24 +5215,43 @@ async def main():
                 logging.error(f"Error checking expiry for {bot['bot_id']}: {ex}")
                 continue
             try:
-                await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"])
+                if not await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"]):
+                    continue
                 db.set_user_bot_active(bot["bot_id"], True)
                 logging.info(f"{pp('✅')} Started user bot @{bot['bot_username']} for {bot['bot_id']}")
             except Exception as ex:
-                logging.error(f"{pp('❌')} Failed to start user bot {bot['bot_id']}: {ex}")
+                logging.error(f"{pp('❌')} Failed to start user bot {bot['bot_id']}: {mask_secrets(ex)}")
     else:
         logging.info("No user bots found in database")
 
-    from telegram.request import HTTPXRequest
-    request = HTTPXRequest(
-        connection_pool_size=100,
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=10.0,
-    )
 
-    app = ApplicationBuilder().token(MAIN_BOT_TOKEN).concurrent_updates(True).request(request).build()
+async def main():
+    logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+    install_log_masking()
+    logging.info(f"{pp('🚀')} Starting Premium Bot System...")
+
+    expired_bots = db.get_expired_subscriptions()
+    for bot_id in expired_bots:
+        bot_data = db.get_user_bot(bot_id)
+        if bot_data and bot_data["is_active"] == 1:
+            if bot_id in user_bot_applications:
+                try:
+                    app = user_bot_applications[bot_id]
+                    await app.updater.stop()
+                    await app.stop()
+                    await app.shutdown()
+                    logging.info(f"{pp('🛑')} Stopped expired bot on startup: {bot_id}")
+                except Exception as ex:
+                    logging.error(f"Error stopping expired bot {bot_id}: {ex}")
+                user_bot_applications.pop(bot_id, None)
+            db.set_user_bot_active(bot_id, False)
+
+    try:
+        await start_bots_on_boot()
+    except Exception as ex:  # userbot problem se main bot kabhi rukna nahi chahiye
+        logging.error(f"{pp('❌')} Userbot startup error (main bot phir bhi chalu hoga): {mask_secrets(ex)}")
+
+    app = ApplicationBuilder().token(MAIN_BOT_TOKEN).concurrent_updates(True).request(_tuned_request()).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
@@ -5114,10 +5264,18 @@ async def main():
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")
     app.job_queue.run_repeating(check_expired_subscriptions_job, interval=3600, first=120, name="expired_subscriptions_check")
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    except (InvalidToken, Forbidden) as ex:
+        # Token revoked/leaked -> restart loop me bot ko jalao mat, seedha saaf message do.
+        logging.error(f"{pp('❌')} MAIN BOT TOKEN reject ho gaya ({mask_secrets(ex)}).\n"
+                      "Ye token leak ho chuka hai (public repo/chat), isliye Telegram ne revoke kar diya.\n"
+                      f"{MAIN_BOT_TOKEN_HINT}")
+        raise SystemExit(2)
     logging.info(f"{pp('✅')} Main bot started successfully")
+    await flush_token_failures(app.bot)
 
     try:
         await asyncio.Event().wait()
@@ -5135,13 +5293,24 @@ async def main():
 
 
 if __name__ == "__main__":
+    if not MAIN_BOT_TOKEN:
+        logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+        install_log_masking()
+        logging.error(f"{pp('❌')} MAIN_BOT_TOKEN set nahi hai!\n{MAIN_BOT_TOKEN_HINT}")
+        raise SystemExit(1)
+
     while True:
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
             logging.info(f"{pp('🛑')} Stopped by user")
             break
+        except SystemExit as ex:
+            logging.error(f"{pp('❌')} Bot band (exit code {ex.code}) - upar wala message padho, "
+                          "config theek karke ./start dobara chalao")
+            # Non-zero exit: launcher/monitoring ko pata chale ki config galat hai
+            raise SystemExit(ex.code if isinstance(ex.code, int) and ex.code else 1)
         except Exception as ex:
-            logging.error(f"{pp('❌')} Fatal error: {ex}")
+            logging.exception(f"{pp('❌')} Fatal error: {mask_secrets(ex)}")
             logging.info(f"{pp('🔄')} Restarting in 10 seconds...")
             time.sleep(10)
