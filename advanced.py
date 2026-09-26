@@ -4,6 +4,7 @@ import json
 import time
 import os
 import re
+import inspect
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from functools import wraps
@@ -147,12 +148,120 @@ def format_support_msg(user_name: str, username: str, user_id: int, message_text
         body += f'\n\n{pe("💬")} <b>Message:</b>\n▸ {message_text}'
     return f'{header}\n\n{body}\n\n'
 
+# ================= STYLED / PREMIUM BUTTON CORE =================
+# Telegram (Bot API 9.5+) lets a bot show a custom (premium/animated) emoji on an
+# inline button through `icon_custom_emoji_id`, and colour it through `style`.
+# python-telegram-bot < 22.7 has no dedicated parameters for those yet, so we
+# detect support at runtime and otherwise pass them via `api_kwargs` (which is
+# forwarded to the Bot API untouched by every PTB 20+/21+/22+ build).
+STYLE_VALUES = ("primary", "success", "danger")
+_BTN_PARAM_CACHE: Dict[str, bool] = {}
+
+
+def _button_supports(field: str) -> bool:
+    if field not in _BTN_PARAM_CACHE:
+        try:
+            _BTN_PARAM_CACHE[field] = field in inspect.signature(InlineKeyboardButton.__init__).parameters
+        except Exception:
+            _BTN_PARAM_CACHE[field] = False
+    return _BTN_PARAM_CACHE[field]
+
+
+# custom-emoji-id -> emoji character. We keep our own cache (filled while parsing
+# user input) plus a reverse view of EMOJI_IDS so that, when Telegram refuses the
+# animated emoji, the button still shows *some* emoji instead of nothing.
+_CUSTOM_EMOJI_CHARS: Dict[str, str] = {}
+_EMOJI_CHAR_BY_ID: Dict[str, str] = {}
+for _emoji_char, _emoji_id in EMOJI_IDS.items():
+    _EMOJI_CHAR_BY_ID.setdefault(_emoji_id, _emoji_char)
+
+
+def remember_emoji_char(emoji_id: Optional[str], emoji_char: Optional[str]):
+    """Remember which plain emoji belongs to a custom emoji id (fallback rendering)."""
+    if not emoji_id or not emoji_char:
+        return
+    _CUSTOM_EMOJI_CHARS[str(emoji_id)] = str(emoji_char)[:8]
+
+
+def emoji_char_for_id(emoji_id: Optional[str]) -> str:
+    if not emoji_id:
+        return ""
+    return (_CUSTOM_EMOJI_CHARS.get(str(emoji_id))
+            or _EMOJI_CHAR_BY_ID.get(str(emoji_id))
+            or "")
+
+
+def build_button(text: str, callback_data: Optional[str] = None, url: Optional[str] = None,
+                 style: Optional[str] = None, icon_id: Optional[str] = None,
+                 with_style: bool = True, with_icon: bool = True) -> InlineKeyboardButton:
+    """Build an inline button with an optional colour (style) + premium emoji icon.
+
+    `with_style=False` / `with_icon=False` are used by the automatic fallbacks when
+    Telegram rejects styled buttons (unavailable custom emoji document, old client,
+    bot owner without Premium, ...).
+    """
+    kwargs: Dict[str, Any] = {}
+    api_kwargs: Dict[str, Any] = {}
+    if style in STYLE_VALUES and with_style:
+        if _button_supports("style"):
+            kwargs["style"] = style
+        else:
+            api_kwargs["style"] = style
+    if icon_id and with_icon:
+        if _button_supports("icon_custom_emoji_id"):
+            kwargs["icon_custom_emoji_id"] = str(icon_id)
+        else:
+            api_kwargs["icon_custom_emoji_id"] = str(icon_id)
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    else:
+        kwargs["url"] = url
+    if api_kwargs:
+        kwargs["api_kwargs"] = api_kwargs
+    return InlineKeyboardButton(text, **kwargs)
+
+
+def button_icon_id(b) -> Optional[str]:
+    """Read the custom-emoji icon id of a button, no matter how it was set."""
+    try:
+        value = getattr(b, "icon_custom_emoji_id", None)
+        if value:
+            return str(value)
+        # NOTE: PTB stores unknown api_kwargs in a mappingproxy, not a dict
+        api_kwargs = getattr(b, "api_kwargs", None)
+        value = api_kwargs.get("icon_custom_emoji_id") if api_kwargs else None
+        return str(value) if value else None
+    except Exception:
+        return None
+
+
+def markup_has_icons(markup) -> bool:
+    try:
+        for row in (markup.inline_keyboard if markup else []):
+            for b in row:
+                if button_icon_id(b):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _strip_leading_icon(text: str, emoji: Optional[str]) -> str:
+    """Remove the icon emoji from the label *only* when it sits at the beginning,
+    so meaningful emojis inside the label (🟢/🔴 status dots etc.) survive."""
+    raw = text or ""
+    stripped = raw.strip()
+    if emoji and stripped.startswith(emoji):
+        stripped = stripped[len(emoji):].strip()
+    return stripped or raw.strip() or "Button"
+
+
 def _degrade_markup(markup):
     """
-    Fallback helper: strip icon_custom_emoji_id/style from every button, keeping
-    only text/url/callback_data. Used when Telegram rejects a "styled" message
-    (custom emoji icon referencing an invalid/inaccessible document) so we can
-    retry with a plain version instead of crashing.
+    Fallback helper: strip style + custom-emoji icon from every button, keeping only
+    text/url/callback_data, and restore the emoji as a *plain text* emoji so the
+    button never loses its icon completely. Used when Telegram rejects a "styled"
+    message (invalid/inaccessible custom-emoji document).
     """
     if not markup:
         return markup
@@ -161,10 +270,14 @@ def _degrade_markup(markup):
         for row in markup.inline_keyboard:
             new_row = []
             for b in row:
-                if b.url:
-                    new_row.append(InlineKeyboardButton(b.text, url=b.url))
-                elif b.callback_data:
-                    new_row.append(InlineKeyboardButton(b.text, callback_data=b.callback_data))
+                text = b.text or ""
+                char = emoji_char_for_id(button_icon_id(b))
+                if char and char not in text:
+                    text = f"{char} {text}".strip()
+                if getattr(b, "url", None):
+                    new_row.append(InlineKeyboardButton(text, url=b.url))
+                elif getattr(b, "callback_data", None):
+                    new_row.append(InlineKeyboardButton(text, callback_data=b.callback_data))
                 else:
                     new_row.append(b)
             new_rows.append(new_row)
@@ -174,44 +287,15 @@ def _degrade_markup(markup):
 
 
 def btn(text: str, callback_data: str, style: str = "primary", emoji: str = None) -> InlineKeyboardButton:
-    api_kwargs = {}
-    style_map = {"primary": "primary", "success": "success", "danger": "danger"}
-    if style and style in style_map:
-        api_kwargs["style"] = style_map[style]
-    if emoji and emoji in EMOJI_IDS:
-        api_kwargs["icon_custom_emoji_id"] = EMOJI_IDS[emoji]
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else "Button"
-    else:
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else text
-    if api_kwargs:
-        return InlineKeyboardButton(text, callback_data=callback_data, **api_kwargs)
-    return InlineKeyboardButton(text, callback_data=callback_data)
+    icon_id = EMOJI_IDS.get(emoji) if emoji else None
+    return build_button(_strip_leading_icon(text, emoji), callback_data=callback_data,
+                        style=style, icon_id=icon_id)
+
 
 def btn_url(text: str, url: str, style: str = "primary", emoji: str = None) -> InlineKeyboardButton:
-    api_kwargs = {}
-    style_map = {"primary": "primary", "success": "success", "danger": "danger"}
-    if style and style in style_map:
-        api_kwargs["style"] = style_map[style]
-    if emoji and emoji in EMOJI_IDS:
-        api_kwargs["icon_custom_emoji_id"] = EMOJI_IDS[emoji]
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else "Button"
-    else:
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else text
-    if api_kwargs:
-        return InlineKeyboardButton(text, url=url, **api_kwargs)
-    return InlineKeyboardButton(text, url=url)
+    icon_id = EMOJI_IDS.get(emoji) if emoji else None
+    return build_button(_strip_leading_icon(text, emoji), url=url,
+                        style=style, icon_id=icon_id)
 
 def premiumize_ui_emojis(text: Optional[str]) -> str:
     """Convert plain emojis to premium <tg-emoji> tags in bot UI text."""
@@ -387,6 +471,49 @@ def _cleanup_support_maps():
         for k in stale:
             store.pop(k, None)
 
+# Callback prefixes of the userbot manage panel (they only carry the bot_id inside
+# their payload, so the main bot has to work out which bot is meant).
+USERBOT_PANEL_PREFIXES = ("ub_", "ubm_", "ubmm_", "delmsg_", "setmsg_", "setbtn_", "setbtng_",
+                          "bcast_", "toggleauto_", "removechan_", "back_to_manage_")
+READONLY_PANEL_PREFIXES = ("ub_stats_", "ub_list_channels_")
+
+
+def resolve_managed_bot_id(user_id: int, data: str) -> Optional[str]:
+    """Which userbot does this panel callback belong to?"""
+    if not data:
+        return None
+    try:
+        candidates = list(db.get_user_bots_by_owner(user_id) or [])
+        known = {str(b.get("bot_id")) for b in candidates}
+        if is_admin(user_id):
+            for bot in (db.get_all_user_bots() or []):
+                if str(bot.get("bot_id")) not in known:
+                    candidates.append(bot)
+                    known.add(str(bot.get("bot_id")))
+        for bot in sorted(candidates, key=lambda b: -len(str(b.get("bot_id") or ""))):
+            bot_id = str(bot.get("bot_id") or "")
+            if bot_id and bot_id in data:
+                return bot_id
+    except Exception as ex:
+        logging.error(f"resolve_managed_bot_id failed: {ex}")
+    return None
+
+
+async def show_manage_from_bot_help(q, bot_id: str):
+    """The manage panel needs the userbot's own chat (that's where its handlers live)."""
+    bot_data = db.get_user_bot(bot_id) or {}
+    username = bot_data.get("bot_username")
+    rows = []
+    if username:
+        rows.append([btn_url("Open My Bot", f"https://t.me/{username}", "success", "🚀")])
+    rows.append([btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")])
+    await safe_edit_message_text(q,
+        f"<blockquote>{pp('🤖')} <b>MANAGE FROM YOUR BOT</b></blockquote>\n\n"
+        "Channels, welcome messages aur broadcast apne <b>bot ke andar</b> se manage hote hain.\n\n"
+        f"👉 @{username or bot_id} ko <code>/start</code> bhejo aur panel kholo.",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
 def _parse_id(s: str):
     try:
         return int(s)
@@ -525,6 +652,30 @@ class Database:
         max_channels = 1 if sub_type.lower() == "basic" else 5
         expiry_date = now_aware() + timedelta(days=days)
         self._execute("""INSERT INTO bot_subscriptions (bot_id, subscription_type, expiry_date, max_channels)\n               VALUES (%s,%s,%s,%s)""", (bot_id, sub_type, expiry_date, max_channels))
+
+    def get_active_subscription(self, bot_id: str):
+        """Latest subscription row that is still valid, or None."""
+        row = self._fetchone("""SELECT * FROM bot_subscriptions\n               WHERE bot_id=%s AND expiry_date >= now()\n               ORDER BY expiry_date DESC LIMIT 1""", (bot_id,))
+        return dict(row) if row else None
+
+    def has_active_subscription(self, bot_id: str) -> bool:
+        try:
+            return self.get_active_subscription(bot_id) is not None
+        except Exception:
+            return False
+
+    def grant_broadcast_subscription(self, bot_id: str, days: int = 1, sub_type: str = "Basic") -> bool:
+        """Admin broadcast ke liye: agar koi active subscription nahi hai to 1 din ka
+        Basic khud se add kar do, taaki broadcast us userbot ke users tak pahunch jaye."""
+        try:
+            if self.has_active_subscription(bot_id):
+                return False
+            self.add_subscription_for_bot(bot_id, sub_type, days)
+            logging.info(f"Auto-added {days}-day {sub_type} subscription for {bot_id} (broadcast)")
+            return True
+        except Exception as ex:
+            logging.error(f"grant_broadcast_subscription failed for {bot_id}: {ex}")
+            return False
 
     def update_subscription_expiry(self, bot_id: str, new_expiry):
         row = self._fetchone("SELECT id FROM bot_subscriptions WHERE bot_id=%s ORDER BY expiry_date DESC LIMIT 1", (bot_id,))
@@ -712,10 +863,17 @@ class Database:
         self._execute("DELETE FROM reachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
 
     def get_requesters_for_bot(self, bot_id: str):
-        rows = self._fetchall("SELECT requester_id FROM reachable_users WHERE bot_id=%s ORDER BY last_ok_at DESC", (bot_id,))
-        if rows:
-            return [r["requester_id"] for r in rows]
-        rows = self._fetchall("SELECT DISTINCT requester_id FROM join_requests WHERE bot_id=%s AND status='approved'", (bot_id,))
+        """Everyone a broadcast should reach: previously reachable users first, then
+        every approved join request (each id only once).
+
+        The old query returned ONLY the reachable list whenever it was non-empty, so
+        users who had approved the join request but were never messaged before never
+        received a broadcast."""
+        rows = self._fetchall("""SELECT requester_id, MAX(ok) AS ok FROM (
+               SELECT requester_id, 1 AS ok FROM reachable_users WHERE bot_id=%s
+               UNION ALL
+               SELECT DISTINCT requester_id, 0 AS ok FROM join_requests WHERE bot_id=%s AND status='approved'
+               ) AS all_users GROUP BY requester_id ORDER BY ok DESC""", (bot_id, bot_id))
         return [r["requester_id"] for r in rows]
 
     def get_total_requesters_count(self, bot_id: str):
@@ -1215,23 +1373,35 @@ async def reply_premium_message(message, text, *args, **kwargs):
 
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def send_user_message(bot, chat_id, text, *args, **kwargs):
-    """Send user-facing messages without stripping premium custom emoji tags."""
+    """Send user-facing messages (premium emoji tags allowed).
+
+    Telegram can reject a message because of a custom-emoji document the bot may not
+    use (Bot API: "Document_invalid") or because of broken HTML. Both cases used to
+    end with the message simply NOT being delivered (broadcast buttons/emoji were lost
+    that way), so we now retry with the emoji tags stripped and the button icons
+    removed - a plain message is always better than no message.
+    """
     try:
         return await bot.send_message(chat_id, text, *args, **kwargs)
     except Forbidden:
         logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
         return None
     except BadRequest as ex:
-        if kwargs.get("parse_mode") == ParseMode.HTML and "can't parse entities" in str(ex).lower():
-            logging.warning(f"HTML parse failed for {chat_id}; retrying with escaped text: {ex}")
-            safe_kwargs = dict(kwargs)
-            safe_kwargs["parse_mode"] = ParseMode.HTML
-            safe_text = escape_preserving_premium_emojis(text)
+        logging.warning(f"send_user_message BadRequest for {chat_id}: {ex}; retrying plainly")
+        plain_kwargs = dict(kwargs)
+        if plain_kwargs.get("reply_markup") is not None:
+            plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+        candidates = []
+        if kwargs.get("parse_mode") == ParseMode.HTML:
+            candidates.append(escape_preserving_premium_emojis(text))
+        candidates.append(strip_premium_emojis(text))
+        for candidate in candidates:
+            if not candidate or candidate == text:
+                continue
             try:
-                return await bot.send_message(chat_id, safe_text, *args, **safe_kwargs)
+                return await bot.send_message(chat_id, candidate, *args, **plain_kwargs)
             except Exception as retry_ex:
-                logging.error(f"send_user_message escaped retry failed: {retry_ex}")
-                return None
+                logging.warning(f"send_user_message plain retry failed for {chat_id}: {retry_ex}")
         logging.error(f"send_user_message failed: {ex}")
         return None
     except (NetworkError, TimedOut) as ex:
@@ -1263,123 +1433,722 @@ def render_dynamic_text(text: Optional[str], user=None, extra: Optional[dict] = 
     return rendered
 
 
-def parse_buttons_text(text: Optional[str]):
+# ================= INLINE BUTTON PARSING (PREMIUM-EMOJI AWARE) =================
+# Telegram sends a premium (custom) emoji as: plain emoji character + a
+# `custom_emoji` message entity that carries the emoji id. The old parser only
+# looked at the raw text, so the id was thrown away and the premium emoji was
+# downgraded to a normal emoji. We now read those entities and store the id in
+# buttons_json["icon_id"], which is sent back as `icon_custom_emoji_id`.
+BUTTON_ROW_SEPARATOR = "||"
+EMOJI_KEYS_BY_LEN = sorted(EMOJI_IDS.keys(), key=len, reverse=True)
+
+
+def _utf16_index(text: str) -> List[int]:
+    """python char index -> Telegram utf-16 offset (entities use utf-16 units)."""
+    out: List[int] = []
+    pos = 0
+    for ch in text:
+        out.append(pos)
+        pos += len(ch.encode("utf-16-le")) // 2
+    return out
+
+
+def custom_emoji_spans(text: Optional[str], entities: Optional[List]) -> List[dict]:
+    """Custom-emoji entities as python-index spans: {start, end, emoji_id, char}."""
+    if not text or not entities:
+        return []
+    try:
+        u16 = _utf16_index(text)
+        lookup = {offset: idx for idx, offset in enumerate(u16)}
+        spans: List[dict] = []
+        for entity in entities:
+            if getattr(entity, "type", None) != "custom_emoji":
+                continue
+            emoji_id = getattr(entity, "custom_emoji_id", None)
+            if not emoji_id:
+                continue
+            start = lookup.get(getattr(entity, "offset", -1))
+            if start is None:
+                continue
+            end = lookup.get(getattr(entity, "offset", 0) + getattr(entity, "length", 0), len(text))
+            char = text[start:end]
+            remember_emoji_char(emoji_id, char)
+            spans.append({"start": start, "end": end, "emoji_id": str(emoji_id), "char": char})
+        return spans
+    except Exception as ex:
+        logging.warning(f"custom_emoji_spans failed: {ex}")
+        return []
+
+
+def _split_span(raw: str, start: int) -> Tuple[str, int, int]:
+    """Strip a sub-string but keep its absolute offsets in sync."""
+    stripped = raw.strip()
+    left = len(raw) - len(raw.lstrip())
+    peak = len(raw.rstrip())
+    end = start + max(peak, left)
+    return stripped, start + left, end
+
+
+def _label_to_text_and_icon(label: str, abs_start: int, abs_end: int,
+                            spans: List[dict]) -> Tuple[str, Optional[str], Optional[str]]:
+    """Return (button text, icon_id, icon_char) for one button label.
+
+    * a premium/custom emoji typed in the label wins and becomes the button icon
+    * otherwise the first emoji of our premium set is promoted to the icon
+    * the chosen icon emoji is removed from the visible text (it IS the icon now)
+    """
+    icon_id: Optional[str] = None
+    icon_char: Optional[str] = None
+    cuts: List[Tuple[int, int]] = []
+    for span in spans:
+        if span["start"] >= abs_start and span["end"] <= abs_end:
+            if icon_id is None:
+                icon_id, icon_char = span["emoji_id"], span["char"]
+            cuts.append((span["start"] - abs_start, span["end"] - abs_start))
+    if icon_id is None:
+        for idx in range(len(label)):
+            match = None
+            for key in EMOJI_KEYS_BY_LEN:
+                if label.startswith(key, idx):
+                    match = key
+                    break
+            if match:
+                icon_id, icon_char = EMOJI_IDS[match], match
+                cuts.append((idx, idx + len(match)))
+                break
+    text = label
+    for cut_start, cut_end in sorted(cuts, reverse=True):
+        text = text[:cut_start] + text[cut_end:]
+    return text.strip(), icon_id, icon_char
+
+
+def _link_label(url: str) -> str:
+    try:
+        host = re.sub(r"^[a-z]+://", "", url or "").split("/")[0]
+        return (host.replace("www.", "")[:30] or "Open Link")
+    except Exception:
+        return "Open Link"
+
+
+def parse_button_lines(text: Optional[str], entities: Optional[List] = None) -> List[List[dict]]:
+    """Parse the easy button syntax into rows of button dicts.
+
+        Join Channel|https://t.me/channel              -> 1 button, own row
+        Join|https://t.me/a || Site|https://site.com   -> 2 buttons on one row
+        https://t.me/channel                           -> label = link host
+
+    Premium emoji anywhere in the label is stored as the button's custom-emoji icon
+    (icon_id + icon_char) so it stays premium after sending.
+    """
     if not text:
         return []
-    buttons = []
-    for line in text.strip().split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split(' || ')]
-        row_buttons = []
-        for part in parts:
-            if '|' not in part:
+    spans = custom_emoji_spans(text, entities)
+    rows: List[List[dict]] = []
+    cursor = 0
+    for raw_line in text.split("\n"):
+        line_start = cursor
+        cursor += len(raw_line) + 1  # +1 for the "\n"
+        parts: List[Tuple[str, int, int]] = []
+        search = 0
+        while True:
+            idx = raw_line.find(BUTTON_ROW_SEPARATOR, search)
+            if idx == -1:
+                parts.append((raw_line[search:], line_start + search, line_start + len(raw_line)))
+                break
+            parts.append((raw_line[search:idx], line_start + search, line_start + idx))
+            search = idx + len(BUTTON_ROW_SEPARATOR)
+        row_buttons: List[dict] = []
+        for part, part_start, part_end in parts:
+            part_text, part_start, part_end = _split_span(part, part_start)
+            if not part_text:
                 continue
-            idx = part.index('|')
-            label = part[:idx].strip()
-            url = part[idx + 1:].strip()
-            if label and url:
-                icon_id = None
-                display_label = label
-                for emoji_char, eid in EMOJI_IDS.items():
-                    if label.startswith(emoji_char):
-                        icon_id = eid
-                        display_label = label[len(emoji_char):].strip()
-                        break
-                if not icon_id:
-                    icon_id = EMOJI_IDS.get("🔗", "5042101437237036298")
-                row_buttons.append(InlineKeyboardButton(
-                    display_label or label, url=url,
-                    api_kwargs={"style": "primary", "icon_custom_emoji_id": icon_id}
-                ))
+            sep = part_text.find("|")
+            if sep == -1:
+                if part_text.lower().startswith(("http://", "https://", "tg://")):
+                    label_raw, label_start, label_end, url = "", part_start, part_start, part_text
+                else:
+                    continue
+            else:
+                label_raw, label_start, label_end = _split_span(part_text[:sep], part_start)
+                url = part_text[sep + 1:].strip()
+            if not url:
+                continue
+            label, icon_id, icon_char = _label_to_text_and_icon(label_raw, label_start, label_end, spans)
+            if not label:
+                label = _link_label(url) if not label_raw else (icon_char or "Open Link")
+            item = {"text": label[:64], "icon_id": icon_id, "icon_char": icon_char, "style": "primary"}
+            if url.lower().startswith("cb:"):
+                item["cb"] = url[3:].strip()
+                item["url"] = None
+            else:
+                item["url"] = url
+                item["cb"] = None
+            row_buttons.append(item)
         if row_buttons:
-            buttons.append(row_buttons)
-    return buttons if buttons else []
+            rows.append(row_buttons)
+    return rows
 
 
-def buttons_to_markup(buttons_json: Optional[str]):
+def rows_to_buttons_json(rows: Optional[List[List[dict]]]) -> Optional[str]:
+    cleaned: List[List[dict]] = []
+    for row in rows or []:
+        clean_row: List[dict] = []
+        for b in row or []:
+            if not isinstance(b, dict):
+                continue
+            item = {"text": (b.get("text") or "Button").strip()[:64] or "Button"}
+            if b.get("url"):
+                item["url"] = b["url"]
+            elif b.get("cb") or b.get("callback_data"):
+                item["cb"] = b.get("cb") or b.get("callback_data")
+            else:
+                continue
+            if b.get("icon_id"):
+                item["icon_id"] = str(b["icon_id"])
+            icon_char = b.get("icon_char") or emoji_char_for_id(b.get("icon_id"))
+            if icon_char:
+                item["icon_char"] = icon_char
+            if b.get("style") in STYLE_VALUES:
+                item["style"] = b["style"]
+            clean_row.append(item)
+        if clean_row:
+            cleaned.append(clean_row)
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+
+
+def parse_buttons_json(buttons_json) -> List[List[dict]]:
+    """Tolerant buttons_json -> rows of dicts (always a list)."""
     if not buttons_json:
-        return None
+        return []
+    if isinstance(buttons_json, (list, tuple)):
+        return list(buttons_json)
     try:
         data = json.loads(buttons_json)
-        if not data:
-            return None
-        rows = []
-        for row in data:
-            row_btns = []
-            for btn_data in row:
-                text = btn_data.get('text', '')
-                icon_id = btn_data.get('icon_id') or EMOJI_IDS.get("🔗", "5042101437237036298")
-                if btn_data.get('url'):
-                    row_btns.append(InlineKeyboardButton(
-                        text, url=btn_data['url'],
-                        api_kwargs={"style": "primary", "icon_custom_emoji_id": icon_id}
-                    ))
-                elif btn_data.get('cb'):
-                    row_btns.append(InlineKeyboardButton(text, callback_data=btn_data['cb']))
-                elif btn_data.get('callback_data'):
-                    row_btns.append(InlineKeyboardButton(text, callback_data=btn_data['callback_data']))
-            if row_btns:
-                rows.append(row_btns)
-        return InlineKeyboardMarkup(rows) if rows else None
     except Exception:
-        return None
+        return []
+    return data if isinstance(data, list) else []
 
 
-def buttons_json_from_text(text: str):
-    if not text:
-        return None
-    json_rows = []
-    for line in text.strip().split('\n'):
-        line = line.strip()
-        if not line:
+def rows_from_buttons_json(buttons_json) -> List[List[dict]]:
+    """Normalise stored json into the internal row format used by the button builder."""
+    rows: List[List[dict]] = []
+    for row in parse_buttons_json(buttons_json):
+        if not isinstance(row, list):
             continue
-        parts = [p.strip() for p in line.split(' || ')]
-        json_row = []
-        for part in parts:
-            if '|' not in part:
+        clean_row: List[dict] = []
+        for b in row:
+            if not isinstance(b, dict):
                 continue
-            idx = part.index('|')
-            label = part[:idx].strip()
-            url = part[idx + 1:].strip()
-            if not label or not url:
-                continue
-            icon_id = None
-            display_label = label
-            for emoji_char, eid in EMOJI_IDS.items():
-                if label.startswith(emoji_char):
-                    icon_id = eid
-                    display_label = label[len(emoji_char):].strip()
-                    break
-            if not icon_id:
-                icon_id = EMOJI_IDS.get("🔗", "5042101437237036298")
-            json_row.append({
-                "text": display_label or label,
-                "url": url,
-                "icon_id": icon_id
-            })
-        if json_row:
-            json_rows.append(json_row)
-    return json.dumps(json_rows) if json_rows else None
+            item = {
+                "text": b.get("text") or "Button",
+                "url": b.get("url"),
+                "cb": b.get("cb") or b.get("callback_data"),
+                "icon_id": str(b.get("icon_id")) if b.get("icon_id") else None,
+                "icon_char": b.get("icon_char") or emoji_char_for_id(b.get("icon_id")),
+                "style": b.get("style") if b.get("style") in STYLE_VALUES else "primary",
+            }
+            if item["url"] or item["cb"]:
+                clean_row.append(item)
+        if clean_row:
+            rows.append(clean_row)
+    return rows
 
 
-def add_callback_button_to_json(buttons_json: Optional[str], text: str, cb: str, url: Optional[str] = None) -> str:
-    data = []
-    if buttons_json:
-        try:
-            data = json.loads(buttons_json) or []
-        except Exception:
-            data = []
-    for row in data:
-        for btn_data in row:
-            if (btn_data.get('cb') == cb or btn_data.get('callback_data') == cb or (url and btn_data.get('url') == url)):
-                return json.dumps(data)
-    if url:
-        data.append([{"text": text, "url": url}])
+def markup_from_rows(rows: Optional[List[List[dict]]], use_icons: bool = True):
+    if not rows:
+        return None
+    markup_rows = []
+    for row in rows:
+        btn_row = []
+        for b in row or []:
+            if not isinstance(b, dict):
+                continue
+            text = (b.get("text") or "Button")[:64]
+            icon_id = b.get("icon_id")
+            style = b.get("style") or "primary"
+            if not use_icons:
+                char = b.get("icon_char") or emoji_char_for_id(icon_id)
+                if char and char not in text:
+                    text = f"{char} {text}".strip()
+            if b.get("url"):
+                btn_row.append(build_button(text, url=b["url"], style=style,
+                                            icon_id=icon_id, with_icon=use_icons))
+            elif b.get("cb") or b.get("callback_data"):
+                btn_row.append(build_button(text, callback_data=b.get("cb") or b.get("callback_data"),
+                                            style=style, icon_id=icon_id, with_icon=use_icons))
+        if btn_row:
+            markup_rows.append(btn_row)
+    return InlineKeyboardMarkup(markup_rows) if markup_rows else None
+
+
+def buttons_to_markup(buttons_json, use_icons: bool = True):
+    return markup_from_rows(rows_from_buttons_json(buttons_json) if not isinstance(buttons_json, list)
+                            else buttons_json, use_icons=use_icons)
+
+
+def buttons_to_plain_markup(buttons_json):
+    rows = rows_from_buttons_json(buttons_json) if not isinstance(buttons_json, list) else buttons_json
+    return markup_from_rows(rows, use_icons=False)
+
+
+def button_count(buttons_json) -> int:
+    rows = rows_from_buttons_json(buttons_json) if not isinstance(buttons_json, list) else buttons_json
+    return sum(len(r) for r in rows or [])
+
+
+def buttons_json_from_text(text: Optional[str], entities: Optional[List] = None) -> Optional[str]:
+    return rows_to_buttons_json(parse_button_lines(text, entities))
+
+
+def parse_buttons_text(text: Optional[str], entities: Optional[List] = None):
+    """Legacy helper - returns PTB button rows (kept for compatibility)."""
+    markup = markup_from_rows(parse_button_lines(text, entities))
+    return markup.inline_keyboard if markup else []
+
+
+def add_callback_button_to_json(buttons_json, text: str, cb: str, url: Optional[str] = None) -> str:
+    rows = rows_from_buttons_json(buttons_json)
+    for row in rows:
+        for b in row:
+            if (cb and b.get("cb") == cb) or (url and b.get("url") == url):
+                return rows_to_buttons_json(rows) or "[]"
+    rows.append([{"text": text, "url": url, "cb": None if url else cb,
+                  "icon_id": None, "icon_char": None, "style": "primary"}])
+    return rows_to_buttons_json(rows) or "[]"
+
+
+# ================= EASY BUTTON BUILDER (WIZARD) =================
+# New flow that any user can follow without learning any syntax:
+#   ➕ Add Button  ->  send the button name  ->  send the link  ->
+#   same row / new row?  ->  repeat  ->  ✅ Save
+# The old "Label|link" bulk syntax stays available as "📄 Paste Many".
+BUTTON_WIZARD_KEY = "button_wizard"
+BUTTON_TARGET_KEY = "button_targets"
+BUTTON_TARGET_TTL = 6 * 3600
+
+
+def _target_store(context) -> dict:
+    store = context.user_data.get(BUTTON_TARGET_KEY)
+    if not isinstance(store, dict):
+        store = {}
+        context.user_data[BUTTON_TARGET_KEY] = store
+    now = time.time()
+    for key in [k for k, v in (list(store.items())) if now - v.get("ts", 0) > BUTTON_TARGET_TTL]:
+        store.pop(key, None)
+    return store
+
+
+def register_button_target(context, target: dict) -> str:
+    store = _target_store(context)
+    tid = str(int(time.time() * 1000) % 1000000)
+    while tid in store:
+        tid = str((int(tid) + 1) % 1000000)
+    store[tid] = {"target": target, "ts": time.time()}
+    return tid
+
+
+def get_button_target(context, tid) -> Optional[dict]:
+    if tid is None or tid == "":
+        return None
+    entry = _target_store(context).get(str(tid))
+    if not entry:
+        return None
+    entry["ts"] = time.time()
+    return entry.get("target")
+
+
+def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
+    """One row callers can drop into any keyboard: ➕ Add Button | 📄 Paste Many."""
+    tid = register_button_target(context, target)
+    return [btn("Add Button", f"bwz_start_{tid}", "success", "➕"),
+            btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄")]
+
+
+def _draft_for_target(context, target: dict) -> dict:
+    kind = target.get("kind")
+    if kind == "draft_user":
+        return context.user_data.get(f"broadcast_draft_{target.get('bot_id')}") or {}
+    if kind == "draft_admin":
+        return context.user_data.get("admin_broadcast_draft") or {}
+    return {}
+
+
+def _target_title(target: dict) -> str:
+    kind = target.get("kind")
+    if kind == "message":
+        return "Saved Message"
+    if kind == "messages":
+        return "Saved Album"
+    if kind == "draft_user":
+        return "Broadcast Message"
+    if kind == "draft_admin":
+        return "Admin Broadcast"
+    if kind == "leave_msg":
+        return f"Leave Message #{int(target.get('idx', 0)) + 1}"
+    return "Message"
+
+
+def target_rows(context, target: dict) -> List[List[dict]]:
+    kind = target.get("kind")
+    try:
+        if kind == "message":
+            row = db.get_message_by_id(target.get("msg_id"))
+            return rows_from_buttons_json(row.get("buttons_json") if row else None)
+        if kind == "messages":
+            for mid in target.get("msg_ids") or []:
+                row = db.get_message_by_id(mid)
+                if row and row.get("buttons_json"):
+                    return rows_from_buttons_json(row.get("buttons_json"))
+            return []
+        if kind in ("draft_user", "draft_admin"):
+            return rows_from_buttons_json(_draft_for_target(context, target).get("buttons_json"))
+        if kind == "leave_msg":
+            messages = db.get_leave_recovery_config().get("messages", [])
+            idx = int(target.get("idx", 0))
+            if 0 <= idx < len(messages):
+                return rows_from_buttons_json(messages[idx].get("buttons_json"))
+        return []
+    except Exception as ex:
+        logging.error(f"target_rows failed: {ex}")
+        return []
+
+
+def target_save_rows(context, target: dict, rows) -> bool:
+    payload = rows_to_buttons_json(rows) or "[]"
+    kind = target.get("kind")
+    try:
+        if kind == "message":
+            db.update_message_buttons(target.get("msg_id"), payload)
+            return True
+        if kind == "messages":
+            msg_ids = target.get("msg_ids") or []
+            for mid in msg_ids:
+                db.update_message_buttons(mid, payload)
+            return bool(msg_ids)
+        if kind == "draft_user":
+            draft = dict(_draft_for_target(context, target))
+            draft["buttons_json"] = payload
+            context.user_data[f"broadcast_draft_{target.get('bot_id')}"] = draft
+            return True
+        if kind == "draft_admin":
+            draft = dict(_draft_for_target(context, target))
+            draft["buttons_json"] = payload
+            context.user_data["admin_broadcast_draft"] = draft
+            return True
+        if kind == "leave_msg":
+            cfg = db.get_leave_recovery_config()
+            messages = cfg.get("messages", [])
+            idx = int(target.get("idx", 0))
+            if 0 <= idx < len(messages):
+                messages[idx]["buttons_json"] = payload
+                cfg["messages"] = messages
+                db.set_leave_recovery_config(cfg)
+                return True
+        return False
+    except Exception as ex:
+        logging.error(f"target_save_rows failed: {ex}")
+        return False
+
+
+def target_nav_rows(target: dict) -> List[List[InlineKeyboardButton]]:
+    kind = target.get("kind")
+    if kind == "draft_user":
+        bot_id = target.get("bot_id")
+        return [
+            [btn("Send Broadcast", f"bcast_send_{bot_id}", "success", "🚀")],
+            [btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")],
+        ]
+    if kind == "draft_admin":
+        return [
+            [btn("Send Broadcast", "admin_bcast_send", "success", "🚀")],
+            [btn("Cancel", "admin_panel", "danger", "❌")],
+        ]
+    if kind == "leave_msg":
+        return [[btn("Back", "admin_leave_msgs", "primary", "🔙")]]
+    if target.get("back_cb"):
+        return [[btn(target.get("back_text") or "Back", target["back_cb"], "primary", "🔙")]]
+    return []
+
+
+def _wizard_layout(rows) -> str:
+    if not rows:
+        return "<i>(abhi koi button nahi)</i>"
+    lines = []
+    for i, row in enumerate(rows, 1):
+        parts = []
+        for b in row or []:
+            icon = (b.get("icon_char") or "").strip()
+            label = (b.get("text") or "Button").strip()
+            parts.append(f"[{icon} {label}]" if icon else f"[{label}]")
+        lines.append(f"{i}. " + "  ".join(parts))
+    return "\n".join(lines)
+
+
+def _wizard_state(context) -> Optional[dict]:
+    state = context.user_data.get(BUTTON_WIZARD_KEY)
+    return state if isinstance(state, dict) else None
+
+
+def _wizard_text(state: dict, target: dict) -> str:
+    body = (f"{pe('🔘')} <b>BUTTON BUILDER</b> — {_target_title(target)}\n\n"
+            f"<b>Layout:</b>\n{_wizard_layout(state.get('rows') or [])}\n\n")
+    step = state.get("step")
+    if step == "name":
+        return body + (f"{pe('✏️')} <b>Button ka naam bhejo</b> — jo text button par dikhega.\n\n"
+                       "Premium emoji bhi chalega: <code>💎 Join Now</code> bhejo to 💎 premium icon ban jayega.")
+    if step == "url":
+        name = (state.get("pending") or {}).get("text") or ""
+        return body + (f"<b>Naam:</b> {EmojiManager._html_escape(name)}\n\n"
+                       f"{pe('🔗')} <b>Ab is button ka link bhejo</b>\n"
+                       "Example: <code>https://t.me/yourchannel</code>")
+    if step == "bulk":
+        return body + (f"{pe('📄')} <b>Bulk mode:</b> ek line me ek button bhejo\n\n"
+                       "<code>Join Channel|https://t.me/channel</code>\n"
+                       "<code>Join|https://t.me/a || Site|https://site.com</code>\n\n"
+                       "<i>Do button ek hi line me chahiye to <code>||</code> lagao.</i>")
+    return body + (f"{pe('➕')} <b>Naya button add karo</b> — Same Row = 2 button ek line me, "
+                   "New Row = apni alag line me.")
+
+
+def _wizard_kb(state: dict, target: dict) -> Optional[InlineKeyboardMarkup]:
+    tid = state.get("tid")
+    step = state.get("step")
+    rows = state.get("rows") or []
+    kb: List[List[InlineKeyboardButton]] = []
+    if step in ("name", "url", "bulk"):
+        if rows:
+            kb.append([btn("Save & Done", f"bwz_done_{tid}", "success", "✅")])
+        kb.append([btn("Cancel", f"bwz_cancel_{tid}", "danger", "❌")])
+        return InlineKeyboardMarkup(kb)
+    add_row: List[InlineKeyboardButton] = []
+    if rows and len(rows[-1]) < 2:
+        add_row.append(btn("Add Same Row", f"bwz_same_{tid}", "success", "↔️"))
+    add_row.append(btn("Add New Row", f"bwz_row_{tid}", "success", "➕"))
+    kb.append(add_row)
+    kb.append([btn("Preview", f"bwz_prev_{tid}", "primary", "👀"),
+               btn("Undo Last", f"bwz_undo_{tid}", "danger", "🗑")])
+    kb.append([btn("Save & Done", f"bwz_done_{tid}", "success", "✅")])
+    kb.append([btn("Cancel", f"bwz_cancel_{tid}", "danger", "❌")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def _wizard_render(context, state: dict, target: dict, q=None, note: str = ""):
+    text = _wizard_text(state, target)
+    if note:
+        text = f"{note}\n\n{text}"
+    kb = _wizard_kb(state, target)
+    if q is not None:
+        await safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    chat_id = state.get("chat_id")
+    if chat_id:
+        await send_premium_message(context.bot, chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def label_from_message(msg) -> Tuple[str, Optional[str], Optional[str]]:
+    """Extract a button label (+ premium emoji icon) from a user message."""
+    raw = msg.text or msg.caption or ""
+    if not raw.strip():
+        return "", None, None
+    first_line = raw.split("\n")[0]
+    entities = list(msg.entities or msg.caption_entities or [])
+    spans = custom_emoji_spans(raw, entities)
+    label, icon_id, icon_char = _label_to_text_and_icon(first_line, 0, len(first_line), spans)
+    if not label:
+        label = icon_char or first_line.strip()
+    return label.strip()[:64], icon_id, icon_char
+
+
+async def start_button_wizard(q, context, tid, mode: str = "wizard"):
+    target = get_button_target(context, tid)
+    if not target:
+        await safe_edit_message_text(q, f"{pe('❌')} Ye builder session purana ho gaya. Button dobara kholo.",
+                                     parse_mode=ParseMode.HTML)
+        return
+    rows = target_rows(context, target)
+    if mode == "bulk":
+        step = "bulk"
+    elif rows:
+        step = "next"
     else:
-        data.append([{"text": text, "cb": cb}])
-    return json.dumps(data)
+        step = "name"
+    state = {
+        "tid": str(tid), "rows": rows, "pending": None, "placement": "new", "step": step,
+        "chat_id": (q.message.chat_id if q.message else q.from_user.id), "ts": time.time(),
+    }
+    context.user_data[BUTTON_WIZARD_KEY] = state
+    note = ""
+    if rows:
+        note = f"{pe('👀')} Pehle se {button_count(rows_to_buttons_json(rows))} button hain — aur add kar sakte ho."
+    await _wizard_render(context, state, target, q=q, note=note)
+
+
+async def handle_button_wizard_callback(q, context, data: str) -> bool:
+    """Handles every `bwz_*` callback. Returns True when the update was consumed."""
+    if not data or not data.startswith("bwz_"):
+        return False
+    parts = data.split("_")
+    action = parts[1] if len(parts) > 1 else ""
+    tid = parts[2] if len(parts) > 2 else ""
+    if action in ("start", "bulk"):
+        await start_button_wizard(q, context, tid, mode="bulk" if action == "bulk" else "wizard")
+        return True
+    state = _wizard_state(context)
+    if not state or str(state.get("tid")) != str(tid):
+        await safe_edit_message_text(q, f"{pe('❌')} Ye builder band ho chuka hai. Button dobara kholo.",
+                                     parse_mode=ParseMode.HTML)
+        return True
+    target = get_button_target(context, tid)
+    if not target:
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        await safe_edit_message_text(q, f"{pe('❌')} Target session expire ho gaya.", parse_mode=ParseMode.HTML)
+        return True
+    if action in ("same", "row"):
+        state["step"] = "name"
+        state["placement"] = "same" if action == "same" else "new"
+        await _wizard_render(context, state, target, q=q)
+        return True
+    if action == "undo":
+        rows = state.get("rows") or []
+        if rows:
+            rows[-1].pop()
+            if not rows[-1]:
+                rows.pop()
+        state["rows"] = rows
+        state["step"] = "next"
+        await _wizard_render(context, state, target, q=q, note=f"{pe('🗑')} Last button hata diya.")
+        return True
+    if action == "prev":
+        markup = markup_from_rows(state.get("rows") or [])
+        if markup:
+            try:
+                await send_premium_message(context.bot, state.get("chat_id") or q.from_user.id,
+                                           f"{pe('👀')} <b>Preview</b> — yahi buttons users ko dikhenge:",
+                                           parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception as ex:
+                logging.warning(f"button preview failed: {ex}")
+        else:
+            await send_ephemeral_reply(q.message, f"{pe('❌')} Abhi koi button nahi hai.", 2)
+        return True
+    if action == "done":
+        rows = state.get("rows") or []
+        ok = target_save_rows(context, target, rows)
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        nav = target_nav_rows(target)
+        if not ok:
+            await safe_edit_message_text(q, f"{pe('❌')} Save nahi ho paya. Dobara try karo.",
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=InlineKeyboardMarkup(nav) if nav else None)
+            return True
+        extra: List[List[InlineKeyboardButton]] = []
+        if target.get("kind") in ("message", "messages") and rows:
+            extra.append(button_builder_row(context, target))
+        await safe_edit_message_text(q,
+                                     f"{pe('✅')} <b>Buttons saved!</b> ({button_count(rows_to_buttons_json(rows))})\n\n"
+                                     f"{_wizard_layout(rows)}",
+                                     parse_mode=ParseMode.HTML,
+                                     reply_markup=InlineKeyboardMarkup(extra + nav) if (extra or nav) else None)
+        return True
+    if action == "cancel":
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        nav = target_nav_rows(target)
+        await safe_edit_message_text(q, f"{pe('❌')} Button builder cancelled.", parse_mode=ParseMode.HTML,
+                                     reply_markup=InlineKeyboardMarkup(nav) if nav else None)
+        return True
+    return True
+
+
+async def userbot_wizard_callback(update, context, bot_id: str, owner_id: int):
+    """`bwz_*` callbacks inside a userbot chat - owner/admin only, always answered."""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not is_bot_owner(bot_id, q.from_user.id):
+        return
+    await handle_button_wizard_callback(q, context, q.data)
+
+
+async def handle_button_wizard_message(msg, context) -> bool:
+    """Consume text messages while the easy button builder is active."""
+    state = _wizard_state(context)
+    if not state:
+        return False
+    target = get_button_target(context, state.get("tid"))
+    if not target:
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        return False
+    has_media = any(getattr(msg, attr, None) for attr in
+                    ("photo", "video", "document", "audio", "voice", "video_note", "sticker", "animation"))
+    if has_media:
+        await reply_premium_message(msg, f"{pe('⚠️')} Button builder khula hai — pehle <b>Save & Done</b> "
+                                         f"ya <b>Cancel</b> dabao, phir media bhejo.",
+                                    parse_mode=ParseMode.HTML)
+        return True
+    if not (msg.text or msg.caption):
+        await reply_premium_message(msg, f"{pe('⚠️')} Text bhejo — button ka naam ya link.",
+                                    parse_mode=ParseMode.HTML)
+        return True
+    state["chat_id"] = msg.chat_id
+    step = state.get("step")
+    if step == "name":
+        label, icon_id, icon_char = label_from_message(msg)
+        if not label:
+            await reply_premium_message(msg, f"{pe('⚠️')} Button ka naam khali hai, dobara bhejo.",
+                                        parse_mode=ParseMode.HTML)
+            return True
+        state["pending"] = {"text": label, "icon_id": icon_id, "icon_char": icon_char,
+                            "url": None, "cb": None, "style": "primary"}
+        state["step"] = "url"
+        await _wizard_render(context, state, target)
+        return True
+    if step == "url":
+        url = (msg.text or msg.caption or "").strip().split("\n")[0].strip()
+        is_cb = url.lower().startswith("cb:")
+        if not is_cb and not url.lower().startswith(("http://", "https://", "tg://")):
+            await reply_premium_message(msg, f"{pe('⚠️')} Ye link valid nahi lag raha.\n\n"
+                                             "<code>https://t.me/yourchannel</code> jaisa link bhejo.",
+                                        parse_mode=ParseMode.HTML)
+            return True
+        pending = dict(state.get("pending") or {})
+        pending["url"] = None if is_cb else url
+        pending["cb"] = url[3:].strip() if is_cb else None
+        rows = state.get("rows") or []
+        if state.get("placement") == "same" and rows and len(rows[-1]) < 8:
+            rows[-1].append(pending)
+        else:
+            rows.append([pending])
+        state["rows"] = rows
+        state["pending"] = None
+        state["step"] = "next"
+        await _wizard_render(context, state, target,
+                            note=f"{pe('✅')} <b>{EmojiManager._html_escape(pending.get('text') or '')}</b> add ho gaya!")
+        return True
+    if step == "bulk":
+        new_rows = parse_button_lines(msg.text or msg.caption or "", msg.entities or msg.caption_entities)
+        if not new_rows:
+            await reply_premium_message(msg, f"{pe('❌')} Kuch samajh nahi aaya.\n\n"
+                                             "Ek line me ek button:\n<code>Join|https://t.me/channel</code>\n"
+                                             "<code>A|https://a.com || B|https://b.com</code>",
+                                        parse_mode=ParseMode.HTML)
+            return True
+        rows = state.get("rows") or []
+        rows.extend(new_rows)
+        state["rows"] = rows
+        state["step"] = "next"
+        await _wizard_render(context, state, target,
+                            note=f"{pe('✅')} {sum(len(r) for r in new_rows)} button add ho gaye!")
+        return True
+    if step == "next":
+        state["step"] = "name"
+        state["placement"] = "new"
+        await _wizard_render(context, state, target,
+                            note=f"{pe('➕')} Naya button — pehle naam bhejo:")
+        return True
+    return False
 
 
 async def send_ephemeral_reply(msg, text: str, seconds: int = 2):
@@ -1395,62 +2164,73 @@ async def send_ephemeral_reply(msg, text: str, seconds: int = 2):
         pass
 
 
+def _resolve_bot(bot_or_context):
+    """Accept a Bot/ExtBot or any context that carries one (context.bot)."""
+    if bot_or_context is None:
+        return None
+    if hasattr(bot_or_context, "send_message") and hasattr(bot_or_context, "send_photo"):
+        return bot_or_context
+    return getattr(bot_or_context, "bot", bot_or_context)
+
+
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
                      text: str = "", markup=None, emoji_map: dict = None,
                      entities_json: Optional[str] = None, file_name: Optional[str] = None,
                      mime_type: Optional[str] = None):
-    bot = bot_or_context if isinstance(bot_or_context, Bot) else bot_or_context.bot
+    bot = _resolve_bot(bot_or_context)
     kwargs = {}
     if markup:
         kwargs["reply_markup"] = markup
-    if text:
-        display_text = MessageManager.prepare_for_sending(text, entities_json, emoji_map)
-    else:
-        display_text = None
-    async def _do_send(send_kwargs):
+    display_text = MessageManager.prepare_for_sending(text, entities_json, emoji_map) if text else None
+
+    async def _do_send(send_kwargs, caption_override=None):
+        caption = caption_override if caption_override is not None else display_text
+        parse_mode = ParseMode.HTML if caption else None
         if media_type == "photo":
-            await bot.send_photo(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_photo(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "video":
-            await bot.send_video(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_video(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "document":
             doc_kwargs = dict(send_kwargs)
             if file_name:
                 doc_kwargs["filename"] = file_name
-            await bot.send_document(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **doc_kwargs)
+            await bot.send_document(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **doc_kwargs)
         elif media_type == "animation":
-            await bot.send_animation(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_animation(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "audio":
-            await bot.send_audio(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_audio(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "voice":
-            await bot.send_voice(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_voice(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "video_note":
             await bot.send_video_note(chat_id, media_id, **send_kwargs)
         elif media_type == "sticker":
             await bot.send_sticker(chat_id, media_id, **send_kwargs)
         else:
-            if display_text:
-                await send_user_message(bot, chat_id, display_text, parse_mode=ParseMode.HTML, **send_kwargs)
+            if caption:
+                await send_user_message(bot, chat_id, caption, parse_mode=ParseMode.HTML, **send_kwargs)
 
     try:
         await _do_send(kwargs)
     except Forbidden:
         logging.warning(f"Cannot send media to {chat_id}: bot blocked")
     except BadRequest as ex:
-        # Try again with button icons stripped first - a single bad custom-emoji
-        # icon on a button shouldn't cost the whole media delivery.
-        logging.warning(f"send_media BadRequest for {chat_id} ({media_type}): {ex}; retrying with plain buttons")
+        # 1st retry: strip button icons + premium emoji from the caption. A single bad
+        # custom-emoji document must never cost the whole media delivery.
+        logging.warning(f"send_media BadRequest for {chat_id} ({media_type}): {ex}; retrying plainly")
         degraded_kwargs = dict(kwargs)
         if "reply_markup" in degraded_kwargs:
             degraded_kwargs["reply_markup"] = _degrade_markup(degraded_kwargs["reply_markup"])
+        plain_caption = strip_premium_emojis(display_text) if display_text else None
         try:
-            await _do_send(degraded_kwargs)
+            await _do_send(degraded_kwargs, caption_override=plain_caption)
         except Exception as ex2:
-            logging.error(f"send_media plain-button retry also failed for {chat_id} ({media_type}): {ex2}")
+            logging.error(f"send_media plain retry also failed for {chat_id} ({media_type}): {ex2}")
+            # 2nd retry: text only (so the user at least receives the caption + buttons)
             try:
-                plain_text = (text or "").strip()
-                if plain_text:
-                    await send_user_message(bot, chat_id, plain_text, **degraded_kwargs)
+                if plain_caption:
+                    await send_user_message(bot, chat_id, plain_caption,
+                                            parse_mode=ParseMode.HTML, **degraded_kwargs)
             except Exception:
                 pass
     except (NetworkError, TimedOut) as ex:
@@ -1459,11 +2239,138 @@ async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
     except Exception as ex:
         logging.error(f"send_media failed: {ex}")
         try:
-            plain_text = (text or "").strip()
+            plain_text = strip_premium_emojis(display_text) if display_text else (text or "").strip()
             if plain_text:
-                await send_user_message(bot, chat_id, plain_text, **kwargs)
+                await send_user_message(bot, chat_id, plain_text,
+                                        parse_mode=ParseMode.HTML, **kwargs)
         except Exception:
             pass
+
+
+# ================= ALBUM / BROADCAST DRAFT SENDING =================
+ALBUM_MEDIA_TYPES = ("photo", "video", "document", "audio")
+
+
+def draft_items(draft: Optional[dict]) -> List[dict]:
+    """Flatten a broadcast/album draft into an ordered list of media items."""
+    draft = draft or {}
+    album = draft.get("album")
+    items: List[dict] = []
+    if isinstance(album, list) and album:
+        for it in album:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "media": it.get("media") or it.get("media_id"),
+                "media_type": it.get("media_type") or "text",
+                "text": it.get("text") or "",
+                "entities_json": it.get("entities_json"),
+                "file_name": it.get("file_name"),
+                "mime_type": it.get("mime_type"),
+            })
+        if items and not items[0]["text"] and draft.get("text"):
+            items[0]["text"] = draft.get("text")
+            items[0]["entities_json"] = draft.get("entities_json")
+        if items:
+            return items
+    return [{
+        "media": draft.get("media") or draft.get("media_id"),
+        "media_type": draft.get("media_type") or "text",
+        "text": draft.get("text") or "",
+        "entities_json": draft.get("entities_json"),
+        "file_name": draft.get("file_name"),
+        "mime_type": draft.get("mime_type"),
+    }]
+
+
+def make_media_item(extracted: dict) -> dict:
+    """One album/broadcast item from a MessageManager.extract_from_message() result."""
+    return {
+        "media": extracted.get("media_id"),
+        "media_type": extracted.get("media_type"),
+        "text": extracted.get("text") or "",
+        "entities_json": extracted.get("entities_json"),
+        "file_name": extracted.get("file_name"),
+        "mime_type": extracted.get("mime_type"),
+        "telegram_message_id": extracted.get("telegram_message_id"),
+    }
+
+
+async def send_buttons_after_album(bot, chat_id, text: str, markup):
+    """Telegram does not allow reply_markup on an album, so the buttons go into a
+    small follow-up message (this is how buttons on media groups work)."""
+    body = text or f"{pe('🔗')} <b>Links</b>"
+    try:
+        await send_user_message(bot, chat_id, body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return True
+    except Exception as ex:
+        logging.error(f"album buttons message failed for {chat_id}: {ex}")
+        return False
+
+
+async def send_album(bot, chat_id, items: List[dict], markup=None, button_text: str = "") -> bool:
+    """Send 2..10 media items as one album (caption attached), then the buttons."""
+    group = []
+    for it in items:
+        media_id = it.get("media")
+        media_type = it.get("media_type")
+        if not media_id or media_type not in ALBUM_MEDIA_TYPES:
+            continue
+        caption = MessageManager.prepare_for_sending(it.get("text") or "", it.get("entities_json")) if it.get("text") else None
+        media_kwargs = {"caption": caption, "parse_mode": ParseMode.HTML if caption else None}
+        if media_type == "photo":
+            group.append(InputMediaPhoto(media=media_id, **media_kwargs))
+        elif media_type == "video":
+            group.append(InputMediaVideo(media=media_id, **media_kwargs))
+        elif media_type == "document":
+            group.append(InputMediaDocument(media=media_id, **media_kwargs))
+        else:
+            group.append(InputMediaAudio(media=media_id, **media_kwargs))
+        if len(group) >= 10:
+            break
+    if len(group) < 2:
+        return False
+    try:
+        await bot.send_media_group(chat_id=chat_id, media=group)
+    except (NetworkError, TimedOut):
+        raise
+    except Exception as ex:
+        logging.warning(f"send_media_group failed for {chat_id}: {ex}; sending items separately")
+        return False
+    if markup:
+        await send_buttons_after_album(bot, chat_id, button_text, markup)
+    return True
+
+
+async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], markup=None,
+                             with_buttons: bool = True, button_text: str = "") -> bool:
+    """Send a broadcast draft: single media/text, or the whole album + buttons.
+
+    This is what makes grouped media (4-5 photos/videos with a caption) work in the
+    broadcast flows - previously only the first item of the album was ever sent.
+    """
+    bot = _resolve_bot(bot_or_context)
+    items = draft_items(draft)
+    usable = [it for it in items if it.get("media") and it.get("media_type") in ALBUM_MEDIA_TYPES]
+    if len(usable) >= 2:
+        sent = await send_album(bot, chat_id, items, markup=markup if with_buttons else None,
+                                button_text=button_text)
+        if sent:
+            return True
+        # album failed -> deliver every item on its own (buttons on the last one)
+        for idx, it in enumerate(usable):
+            last = idx == len(usable) - 1
+            await send_media(bot, chat_id, it.get("media"), it.get("media_type") or "text",
+                             it.get("text") or "", markup if (last and with_buttons) else None,
+                             entities_json=it.get("entities_json"),
+                             file_name=it.get("file_name"), mime_type=it.get("mime_type"))
+        return True
+    item = usable[0] if usable else (items[0] if items else {})
+    await send_media(bot, chat_id, item.get("media"), item.get("media_type") or "text",
+                     item.get("text") or "", markup if with_buttons else None,
+                     entities_json=item.get("entities_json"),
+                     file_name=item.get("file_name"), mime_type=item.get("mime_type"))
+    return True
 
 
 # ================= SAFE COPY MESSAGE =================
@@ -1596,15 +2503,27 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                         group_items.append(InputMediaVideo(media=g_media_id, caption=display_text or None, parse_mode=pm))
                     elif g_media_type == "document":
                         group_items.append(InputMediaDocument(media=g_media_id, caption=display_text or None, parse_mode=pm))
+                    elif g_media_type == "audio":
+                        group_items.append(InputMediaAudio(media=g_media_id, caption=display_text or None, parse_mode=pm))
                 j += 1
             if group_items:
+                group_markup = buttons_to_markup(group_buttons_json)
                 try:
                     await context.bot.send_media_group(chat_id=chat_id, media=group_items)
                 except BadRequest as ex:
-                    logging.error(f"send_media_group failed for {chat_id}: {ex}")
-                group_markup = buttons_to_markup(group_buttons_json)
-                if group_markup:
-                    await send_user_message(context.bot, chat_id, group_caption_text or "Open links:", parse_mode=ParseMode.HTML, reply_markup=group_markup)
+                    # Fall back to sending the album items one by one instead of losing them
+                    logging.error(f"send_media_group failed for {chat_id}: {ex}; sending items separately")
+                    for k, inner in enumerate(group_items):
+                        try:
+                            await send_media(context, chat_id, inner.media,
+                                             {"InputMediaPhoto": "photo", "InputMediaVideo": "video",
+                                              "InputMediaDocument": "document", "InputMediaAudio": "audio"}.get(type(inner).__name__, "text"),
+                                             inner.caption or "", group_markup if k == len(group_items) - 1 else None)
+                        except Exception as inner_ex:
+                            logging.error(f"album item fallback failed for {chat_id}: {inner_ex}")
+                else:
+                    if group_markup:
+                        await send_buttons_after_album(context.bot, chat_id, group_caption_text or "", group_markup)
             i = j
             continue
 
@@ -1645,7 +2564,7 @@ def _runtime_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict:
 async def sync_pending_join_requests_for_channel(bot_id: str, channel_id: int, bot):
     try:
         if not hasattr(bot, 'get_chat_join_requests'):
-            logging.info(f"get_chat_join_requests not available in this PTB version. Skipping sync.")
+            logging.info("get_chat_join_requests not available in this PTB version. Skipping sync.")
             return
         count = 0
         async for jr in bot.get_chat_join_requests(channel_id):
@@ -1712,6 +2631,11 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML)
         return
 
+    # Easy button builder (➕ Add Button wizard)
+    if data and data.startswith("bwz_"):
+        await handle_button_wizard_callback(q, context, data)
+        return
+
     if data == "main_menu":
         user = q.from_user
         await safe_edit_message_text(q, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML,
@@ -1719,6 +2643,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     if data == f"back_to_manage_{bot_id}" or data == f"manage_bot_{bot_id}":
+        # leaving the panel drops any half-finished broadcast draft / button builder
+        for stale_key in (f"broadcast_stage_{bot_id}", f"broadcast_draft_{bot_id}", BUTTON_WIZARD_KEY):
+            context.user_data.pop(stale_key, None)
         await safe_edit_message_text(q, f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>", parse_mode=ParseMode.HTML,
             reply_markup=bot_management_kb(bot_id, uid))
         return
@@ -1767,7 +2694,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await safe_edit_message_text(q,
             f"<blockquote>{pp('📝')} <b>SET MESSAGES</b></blockquote>\n\n"
             "Send messages one by one.\n\n"
-            "Supported: text, photo, video, document, audio, sticker, media albums\n\n"
+            "Supported: text, photo, video, document, audio, sticker, media albums (4-5 media + caption)\n\n"
+            f"{pp('🔘')} Har message ke baad <b>Add Button</b> se buttons bana sakte ho "
+            "(naam bhejo → link bhejo → same row / new row).\n\n"
             "Placeholders: <code>{{first_name}}</code> <code>{{username}}</code> <code>{{user_id}}</code>\n\n"
             "Type <b>done</b> when finished.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")]]))
@@ -1847,15 +2776,20 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if data == f"ub_broadcast_{bot_id}":
         context.user_data[f"broadcast_stage_{bot_id}"] = "await_message"
         await safe_edit_message_text(q,
-            f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\nSend message to broadcast to all your users:",
+            f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\n"
+            "Jo message bhejna hai wo bhejo — text, photo, video, document ya poora "
+            "album (4-5 photo/video ek saath + caption).\n\n"
+            f"{pe('🔘')} Buttons add karne ka option uske baad milega.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")]]))
         return
 
     if data == f"bcast_add_btns_{bot_id}":
-        context.user_data[f"broadcast_stage_{bot_id}"] = "await_buttons"
-        await safe_edit_message_text(q,
-            f"{pe('🔘')} Send inline buttons (Text|https://link per line):",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+        if not context.user_data.get(f"broadcast_draft_{bot_id}"):
+            await safe_edit_message_text(q, f"{pe('❌')} Pehle broadcast message bhejo.", parse_mode=ParseMode.HTML,
+                                         reply_markup=bot_management_kb(bot_id, uid))
+            return
+        tid = register_button_target(context, user_broadcast_target(bot_id, uid))
+        await start_button_wizard(q, context, tid)
         return
 
     if data == f"bcast_send_{bot_id}":
@@ -1931,11 +2865,18 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         msg_id = _extract_last_id(parts)
         ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["editing_buttons_msg_id"] = msg_id
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, {"kind": "message", "msg_id": msg_id,
+                                         "back_cb": f"ubmm_{bot_id}_{msg_id}"}),
+            [btn("Cancel", f"ubmm_{bot_id}_{msg_id}", "danger", "❌")],
+        ])
         await safe_edit_message_text(q,
-            f"{pe('🔘')} <b>Send Inline Buttons</b>\n\n"
-            "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
-            "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"ub_manage_messages_{bot_id}", "danger", "❌")]]))
+            f"{pe('🔘')} <b>Edit Inline Buttons</b>\n\n"
+            "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
+            "<b>Paste Many</b> = purana format\n"
+            "<code>Button Label|https://link</code>\n"
+            "<code>Label One|https://link1 || Label Two|https://link2</code>",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if data.startswith(f"delmsg_{bot_id}_"):
@@ -1973,22 +2914,52 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if data.startswith(f"setbtn_addmore_{bot_id}_"):
         parts = data.split("_")
         msg_id = _extract_last_id(parts)
-        ud = _runtime_store(context, f"{uid}_{bot_id}")
-        ud["waiting_buttons"] = {"msg_id": msg_id, "append": True}
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, {"kind": "message", "msg_id": msg_id,
+                                         "back_cb": f"manage_bot_{bot_id}"}),
+            [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+        ])
         await safe_edit_message_text(q,
-            f"{pe('🔘')} Send more inline buttons to append:\n\n"
-            "<code>Button Label|https://link</code>",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+            f"{pe('🔘')} <b>Aur buttons add karo</b> — purane buttons already load ho chuke hain.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if data.startswith(f"setbtng_addmore_{bot_id}"):
         ud = _runtime_store(context, f"{uid}_{bot_id}")
-        grp = ud.get("pending_buttons_group_addmore")
-        if grp:
-            ud["waiting_buttons"] = {"msg_ids": grp.get("msg_ids"), "append": True}
+        grp = ud.get("pending_buttons_group_addmore") or {}
+        msg_ids = grp.get("msg_ids") or []
+        if not msg_ids:
+            await safe_edit_message_text(q, f"{pe('❌')} Album session nahi mila, album dobara bhejo.",
+                                         parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
+            return
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, {"kind": "messages", "msg_ids": msg_ids,
+                                         "back_cb": f"manage_bot_{bot_id}"}),
+            [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+        ])
         await safe_edit_message_text(q,
-            f"{pe('🔘')} Send more buttons to append:",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+            f"{pe('🔘')} <b>Aur buttons add karo</b> — purane buttons already load ho chuke hain.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if data == f"setbtng_{bot_id}" or data.startswith(f"setbtn_{bot_id}_"):
+        ud = _runtime_store(context, f"{uid}_{bot_id}")
+        if data == f"setbtng_{bot_id}":
+            grp = ud.get("pending_buttons_group") or {}
+            msg_ids = grp.get("msg_ids") or []
+            target = {"kind": "messages", "msg_ids": msg_ids, "back_cb": f"manage_bot_{bot_id}"}
+        else:
+            msg_id = _extract_last_id(data.split("_"))
+            target = {"kind": "message", "msg_id": msg_id, "back_cb": f"manage_bot_{bot_id}"}
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, target),
+            [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+        ])
+        await safe_edit_message_text(q,
+            f"{pe('🔘')} <b>Inline Buttons</b>\n\n"
+            "<b>Add Button</b> = easy (naam → link → row)\n"
+            "<b>Paste Many</b> = bulk format",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
 
@@ -2050,12 +3021,17 @@ async def _flush_media_group(bot_id: str, actor_uid: int, managed_uid: int, chat
         saved_ids.append(msg_id)
     ud.pop(key, None)
     ud["pending_buttons_group"] = {"msg_ids": saved_ids}
-    await send_premium_message(context.bot, chat_id, f"{pe('✅')} Media group saved. Choose an option:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-        [btn("Set Inline Button", f"setbtng_{bot_id}", "primary", "🔘")],
-        [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
-        [btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
-        [btn("Done", f"setmsg_done_{bot_id}", "success", "✅")],
-    ]))
+    builder = button_builder_row(context, {"kind": "messages", "msg_ids": saved_ids,
+                                           "back_cb": f"manage_bot_{bot_id}"})
+    await send_premium_message(context.bot, chat_id,
+        f"{pe('✅')} <b>Album saved</b> ({len(saved_ids)} media).\n\n"
+        f"{pe('🔘')} Buttons add karo (album ke neeche ek chhote message me dikhenge):",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+            builder,
+            [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
+            [btn("Done", f"setmsg_done_{bot_id}", "success", "✅"),
+             btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
+        ]))
 
 
 async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2160,6 +3136,10 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
     ud = _runtime_store(context, f"{uid}_{bot_id}")
     extracted = MessageManager.extract_from_message(msg)
 
+    # Easy button builder (➕ Add Button wizard) has priority over the other flows
+    if await handle_button_wizard_message(msg, context):
+        return
+
     if ud.get("editing_text_msg_id"):
         mid = ud.pop("editing_text_msg_id")
         row = db.get_message_by_id(mid)
@@ -2177,7 +3157,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         mid = ud.pop("editing_buttons_msg_id")
         row = db.get_message_by_id(mid)
         if row and row["bot_id"] == bot_id:
-            btn_json = buttons_json_from_text(msg.text or "")
+            btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
             db.update_message_buttons(mid, btn_json or "[]")
             await reply_premium_message(msg, f"{pe('✅')} Buttons updated.", parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[btn(f"{pe('🔙')} Back to Messages", f"ubmm_{bot_id}_{row['channel_id']}", "primary", "🔙")]]))
@@ -2249,7 +3229,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         msg_id = info.get("msg_id")
         msg_ids = info.get("msg_ids") or ([] if msg_id is None else [msg_id])
         append_mode = info.get("append", False)
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             for _id in msg_ids:
                 if append_mode:
@@ -2267,12 +3247,17 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
             else:
                 more_btn_cb = f"setbtng_addmore_{bot_id}"
                 ud["pending_buttons_group_addmore"] = {"msg_ids": msg_ids}
-            await reply_premium_message(msg, f"{pe('✅')} Inline buttons saved! Choose next action:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Set More Inline Buttons", more_btn_cb, "primary", "🔘")],
-                [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
-                [btn("Done", f"setmsg_done_{bot_id}", "success", "✅")],
-                [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
-            ]))
+            builder_target = ({"kind": "message", "msg_id": msg_ids[0]} if len(msg_ids) == 1
+                              else {"kind": "messages", "msg_ids": msg_ids})
+            builder_target["back_cb"] = f"manage_bot_{bot_id}"
+            await reply_premium_message(msg, f"{pe('✅')} Inline buttons saved!", parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    button_builder_row(context, builder_target),
+                    [btn("Set More Inline Buttons", more_btn_cb, "primary", "🔘")],
+                    [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
+                    [btn("Done", f"setmsg_done_{bot_id}", "success", "✅"),
+                     btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+                ]))
         else:
             await reply_premium_message(msg, f"{pe('❌')} No valid buttons parsed.\n\nFormat:\n• 1 button: <code>Button Label|https://link</code>\n• 2 per row: <code>Label One|https://link1 || Label Two|https://link2</code>", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         ud.pop("waiting_buttons", None)
@@ -2327,30 +3312,39 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         if msg_id and extracted["emoji_map"]:
             db.save_user_emoji_map(bot_id, msg_id, extracted["emoji_map"])
         ud["pending_buttons"] = {"msg_id": msg_id, "channel_id": channel_id}
-        await reply_premium_message(msg, f"{pe('✅')} Message saved! Choose an option:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-            [btn("Set Inline Button", f"setbtn_{bot_id}_{msg_id}", "primary", "🔘")],
-            [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
-            [btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
-            [btn("Done", f"setmsg_done_{bot_id}", "success", "✅")],
-        ]))
+        builder = button_builder_row(context, {"kind": "message", "msg_id": msg_id,
+                                               "back_cb": f"manage_bot_{bot_id}"})
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Message saved!</b>\n\n"
+            f"{pe('🔘')} Buttons add karne ke liye <b>Add Button</b> dabao (naam → link → row), "
+            f"ya <b>Paste Many</b> se purana <code>Label|link</code> format use karo.",
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+                builder,
+                [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
+                [btn("Done", f"setmsg_done_{bot_id}", "success", "✅"),
+                 btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
+            ]))
         return
 
     if context.user_data.get(f"broadcast_stage_{bot_id}") == "await_message":
+        # Albums arrive as separate updates - collect them all before saving the draft
+        if await collect_broadcast_album(context, "user", bot_id, msg, extracted):
+            return
         draft = {"text": extracted["text"], "media": extracted["media_id"], "media_type": extracted["media_type"],
                  "emoji_map": extracted["emoji_map"], "entities_json": extracted["entities_json"],
-                 "file_name": extracted.get("file_name"), "mime_type": extracted.get("mime_type")}
+                 "file_name": extracted.get("file_name"), "mime_type": extracted.get("mime_type"),
+                 "buttons_json": None, "target_bot": bot_id}
         context.user_data[f"broadcast_draft_{bot_id}"] = draft
         context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
-        await reply_premium_message(msg, f"{pe('✅')} Broadcast draft saved. Add inline buttons or send now?", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-            [btn("Add Inline Buttons", f"bcast_add_btns_{bot_id}", "primary", "🔘")],
-            [btn("Send Now", f"bcast_send_{bot_id}", "success", "🚀")],
-            [btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")],
-        ]))
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Broadcast draft saved.</b>\n\n"
+            f"{pe('🔘')} <b>Add Button</b> se buttons add karo, ya seedha <b>Send Now</b> dabao.",
+            parse_mode=ParseMode.HTML, reply_markup=user_broadcast_ready_kb(context, bot_id, owner_id))
         return
 
     if context.user_data.get(f"broadcast_stage_{bot_id}") == "await_buttons":
         draft = context.user_data.get(f"broadcast_draft_{bot_id}", {})
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             draft["buttons_json"] = btn_json
             context.user_data[f"broadcast_draft_{bot_id}"] = draft
@@ -2360,10 +3354,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                     await reply_premium_message(msg, f"{pe('👁')} <b>Button Preview</b> — yahi dikhega users ko:", parse_mode=ParseMode.HTML, reply_markup=preview_markup)
                 except Exception:
                     pass
-            await reply_premium_message(msg, f"{pe('✅')} Buttons saved. Ready to send?", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Send Now", f"bcast_send_{bot_id}", "success", "🚀")],
-                [btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")],
-            ]))
+            await reply_premium_message(msg, f"{pe('✅')} Buttons saved. Ready to send?", parse_mode=ParseMode.HTML,
+                                        reply_markup=user_broadcast_ready_kb(context, bot_id, owner_id))
         else:
             await reply_premium_message(msg, f"{pe('❌')} No valid buttons.\n\nFormat:\n• 1 button: <code>Button Label|https://link</code>\n• 2 per row: <code>Label One|https://link1 || Label Two|https://link2</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
         context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
@@ -2573,7 +3565,8 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app.bot_data["owner_id"] = owner_id
     app.add_handler(CommandHandler("start", lambda u, c: user_bot_start(u, c, bot_id, owner_id)))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_public_userbot_callback(u, c, bot_id), pattern=r'^(start_now|live_chat_support)$'))
-    app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|bwz_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: userbot_wizard_callback(u, c, bot_id, owner_id), pattern=r"^bwz_"))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_set_buttons_callback(u, c, bot_id, owner_id), pattern=f"^setbtn_{bot_id}_"))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
@@ -2604,15 +3597,196 @@ async def stop_user_bot(bot_id: str):
 
 
 # ================= BROADCAST FUNCTIONS =================
+def _broadcast_draft_key(scope: str, bot_id: Optional[str] = None) -> str:
+    return f"broadcast_draft_{bot_id}" if scope == "user" else "admin_broadcast_draft"
+
+
+def _broadcast_stage_key(scope: str, bot_id: Optional[str] = None) -> str:
+    return f"broadcast_stage_{bot_id}" if scope == "user" else "admin_broadcast_stage"
+
+
+def get_broadcast_draft(context, scope: str, bot_id: Optional[str] = None) -> dict:
+    draft = context.user_data.get(_broadcast_draft_key(scope, bot_id))
+    return draft if isinstance(draft, dict) else {}
+
+
+def save_broadcast_draft(context, scope: str, bot_id: Optional[str], draft: dict):
+    context.user_data[_broadcast_draft_key(scope, bot_id)] = draft
+
+
+def user_broadcast_target(bot_id: str, owner_id: int) -> dict:
+    return {"kind": "draft_user", "bot_id": bot_id, "owner_id": owner_id,
+            "back_cb": f"manage_bot_{bot_id}"}
+
+
+def admin_broadcast_target() -> dict:
+    return {"kind": "draft_admin", "back_cb": "admin_panel"}
+
+
+def user_broadcast_ready_kb(context, bot_id: str, owner_id: int) -> InlineKeyboardMarkup:
+    rows = [button_builder_row(context, user_broadcast_target(bot_id, owner_id))]
+    rows.append([btn("Send Now", f"bcast_send_{bot_id}", "success", "🚀"),
+                 btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_broadcast_ready_kb(context) -> InlineKeyboardMarkup:
+    rows = [button_builder_row(context, admin_broadcast_target())]
+    rows.append([btn("Send Now", "admin_bcast_send", "success", "🚀"),
+                 btn("Cancel", "admin_panel", "danger", "❌")])
+    return InlineKeyboardMarkup(rows)
+
+
+def broadcast_selected_ids(context) -> List[str]:
+    selected = context.user_data.get("admin_bcast_selected") or []
+    return [str(b) for b in selected if b]
+
+
+def broadcast_target_label(draft: dict) -> str:
+    ids = [str(b) for b in (draft.get("target_bots") or []) if b]
+    if not ids and draft.get("target_bot"):
+        ids = [str(draft["target_bot"])]
+    if not ids:
+        return "ALL userbots"
+    if len(ids) == 1:
+        return f"userbot {ids[0]}"
+    return f"{len(ids)} userbots ({', '.join(ids[:5])}{'…' if len(ids) > 5 else ''})"
+
+
+def make_broadcast_draft(extracted: dict, target_bots: Optional[List[str]] = None,
+                         target_bot: Optional[str] = None) -> dict:
+    return {
+        "text": extracted.get("text") or "",
+        "media": extracted.get("media_id"),
+        "media_type": extracted.get("media_type") or "text",
+        "entities_json": extracted.get("entities_json"),
+        "file_name": extracted.get("file_name"),
+        "mime_type": extracted.get("mime_type"),
+        "buttons_json": None,
+        "target_bots": list(target_bots) if target_bots else None,
+        "target_bot": target_bot,
+    }
+
+
+def _broadcast_album_key(scope: str, bot_id: Optional[str], media_group_id) -> str:
+    return f"bcast_album_{scope}_{bot_id or 'admin'}_{media_group_id}"
+
+
+# strong references so fire-and-forget flush tasks are never garbage collected
+_PENDING_TASKS: set = set()
+
+
+def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1.4):
+    """Wait a moment for the rest of an album, then save the draft.
+
+    Uses the JobQueue when available and falls back to an asyncio task, so album
+    broadcasts keep working even without the job-queue extra."""
+    if getattr(context, "job_queue", None):
+        context.user_data[job_key] = context.job_queue.run_once(_flush_broadcast_album_job, when=when, data=data)
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(when)
+            await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
+                                        data.get("chat_id"), data.get("media_group_id"))
+        except Exception as ex:
+            logging.error(f"broadcast album flush task failed: {ex}")
+
+    task = asyncio.ensure_future(_runner())
+    _PENDING_TASKS.add(task)
+    task.add_done_callback(_PENDING_TASKS.discard)
+    context.user_data[job_key] = task
+
+
+async def collect_broadcast_album(context, scope: str, bot_id: Optional[str], msg,
+                                  extracted: dict) -> bool:
+    """Collect an album (media group) sent while composing a broadcast.
+
+    Telegram delivers every photo/video of an album as a separate update; before this
+    only the first one ever reached the draft, so users got a single media instead of
+    the whole album with its caption.
+    """
+    media_group_id = extracted.get("media_group_id")
+    if not media_group_id:
+        return False
+    key = _broadcast_album_key(scope, bot_id, media_group_id)
+    items = context.user_data.setdefault(key, [])
+    first = len(items) == 0
+    items.append(make_media_item(extracted))
+    if first:
+        try:
+            await reply_premium_message(msg, f"{pe('📸')} Album mil gaya, process kar raha hoon…",
+                                        parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    job_key = f"{key}_job"
+    old_job = context.user_data.get(job_key)
+    if old_job is not None:
+        try:
+            old_job.schedule_removal()
+        except Exception:
+            try:
+                old_job.cancel()
+            except Exception:
+                pass
+    _schedule_broadcast_flush(context, job_key,
+                              {"scope": scope, "bot_id": bot_id, "chat_id": msg.chat_id,
+                               "media_group_id": media_group_id})
+    return True
+
+
+async def _flush_broadcast_album_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
+                                data.get("chat_id"), data.get("media_group_id"))
+
+
+async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
+                                chat_id, media_group_id):
+    key = _broadcast_album_key(scope, bot_id, media_group_id)
+    items = context.user_data.pop(key, None) or []
+    context.user_data.pop(f"{key}_job", None)
+    if not items or not chat_id:
+        return
+    first = items[0]
+    draft = {
+        "text": first.get("text") or "",
+        "media": first.get("media"),
+        "media_type": first.get("media_type") or "text",
+        "entities_json": first.get("entities_json"),
+        "file_name": first.get("file_name"),
+        "mime_type": first.get("mime_type"),
+        "album": items,
+        "buttons_json": None,
+    }
+    if scope == "admin":
+        draft["target_bots"] = broadcast_selected_ids(context) or None
+        draft["target_bot"] = None
+        context.user_data["admin_broadcast_draft"] = draft
+        context.user_data["admin_broadcast_stage"] = "buttons_or_send"
+        context.user_data.pop("admin_broadcast", None)
+        kb = admin_broadcast_ready_kb(context)
+        label = broadcast_target_label(draft)
+    else:
+        draft["target_bot"] = bot_id
+        context.user_data[f"broadcast_draft_{bot_id}"] = draft
+        context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
+        kb = user_broadcast_ready_kb(context, bot_id, 0)
+        label = "your users"
+    await send_premium_message(context.bot, chat_id,
+                               f"{pe('✅')} <b>Album saved</b> ({len(items)} media) — target: {label}\n\n"
+                               f"Buttons add karo ya abhi send kar do.",
+                               parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
 async def preview_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
     draft = context.user_data.get(f"broadcast_draft_{bot_id}", {})
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft found.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
     try:
-        await send_media(context, owner_id, draft.get("media"), draft.get("media_type") or "text",
-                         draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                         entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+        await send_draft_message(context, owner_id, draft, markup=buttons_to_markup(draft.get("buttons_json")))
     except Exception as ex:
         await safe_edit_message_text(q, f"{pe('❌')} Preview failed: {str(ex)}", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
@@ -2625,24 +3799,24 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft to send.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
-    reqs = db.get_requesters_for_bot(bot_id)
+    reqs = list(dict.fromkeys(db.get_requesters_for_bot(bot_id) or []))
     if not reqs:
         await safe_edit_message_text(q, f"{pe('❌')} No users to broadcast to.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
     await safe_edit_message_text(q, f"{pe('✈️')} Broadcasting...", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+    markup = buttons_to_markup(draft.get("buttons_json"))
     sent = 0
     fail = 0
     for r in reqs:
         try:
-            await send_media(context, r, draft.get("media"), draft.get("media_type") or "text",
-                             draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                             entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+            await send_draft_message(context, r, draft, markup=markup)
             db.mark_reachable(bot_id, r)
             sent += 1
         except Forbidden:
             db.mark_unreachable(bot_id, r)
             fail += 1
         except Exception as ex:
+            logging.error(f"user broadcast delivery failed for {r}: {ex}")
             fail += 1
         if (sent + fail) % 30 == 0:
             try:
@@ -2651,6 +3825,22 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
                 pass
     await safe_edit_message_text(q, UIFormatter.broadcast_confirm(sent, fail), parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
     context.user_data.pop(f"broadcast_draft_{bot_id}", None)
+
+
+async def ensure_broadcast_subscription(bot_id: str, bot_token: Optional[str] = None,
+                                        owner_id: Optional[int] = None) -> bool:
+    """Agar userbot ke paas koi active subscription nahi hai to broadcast ke liye
+    1 din ka Basic khud se add karo aur bot ko (best effort) chalu kar do."""
+    added = db.grant_broadcast_subscription(bot_id, days=1, sub_type="Basic")
+    if not added:
+        return False
+    try:
+        if bot_token and bot_id not in user_bot_applications:
+            await start_user_bot(bot_token, bot_id, owner_id or 0)
+            db.set_user_bot_active(bot_id, True)
+    except Exception as ex:
+        logging.error(f"auto-start after trial subscription failed for {bot_id}: {ex}")
+    return True
 
 
 # ================= ADMIN PANEL FUNCTIONS =================
@@ -2933,6 +4123,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
 
     try:
+        # Easy button builder (➕ Add Button wizard) - handled before everything else
+        if data and data.startswith("bwz_"):
+            await handle_button_wizard_callback(q, context, data)
+            return
+
         if data == "main_menu":
             user = q.from_user
             await safe_edit_message_text(q, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
@@ -2959,6 +4154,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message_text(q, f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>\n\nBot: @{bot_data['bot_username']}\nBot ID: {bot_id}", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
             return
 
+        # ---- userbot manage panel opened from the MAIN bot ----
+        if data and data.startswith(USERBOT_PANEL_PREFIXES):
+            panel_bot = resolve_managed_bot_id(uid, data)
+            if not panel_bot:
+                return
+            if not is_bot_owner(panel_bot, uid):
+                await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML)
+                return
+            if data.startswith(READONLY_PANEL_PREFIXES):
+                # read-only panels work from here too
+                await user_bot_callback(update, context, panel_bot, uid)
+            else:
+                await show_manage_from_bot_help(q, panel_bot)
+            return
+
         if data.startswith("sub_for_bot_"):
             bot_id = data.replace("sub_for_bot_", "")
             await safe_edit_message_text(q, UIFormatter.subscription_required(), parse_mode=ParseMode.HTML, reply_markup=subscription_plans_kb(bot_id))
@@ -2975,6 +4185,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
                 return
+            # leaving the panel drops any half-finished broadcast (avoids a stale draft)
+            for stale_key in ("admin_broadcast", "admin_broadcast_stage", "admin_broadcast_draft",
+                              "admin_bcast_selected", "admin_broadcast_target"):
+                context.user_data.pop(stale_key, None)
+            context.user_data.pop(BUTTON_WIZARD_KEY, None)
             await safe_edit_message_text(q, f"<blockquote>{pp('👑')} <b>ADMIN PANEL</b></blockquote>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             return
 
@@ -3150,14 +4365,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             idx = int(data.replace("admin_leave_set_btns_", ""))
-            context.user_data["admin_set_leave_btns_idx"] = idx
+            kb = InlineKeyboardMarkup([
+                button_builder_row(context, {"kind": "leave_msg", "idx": idx,
+                                             "back_cb": "admin_leave_msgs"}),
+                [btn("Back", "admin_leave_msgs", "primary", "🔙")],
+            ])
             await safe_edit_message_text(q,
-                f"<blockquote>{pp('🔘')} <b>SET BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
-                "Send button lines.\n\nFormat:\n"
-                "• <code>Button Label|https://link</code>\n"
-                "• <code>Label1|https://url1 || Label2|https://url2</code>\n\n"
-                "Multiple buttons per row use <code> || </code> separator.",
-                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_leave_msgs", "primary", "🔙")]]))
+                f"<blockquote>{pp('🔘')} <b>BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
+                "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
+                "<b>Paste Many</b> = bulk format (premium emoji supported)\n"
+                "<code>Button Label|https://link</code>\n"
+                "<code>Label1|https://url1 || Label2|https://url2</code>",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
         if data == "admin_leave_channels":
@@ -3214,7 +4433,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\nChoose target:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Specific UserBot", "admin_bcast_target_select", "primary", "🎯")],
+                [btn("Select UserBots (multi)", "admin_bcast_target_select", "primary", "🎯")],
                 [btn("All UserBots", "admin_bcast_target_all", "success", "🌐")],
                 [btn("Back", "admin_panel", "primary", "🔙")],
             ]))
@@ -3225,19 +4444,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data["admin_broadcast"] = True
             context.user_data["admin_broadcast_target"] = None
-            await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO ALL</b></blockquote>\n\nSend text or media to broadcast to all userbots' users.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
+            context.user_data.pop("admin_bcast_selected", None)
+            await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO ALL</b></blockquote>\n\nSend text, media ya album (4-5 photo/video + caption) — buttons baad me add kar sakte ho.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
             return
 
         if data == "admin_bcast_target_select":
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data.startswith("admin_bcast_tog_"):
             if not is_admin(uid):
                 return
-            bots = db.get_all_user_bots() or []
-            if not bots:
-                await safe_edit_message_text(q, f"{pe('❌')} No userbots found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            bot_id = data.replace("admin_bcast_tog_", "")
+            selected = broadcast_selected_ids(context)
+            if bot_id in selected:
+                selected = [b for b in selected if b != bot_id]
+            else:
+                selected.append(bot_id)
+            context.user_data["admin_bcast_selected"] = selected
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data == "admin_bcast_sel_all":
+            if not is_admin(uid):
                 return
-            kb = [[btn(f"@{bot['bot_username']} ({bot['bot_id']})", f"admin_bcast_pick_{bot['bot_id']}", "primary", "🤖")] for bot in bots]
-            kb.append([btn("Back", "admin_broadcast", "primary", "🔙")])
-            await safe_edit_message_text(q, f"{pe('🤖')} Select userbot:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            context.user_data["admin_bcast_selected"] = [str(b["bot_id"]) for b in (db.get_all_user_bots() or [])]
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data == "admin_bcast_sel_none":
+            if not is_admin(uid):
+                return
+            context.user_data["admin_bcast_selected"] = []
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data == "admin_bcast_sel_done":
+            if not is_admin(uid):
+                return
+            selected = broadcast_selected_ids(context)
+            if not selected:
+                await safe_edit_message_text(q, f"{pe('⚠️')} Kam se kam ek userbot select karo.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_bcast_target_select", "primary", "🔙")]]))
+                return
+            context.user_data["admin_broadcast"] = True
+            context.user_data["admin_broadcast_target"] = None
+            await safe_edit_message_text(q,
+                f"<blockquote>{pp('✈️')} <b>BROADCAST → {len(selected)} USERBOT(S)</b></blockquote>\n\n"
+                f"Ab message bhejo — text, photo, video, document ya album (4-5 media + caption).\n\n"
+                f"{pe('🔘')} Buttons add karne ka option draft save hone ke baad milega.\n"
+                f"{pe('⚠️')} Jis userbot ka subscription nahi hai, usme 1 din ka Basic khud add ho jayega.",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_bcast_target_select", "primary", "🔙")]]))
             return
 
         if data.startswith("admin_bcast_pick_"):
@@ -3246,6 +4502,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_id = data.replace("admin_bcast_pick_", "")
             context.user_data["admin_broadcast"] = True
             context.user_data["admin_broadcast_target"] = bot_id
+            context.user_data["admin_bcast_selected"] = [bot_id]
             await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO USERBOT {bot_id}</b></blockquote>\n\nSend text or media to broadcast.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
             return
 
@@ -3253,11 +4510,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             draft = context.user_data.get("admin_broadcast_draft", {})
-            if draft:
-                context.user_data["admin_broadcast_stage"] = "await_buttons"
-                await safe_edit_message_text(q, f"{pe('🔘')} Send button lines (Text|https://link per line):", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
-            else:
+            if not draft:
                 await safe_edit_message_text(q, f"{pe('❌')} No draft found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            tid = register_button_target(context, admin_broadcast_target())
+            await start_button_wizard(q, context, tid)
             return
 
         if data == "admin_bcast_send":
@@ -3366,62 +4623,117 @@ async def preview_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = q.from_user.id
     try:
-        await send_media(context, uid, draft.get("media"), draft.get("media_type") or "text",
-                         draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                         entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+        await send_draft_message(context, uid, draft, markup=buttons_to_markup(draft.get("buttons_json")))
     except Exception as ex:
         await safe_edit_message_text(q, f"{pe('❌')} Preview failed: {str(ex)}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
-    target_bot = draft.get("target_bot")
-    target_label = f"userbot {target_bot}" if target_bot else "ALL userbots"
-    await safe_edit_message_text(q, f"{pe('✅')} Preview sent above.\n{pe('✈️')} Confirm broadcast to <b>{target_label}</b>?", parse_mode=ParseMode.HTML, reply_markup=confirm_kb("admin_bcast_confirm", "admin_panel"))
+    await safe_edit_message_text(q, f"{pe('✅')} Preview sent above.\n{pe('✈️')} Confirm broadcast to <b>{broadcast_target_label(draft)}</b>?",
+                                 parse_mode=ParseMode.HTML, reply_markup=confirm_kb("admin_bcast_confirm", "admin_panel"))
 
 
 async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
     draft = context.user_data.get("admin_broadcast_draft", {})
-    for key in ["admin_broadcast", "admin_broadcast_stage", "admin_broadcast_target"]:
+    selected = [str(b) for b in ((draft.get("target_bots") or broadcast_selected_ids(context))) if b]
+    if not selected and draft.get("target_bot"):
+        selected = [str(draft["target_bot"])]
+    for key in ["admin_broadcast", "admin_broadcast_stage", "admin_broadcast_target", "admin_bcast_selected"]:
         context.user_data.pop(key, None)
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft to send.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
-    bots = db.get_all_user_bots()
-    if draft.get("target_bot"):
-        bots = [b for b in bots if b["bot_id"] == draft["target_bot"]]
-    await safe_edit_message_text(q, f"{pe('✈️')} Admin broadcast started...", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+    all_bots = db.get_all_user_bots() or []
+    bots = [b for b in all_bots if str(b["bot_id"]) in selected] if selected else all_bots
+    if not bots:
+        await safe_edit_message_text(q, f"{pe('❌')} Selected userbot(s) not found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        context.user_data.pop("admin_broadcast_draft", None)
+        return
+    await safe_edit_message_text(q, f"{pe('✈️')} Admin broadcast started — {len(bots)} userbot(s)…", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+    markup = buttons_to_markup(draft.get("buttons_json"))
     total_sent = 0
     total_fail = 0
+    auto_subs: List[str] = []
+    per_bot_lines: List[str] = []
     for bot in bots:
         bot_id = bot["bot_id"]
-        sub = db.get_subscription_for_bot(bot_id)
-        if not sub:
-            continue
-        try:
-            exp = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
-            if exp < now_aware():
-                continue
-        except Exception:
-            continue
+        # Agar subscription nahi hai to 1 din ka Basic khud se add karo, warna broadcast
+        # us userbot ke users tak kabhi nahi pahunchta.
+        if await ensure_broadcast_subscription(bot_id, bot.get("bot_token"), bot.get("user_id")):
+            auto_subs.append(bot_id)
         if bot_id in user_bot_applications:
             bot_instance = user_bot_applications[bot_id].bot
         else:
             try:
                 bot_instance = Bot(token=bot["bot_token"])
-            except Exception:
+            except Exception as ex:
+                logging.error(f"admin broadcast: bad token for {bot_id}: {ex}")
+                per_bot_lines.append(f"❌ @{bot.get('bot_username') or bot_id}: token error")
                 continue
-        recipients = db.get_requesters_for_bot(bot_id)
+        recipients = list(dict.fromkeys(db.get_requesters_for_bot(bot_id) or []))
+        bot_sent = 0
+        bot_fail = 0
         for r in recipients:
             try:
-                await send_media(bot_instance, r, draft.get("media"), draft.get("media_type") or "text",
-                                 draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                                 entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
-                total_sent += 1
+                await send_draft_message(bot_instance, r, draft, markup=markup)
+                bot_sent += 1
             except Forbidden:
-                total_fail += 1
-            except Exception:
-                total_fail += 1
-    target_label = f"userbot {draft['target_bot']}" if draft.get("target_bot") else "ALL userbots"
-    await safe_edit_message_text(q, f"<blockquote>{pp('✅')} <b>ADMIN BROADCAST COMPLETE</b></blockquote>\n\n{pp('📤')} Target: {target_label}\n{pp('✅')} Sent: {total_sent}\n{pp('❌')} Failed: {total_fail}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                bot_fail += 1
+            except Exception as ex:
+                logging.error(f"admin broadcast delivery failed for {r} via {bot_id}: {ex}")
+                bot_fail += 1
+        total_sent += bot_sent
+        total_fail += bot_fail
+        per_bot_lines.append(f"• @{bot.get('bot_username') or bot_id}: {bot_sent} sent, {bot_fail} failed"
+                             + ("  (1d Basic auto-added)" if bot_id in auto_subs else ""))
+    summary = "\n".join(per_bot_lines[-15:])
+    auto_line = ""
+    if auto_subs:
+        auto_line = f"\n{pp('⭐️')} 1-day Basic auto-added: {len(auto_subs)} userbot(s)"
+    await safe_edit_message_text(q,
+                                 f"<blockquote>{pp('✅')} <b>ADMIN BROADCAST COMPLETE</b></blockquote>\n\n"
+                                 f"{pp('📤')} Target: {broadcast_target_label(draft)}\n"
+                                 f"{pp('✅')} Sent: {total_sent}\n"
+                                 f"{pp('❌')} Failed: {total_fail}{auto_line}\n\n{summary}",
+                                 parse_mode=ParseMode.HTML, reply_markup=admin_kb())
     context.user_data.pop("admin_broadcast_draft", None)
+
+
+async def render_admin_bcast_targets(q, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-select list: har userbot ko tick karke Done dabao."""
+    if not is_admin(q.from_user.id):
+        return
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        await safe_edit_message_text(q, f"{pe('❌')} No userbots found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        return
+    selected = set(broadcast_selected_ids(context))
+    rows: List[List[InlineKeyboardButton]] = [[
+        btn("Select All", "admin_bcast_sel_all", "primary", "✅"),
+        btn("Clear", "admin_bcast_sel_none", "danger", "🗑"),
+    ]]
+    for bot in bots:
+        bot_id = str(bot["bot_id"])
+        sub = db.get_active_subscription(bot_id)
+        if sub:
+            try:
+                expiry = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
+                days_left = max((expiry - now_aware()).days, 0)
+            except Exception:
+                days_left = 0
+            status = f"{sub['subscription_type']} {days_left}d"
+        else:
+            status = "no sub → 1d Basic auto"
+        mark = "☑️" if bot_id in selected else "⬜"
+        label = f"{mark} @{bot.get('bot_username') or bot_id} • {status}"
+        rows.append([btn(label[:60], f"admin_bcast_tog_{bot_id}", "primary", "🤖")])
+    rows.append([btn(f"Done ({len(selected)} selected)", "admin_bcast_sel_done", "success", "✅")])
+    rows.append([btn("Back", "admin_broadcast", "primary", "🔙")])
+    await safe_edit_message_text(q,
+                                 f"<blockquote>{pp('✈️')} <b>SELECT USERBOTS</b></blockquote>\n\n"
+                                 "Jitne userbots ko select karna hai unhe tick karo (ek-ek karke, ya Select All), "
+                                 "phir <b>Done</b> dabao.\n\n"
+                                 f"{pe('ℹ️')} Jis userbot ka subscription nahi hai, usme 1 din ka Basic khud add ho jayega.\n\n"
+                                 f"<b>Selected:</b> {len(selected)}",
+                                 parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ================= MAIN MESSAGE HANDLER =================
@@ -3431,6 +4743,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     if not msg:
+        return
+
+    # Easy button builder (➕ Add Button wizard) has priority over everything else
+    if await handle_button_wizard_message(msg, context):
         return
 
     if context.user_data.get("waiting_token") and not is_admin(user.id):
@@ -3552,7 +4868,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_set_leave_btns_idx") is not None and is_admin(user.id):
         idx = context.user_data.pop("admin_set_leave_btns_idx")
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             cfg = db.get_leave_recovery_config()
             messages = cfg.get("messages", [])
@@ -3589,27 +4905,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_broadcast") and is_admin(user.id):
         extracted = MessageManager.extract_from_message(msg)
-        draft = {
-            "text": msg.text or msg.caption or "",
-            "media": msg.photo[-1].file_id if msg.photo else (msg.video.file_id if msg.video else (msg.document.file_id if msg.document else None)),
-            "media_type": "photo" if msg.photo else ("video" if msg.video else ("document" if msg.document else "text")),
-            "entities_json": extracted["entities_json"],
-            "file_name": extracted.get("file_name"),
-            "mime_type": extracted.get("mime_type"),
-            "target_bot": context.user_data.get("admin_broadcast_target"),
-        }
+        # An album arrives as many updates - collect all of them first
+        if await collect_broadcast_album(context, "admin", None, msg, extracted):
+            return
+        if not (msg.text or msg.caption or extracted.get("media_id")):
+            await reply_premium_message(msg, f"{pe('⚠️')} Text, photo, video, document ya album bhejo.", parse_mode=ParseMode.HTML)
+            return
+        draft = make_broadcast_draft(extracted,
+                                     target_bots=broadcast_selected_ids(context) or None,
+                                     target_bot=context.user_data.get("admin_broadcast_target"))
         context.user_data["admin_broadcast_draft"] = draft
-        context.user_data["admin_broadcast_stage"] = "await_buttons"
-        await reply_premium_message(msg, f"{pe('✅')} Broadcast draft saved. Add buttons or send now?", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-            [btn("Add Inline Buttons", "admin_bcast_add_btns", "primary", "🔘")],
-            [btn("Send Now", "admin_bcast_send", "success", "🚀")],
-            [btn("Cancel", "admin_panel", "danger", "❌")],
-        ]))
+        context.user_data["admin_broadcast_stage"] = "buttons_or_send"
+        context.user_data.pop("admin_broadcast", None)
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Broadcast draft saved.</b>\n"
+            f"{pe('📤')} Target: {broadcast_target_label(draft)}\n\n"
+            f"{pe('🔘')} <b>Add Button</b> se buttons banao, ya <b>Send Now</b> dabao.",
+            parse_mode=ParseMode.HTML, reply_markup=admin_broadcast_ready_kb(context))
         return
 
     if context.user_data.get("admin_broadcast_stage") == "await_buttons" and is_admin(user.id):
         draft = context.user_data.get("admin_broadcast_draft", {})
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             draft["buttons_json"] = btn_json
             context.user_data["admin_broadcast_draft"] = draft
