@@ -589,6 +589,14 @@ def _extract_last_id(parts: list) -> int:
     return 0
 
 # ================= DATABASE =================
+# Broadcast audience: reachable users + approved join requests, permanent failures excluded.
+REQUESTERS_SQL = """SELECT requester_id, MAX(ok) AS ok FROM (
+       SELECT requester_id, 1 AS ok FROM reachable_users WHERE bot_id=%s
+       UNION ALL
+       SELECT DISTINCT requester_id, 0 AS ok FROM join_requests WHERE bot_id=%s AND status='approved'
+       ) AS all_users
+       WHERE requester_id NOT IN (SELECT requester_id FROM unreachable_users WHERE bot_id=%s)
+       GROUP BY requester_id ORDER BY ok DESC"""
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/advanced_bot")
 
 try:
@@ -630,6 +638,7 @@ class Database:
             """CREATE TABLE IF NOT EXISTS user_bot_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                channel_id BIGINT, content_text TEXT, media_id TEXT, media_type TEXT,\n                file_name TEXT, mime_type TEXT, telegram_message_id BIGINT,\n                media_group_id TEXT, buttons_json TEXT, entities_json TEXT,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS join_requests (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, channel_id BIGINT, status TEXT,\n                request_date TIMESTAMPTZ DEFAULT now(), approved_date TIMESTAMPTZ,\n                UNIQUE(bot_id, requester_id, channel_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS reachable_users (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, last_ok_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, requester_id)\n            )""",
+            """CREATE TABLE IF NOT EXISTS unreachable_users (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, reason TEXT, failed_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, requester_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS user_emoji_maps (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                msg_id BIGINT, emoji_map JSONB DEFAULT '{}',\n                updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (bot_id, msg_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS system_settings (\n                key TEXT PRIMARY KEY, value_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS leave_recovery_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT, user_id BIGINT,\n                source_channel_id BIGINT, target_channel_id BIGINT, message_id BIGINT,\n                sent_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ\n            )""",
@@ -638,6 +647,7 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_user_bots_user ON user_bots(user_id)",
             "CREATE INDEX IF NOT EXISTS idx_messages_bot ON user_bot_messages(bot_id, channel_id)",
             "CREATE INDEX IF NOT EXISTS idx_reachable_bot ON reachable_users(bot_id, last_ok_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_unreachable_bot ON unreachable_users(bot_id)",
         ]
         with self.conn.cursor() as cur:
             for stmt in statements:
@@ -916,22 +926,27 @@ class Database:
 
     def mark_reachable(self, bot_id: str, requester_id):
         self._execute("INSERT INTO reachable_users (bot_id, requester_id, last_ok_at) VALUES (%s,%s,now()) ON CONFLICT (bot_id, requester_id) DO UPDATE SET last_ok_at=now()", (bot_id, requester_id))
+        # User wapas aa gaya (start / join request) -> purana permanent-fail marker hata do
+        self._execute("DELETE FROM unreachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
 
     def mark_unreachable(self, bot_id: str, requester_id):
         self._execute("DELETE FROM reachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
 
-    def get_requesters_for_bot(self, bot_id: str):
-        """Everyone a broadcast should reach: previously reachable users first, then
-        every approved join request (each id only once).
+    def mark_permanently_unreachable(self, bot_id: str, requester_id, reason: str = ""):
+        """Jo user permanently reachable nahi hai (block / chat not found / deactivated)
+        use yaad rakho - warna har broadcast me hazaaron dead ids par API calls jati hain
+        aur log spam hota hai (yehi server logs me dikh raha tha)."""
+        self._execute("""INSERT INTO unreachable_users (bot_id, requester_id, reason, failed_at)
+               VALUES (%s,%s,%s,now()) ON CONFLICT (bot_id, requester_id)
+               DO UPDATE SET reason=EXCLUDED.reason, failed_at=now()""",
+            (bot_id, requester_id, (reason or "")[:200]))
 
-        The old query returned ONLY the reachable list whenever it was non-empty, so
-        users who had approved the join request but were never messaged before never
-        received a broadcast."""
-        rows = self._fetchall("""SELECT requester_id, MAX(ok) AS ok FROM (
-               SELECT requester_id, 1 AS ok FROM reachable_users WHERE bot_id=%s
-               UNION ALL
-               SELECT DISTINCT requester_id, 0 AS ok FROM join_requests WHERE bot_id=%s AND status='approved'
-               ) AS all_users GROUP BY requester_id ORDER BY ok DESC""", (bot_id, bot_id))
+    def get_requesters_for_bot(self, bot_id: str):
+        """Broadcast audience: reachable users + approved join requests (ek id ek baar).
+
+        Permanently unreachable users (block / chat not found / deactivated) skip hote
+        hain - pehle un par har broadcast me API calls jati thin aur log spam hota tha."""
+        rows = self._fetchall(REQUESTERS_SQL, (bot_id, bot_id, bot_id))
         return [r["requester_id"] for r in rows]
 
     def get_total_requesters_count(self, bot_id: str):
@@ -1439,12 +1454,17 @@ async def send_user_message(bot, chat_id, text, *args, **kwargs):
     that way), so we now retry with the emoji tags stripped and the button icons
     removed - a plain message is always better than no message.
     """
+    raise_on_failure = kwargs.pop("raise_on_failure", False)
     try:
         return await bot.send_message(chat_id, text, *args, **kwargs)
     except Forbidden:
-        logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
-        return None
+        # Blocked / can't initiate: broadcast ko is user ko unreachable mark karna hai,
+        # isliye swallow nahi karte (pehle chup-chaap None return hota tha aur broadcast
+        # ise "sent" ginta tha).
+        raise
     except BadRequest as ex:
+        if is_user_gone_error(ex):
+            raise
         logging.warning(f"send_user_message BadRequest for {chat_id}: {ex}; retrying plainly")
         plain_kwargs = dict(kwargs)
         if plain_kwargs.get("reply_markup") is not None:
@@ -1461,12 +1481,16 @@ async def send_user_message(bot, chat_id, text, *args, **kwargs):
             except Exception as retry_ex:
                 logging.warning(f"send_user_message plain retry failed for {chat_id}: {retry_ex}")
         logging.error(f"send_user_message failed: {ex}")
+        if raise_on_failure:
+            raise
         return None
     except (NetworkError, TimedOut) as ex:
         logging.warning(f"Network error sending to {chat_id}: {ex}")
         raise
     except Exception as ex:
         logging.error(f"send_user_message failed: {ex}")
+        if raise_on_failure:
+            raise
         return None
 
 
@@ -2235,7 +2259,7 @@ def _resolve_bot(bot_or_context):
 async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
                      text: str = "", markup=None, emoji_map: dict = None,
                      entities_json: Optional[str] = None, file_name: Optional[str] = None,
-                     mime_type: Optional[str] = None):
+                     mime_type: Optional[str] = None, raise_on_failure: bool = False):
     bot = _resolve_bot(bot_or_context)
     kwargs = {}
     if markup:
@@ -2270,43 +2294,154 @@ async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
 
     try:
         await _do_send(kwargs)
+        return True
     except Forbidden:
-        logging.warning(f"Cannot send media to {chat_id}: bot blocked")
+        # Blocked / can't initiate: chup-chaap swallow karne se broadcast "sent" count
+        # karta tha aur user DB me reachable hi rehta tha. Ab caller (broadcast) decide
+        # karta hai: unreachable mark karo.
+        raise
     except BadRequest as ex:
+        if is_user_gone_error(ex):
+            # "Chat not found" / deactivated / can't initiate: retry karna bekaar hai
+            raise
+        media_problem = is_media_error(ex)
         # 1st retry: strip button icons + premium emoji from the caption. A single bad
         # custom-emoji document must never cost the whole media delivery.
-        logging.warning(f"send_media BadRequest for {chat_id} ({media_type}): {ex}; retrying plainly")
+        log = logging.debug if media_problem else logging.warning
+        log(f"send_media BadRequest for {chat_id} ({media_type}): {ex}; retrying plainly")
         degraded_kwargs = dict(kwargs)
         if "reply_markup" in degraded_kwargs:
             degraded_kwargs["reply_markup"] = _degrade_markup(degraded_kwargs["reply_markup"])
         plain_caption = strip_premium_emojis(display_text) if display_text else None
+        delivered = False
         try:
             await _do_send(degraded_kwargs, caption_override=plain_caption)
+            delivered = True
         except Exception as ex2:
-            logging.error(f"send_media plain retry also failed for {chat_id} ({media_type}): {ex2}")
+            log = logging.debug if (media_problem or is_media_error(ex2)) else logging.error
+            log(f"send_media plain retry also failed for {chat_id} ({media_type}): {ex2}")
             # 2nd retry: text only (so the user at least receives the caption + buttons)
             try:
                 if plain_caption:
                     await send_user_message(bot, chat_id, plain_caption,
                                             parse_mode=ParseMode.HTML, **degraded_kwargs)
+                    delivered = True
             except Exception:
                 pass
+        if delivered and media_problem:
+            # media nahi gayi par caption + buttons pahunch gaye (broadcast ise count karta hai).
+            # Har user ke liye alag line na chhape - pehle 3 WARNING, uske baad DEBUG.
+            key = (str(media_type), mask_secrets(ex)[:60])
+            seen = _MEDIA_ISSUE_SEEN.get(key, 0)
+            _MEDIA_ISSUE_SEEN[key] = seen + 1
+            log = logging.warning if seen < 3 else logging.debug
+            log(f"media deliver nahi hui ({chat_id}, {media_type}) - caption + buttons text ke "
+                f"roop me bheje: {mask_secrets(ex)}")
+            return "degraded"
+        if not delivered and raise_on_failure:
+            raise
+        return delivered
     except (NetworkError, TimedOut) as ex:
         logging.warning(f"Network error sending to {chat_id}: {ex}")
         raise
     except Exception as ex:
         logging.error(f"send_media failed: {ex}")
+        delivered = False
         try:
             plain_text = strip_premium_emojis(display_text) if display_text else (text or "").strip()
             if plain_text:
                 await send_user_message(bot, chat_id, plain_text,
                                         parse_mode=ParseMode.HTML, **kwargs)
+                delivered = True
         except Exception:
             pass
+        if not delivered and raise_on_failure:
+            raise
+        return delivered
 
 
 # ================= ALBUM / BROADCAST DRAFT SENDING =================
 ALBUM_MEDIA_TYPES = ("photo", "video", "document", "audio")
+
+# User-level permanent failures: is user ko dobara try karne ka koi fayda nahi
+USER_GONE_MARKERS = (
+    "chat not found", "user not found", "user is deactivated", "user is deleted",
+    "bot was blocked", "blocked by the user", "bot can't initiate conversation",
+    "cant initiate conversation", "can't initiate conversation", "peer_id_invalid",
+    "bot was kicked", "bot is not a member",
+)
+# Media-level failures: user theek hai, sirf media reference galat hai
+MEDIA_ERROR_MARKERS = (
+    "wrong file identifier", "http url specified", "document_invalid", "media invalid",
+    "media_empty", "photo_invalid", "video_invalid", "audio_invalid", "file is too big",
+    "file too large", "file is too big", "image_process_failed",
+)
+
+
+def is_user_gone_error(ex) -> bool:
+    text = str(ex).lower()
+    return any(m in text for m in USER_GONE_MARKERS)
+
+
+def is_media_error(ex) -> bool:
+    text = str(ex).lower()
+    return any(m in text for m in MEDIA_ERROR_MARKERS)
+
+
+_MEDIA_REF_CACHE: Dict[tuple, str] = {}
+MEDIA_URL_TEMPLATE = "https://api.telegram.org/file/bot{token}/{path}"
+# ek hi media problem ke pehle 3 users WARNING par, baaki DEBUG (log spam na ho)
+_MEDIA_ISSUE_SEEN: Dict[tuple, int] = {}
+
+
+async def sendable_media_id(dest_bot, media_id, source_bot):
+    """file_id sirf usi bot ke liye valid hota hai jisne file receive ki thi.
+
+    Admin broadcast me media MAIN bot ne receive ki hoti hai aur bhejna kisi userbot se
+    hota hai -> Telegram "wrong file identifier/http url specified" deta hai (server
+    logs me yehi error dikh raha tha). Aise case me source bot ke get_file se ek file URL
+    banate hain jo destination bot khud download kar leta hai.
+    """
+    if not media_id or not source_bot or dest_bot is source_bot:
+        return media_id
+    if not isinstance(media_id, str) or media_id.startswith("http"):
+        return media_id
+    cache_key = (getattr(dest_bot, "token", "") or "", media_id)
+    if cache_key in _MEDIA_REF_CACHE:
+        return _MEDIA_REF_CACHE[cache_key]
+    resolved = media_id
+    try:
+        remote = await source_bot.get_file(media_id)
+        path = getattr(remote, "file_path", None)
+        token = getattr(source_bot, "token", "")
+        if path and token:
+            resolved = MEDIA_URL_TEMPLATE.format(token=token, path=path)
+            logging.info(f"media cross-bot translate ho gayi ({len(resolved)} char url)")
+    except Exception as ex:
+        logging.warning(f"media ko dusre bot ke liye translate nahi kar paye: {mask_secrets(ex)}")
+    _MEDIA_REF_CACHE[cache_key] = resolved
+    if len(_MEDIA_REF_CACHE) > 5000:
+        _MEDIA_REF_CACHE.clear()
+    return resolved
+
+
+async def translate_draft_for_bot(draft: Optional[dict], dest_bot, source_bot) -> dict:
+    """Draft ki copy jo `dest_bot` actually bhej sakta hai."""
+    draft = dict(draft or {})
+    if not source_bot or dest_bot is source_bot:
+        return draft
+    album = draft.get("album")
+    if isinstance(album, list) and album:
+        new_album = []
+        for it in album:
+            if isinstance(it, dict) and it.get("media"):
+                it = dict(it)
+                it["media"] = await sendable_media_id(dest_bot, it.get("media"), source_bot)
+            new_album.append(it)
+        draft["album"] = new_album
+    if draft.get("media"):
+        draft["media"] = await sendable_media_id(dest_bot, draft.get("media"), source_bot)
+    return draft
 
 
 def draft_items(draft: Optional[dict]) -> List[dict]:
@@ -2361,6 +2496,8 @@ async def send_buttons_after_album(bot, chat_id, text: str, markup):
     try:
         await send_user_message(bot, chat_id, body, parse_mode=ParseMode.HTML, reply_markup=markup)
         return True
+    except Forbidden:
+        raise           # blocked user -> broadcast ise unreachable mark karega
     except Exception as ex:
         logging.error(f"album buttons message failed for {chat_id}: {ex}")
         return False
@@ -2416,6 +2553,11 @@ async def send_album(bot, chat_id, items: List[dict], markup=None, button_text: 
         return False
     try:
         await bot.send_media_group(chat_id=chat_id, media=group)
+    except Forbidden:
+        # User ne bot block kiya / chat initiate nahi ho sakti -> items ek-ek karke
+        # bhejne ka koi fayda nahi (pehle ye album ke har item par retry karta tha,
+        # isi se "Cannot send media to X: bot blocked" 5-5 baar log hota tha).
+        raise
     except BadRequest as ex:
         # Permanent (jaise MEDIA_GROUPED_INVALID / media invalid) -> caller per-item
         # fallback karega. NOTE: BadRequest NetworkError ka subclass hai, isliye ye
@@ -2434,7 +2576,7 @@ async def send_album(bot, chat_id, items: List[dict], markup=None, button_text: 
 
 async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], markup=None,
                              with_buttons: bool = True, button_text: str = "",
-                             move_caption: Optional[bool] = None) -> bool:
+                             move_caption: Optional[bool] = None, source_bot=None) -> bool:
     """Send a broadcast draft: single media/text, or the whole album + buttons.
 
     This is what makes grouped media (4-5 photos/videos with a caption) work in the
@@ -2447,6 +2589,9 @@ async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], mar
     """
     bot = _resolve_bot(bot_or_context)
     draft = draft or {}
+    if source_bot is not None and source_bot is not bot:
+        # Draft kisi dusre bot ne receive kiya tha -> media refs translate karo
+        draft = await translate_draft_for_bot(draft, bot, source_bot)
     items = draft_items(draft)
     if move_caption is None:
         move_caption = bool(draft.get("caption_with_buttons", False))
@@ -2463,6 +2608,7 @@ async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], mar
         cap_item = items[cap_idx] if 0 <= cap_idx < len(items) else None
         moved = MessageManager.prepare_for_sending(cap_item.get("text") or "",
                                                    cap_item.get("entities_json")) if cap_item else ""
+        degraded = False
         for k, it in enumerate(usable):
             last = k == len(usable) - 1
             skip = it is cap_item
@@ -2472,19 +2618,23 @@ async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], mar
                 text, entities = "", None
             if last and cap_item is not None and not skip:
                 text, entities = moved, cap_item.get("entities_json")
-            await send_media(bot, chat_id, it.get("media"), it.get("media_type") or "text",
-                             text or "", markup if (last and with_buttons) else None,
-                             entities_json=entities,
-                             file_name=it.get("file_name"), mime_type=it.get("mime_type"))
+            status = await send_media(bot, chat_id, it.get("media"), it.get("media_type") or "text",
+                                      text or "", markup if (last and with_buttons) else None,
+                                      entities_json=entities,
+                                      file_name=it.get("file_name"), mime_type=it.get("mime_type"),
+                                      raise_on_failure=True)
+            degraded = degraded or status == "degraded"
+        if degraded:
+            return "degraded"
         if not usable and with_buttons and markup:
             await send_buttons_after_album(bot, chat_id, button_text, markup)
         return True
     item = usable[0] if usable else (items[0] if items else {})
-    await send_media(bot, chat_id, item.get("media"), item.get("media_type") or "text",
-                     item.get("text") or "", markup if with_buttons else None,
-                     entities_json=item.get("entities_json"),
-                     file_name=item.get("file_name"), mime_type=item.get("mime_type"))
-    return True
+    return await send_media(bot, chat_id, item.get("media"), item.get("media_type") or "text",
+                            item.get("text") or "", markup if with_buttons else None,
+                            entities_json=item.get("entities_json"),
+                            file_name=item.get("file_name"), mime_type=item.get("mime_type"),
+                            raise_on_failure=True)
 
 
 # ================= SAFE COPY MESSAGE =================
@@ -4115,22 +4265,43 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
     markup = buttons_to_markup(draft.get("buttons_json"))
     sent = 0
     fail = 0
+    gone = 0
+    degraded = 0
+    reasons: Dict[str, int] = {}
     for r in reqs:
         try:
-            await send_draft_message(context, r, draft, markup=markup)
+            status = await send_draft_message(context, r, draft, markup=markup)
             db.mark_reachable(bot_id, r)
             sent += 1
-        except Forbidden:
+            if status == "degraded":
+                degraded += 1
+        except Forbidden as ex:
+            gone += 1
             db.mark_unreachable(bot_id, r)
-            fail += 1
+            db.mark_permanently_unreachable(bot_id, r, str(ex))
+        except BadRequest as ex:
+            if is_user_gone_error(ex):
+                gone += 1
+                db.mark_unreachable(bot_id, r)
+                db.mark_permanently_unreachable(bot_id, r, str(ex))
+            else:
+                fail += 1
+                key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
+                reasons[key] = reasons.get(key, 0) + 1
         except Exception as ex:
-            logging.error(f"user broadcast delivery failed for {r}: {ex}")
             fail += 1
-        if (sent + fail) % 30 == 0:
+            key = mask_secrets(ex)[:60]
+            reasons[key] = reasons.get(key, 0) + 1
+        if (sent + fail + gone) % 30 == 0:
             try:
                 await q.message.edit_text(f"{pe('✈️')} Broadcasting... Sent: {sent}, Failed: {fail}", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
+    if reasons:
+        logging.warning(f"user broadcast {bot_id}: {fail} failed — " +
+                        ", ".join(f"{k} x{v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]))
+    logging.info(f"user broadcast {bot_id}: sent={sent} unreachable={gone} failed={fail} "
+                 f"media_issues={degraded}")
     await safe_edit_message_text(q, UIFormatter.broadcast_confirm(sent, fail), parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
     context.user_data.pop(f"broadcast_draft_{bot_id}", None)
 
@@ -5001,18 +5172,55 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         recipients = list(dict.fromkeys(db.get_requesters_for_bot(bot_id) or []))
         bot_sent = 0
         bot_fail = 0
+        bot_gone = 0
+        bot_degraded = 0
+        reasons: Dict[str, int] = {}
+        # Media main bot ne receive ki hoti hai -> is userbot ke liye refs translate karo
+        # (warna har user par "wrong file identifier/http url specified" aata hai)
+        bot_draft = await translate_draft_for_bot(draft, bot_instance, context.bot)
+        media_translated = any(
+            isinstance(m, str) and m.startswith("http")
+            for m in ([i.get("media") for i in (bot_draft.get("album") or [])] or [bot_draft.get("media")])
+            if m)
         for r in recipients:
             try:
-                await send_draft_message(bot_instance, r, draft, markup=markup)
+                status = await send_draft_message(bot_instance, r, bot_draft, markup=markup)
                 bot_sent += 1
-            except Forbidden:
-                bot_fail += 1
+                if status == "degraded":
+                    bot_degraded += 1
+                db.mark_reachable(bot_id, r)
+            except Forbidden as ex:
+                # blocked by user / "Bot can't initiate conversation with a user"
+                bot_gone += 1
+                db.mark_unreachable(bot_id, r)
+                db.mark_permanently_unreachable(bot_id, r, str(ex))
+            except BadRequest as ex:
+                if is_user_gone_error(ex):
+                    bot_gone += 1
+                    db.mark_unreachable(bot_id, r)
+                    db.mark_permanently_unreachable(bot_id, r, str(ex))
+                else:
+                    bot_fail += 1
+                    key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
+                    reasons[key] = reasons.get(key, 0) + 1
             except Exception as ex:
-                logging.error(f"admin broadcast delivery failed for {r} via {bot_id}: {ex}")
                 bot_fail += 1
+                key = mask_secrets(ex)[:60]
+                reasons[key] = reasons.get(key, 0) + 1
+        if bot_degraded:
+            logging.warning(f"admin broadcast {bot_id}: {bot_degraded} users ko media ke bina "
+                            f"caption+buttons mila (media file issue - naya media bhej ke retry karo)")
+        if reasons:
+            logging.warning(f"admin broadcast {bot_id}: {bot_fail} failed — " +
+                            ", ".join(f"{k} x{v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]))
+        logging.info(f"admin broadcast {bot_id}: recipients={len(recipients)} sent={bot_sent} "
+                     f"unreachable={bot_gone} failed={bot_fail} media_issues={bot_degraded} "
+                     f"media_translated={media_translated}")
         total_sent += bot_sent
-        total_fail += bot_fail
-        per_bot_lines.append(f"• @{bot.get('bot_username') or bot_id}: {bot_sent} sent, {bot_fail} failed"
+        total_fail += bot_gone + bot_fail
+        per_bot_lines.append(f"• @{bot.get('bot_username') or bot_id}: {bot_sent} sent, "
+                             f"{bot_gone + bot_fail} failed ({bot_gone} unreachable)"
+                             + (f", {bot_degraded} media-issue" if bot_degraded else "")
                              + ("  (1d Basic auto-added)" if bot_id in auto_subs else ""))
     summary = "\n".join(per_bot_lines[-15:])
     auto_line = ""
