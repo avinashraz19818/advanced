@@ -61,9 +61,11 @@ def retry_async(max_retries=3, delay=1, backoff=2):
                 except (NetworkError, TimedOut, ConnectionError) as e:
                     retries += 1
                     if retries >= max_retries:
-                        logging.error(f"Failed after {max_retries} retries: {e}")
+                        # Final failure: caller apne context ke saath log karta hai
+                        logging.warning(f"{max_retries} attempts ke baad bhi network fail: {mask_secrets(e)}")
                         raise
-                    logging.warning(f"Retry {retries}/{max_retries} after {current_delay}s: {e}")
+                    # Per-attempt lines DEBUG par (log spam na ho) - final result caller batata hai
+                    logging.debug(f"Retry {retries}/{max_retries} after {current_delay}s: {mask_secrets(e)}")
                     await asyncio.sleep(current_delay)
                     current_delay *= backoff
                 except Exception:
@@ -1012,6 +1014,12 @@ class Database:
 
     def mark_unreachable(self, bot_id: str, requester_id):
         self._execute("DELETE FROM reachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
+
+    def is_permanently_unreachable(self, bot_id: str, requester_id) -> bool:
+        """Kya ye user pehle hi permanently fail ho chuka hai (block/chat not found)?"""
+        row = self._fetchone("SELECT 1 AS x FROM unreachable_users WHERE bot_id=%s AND requester_id=%s",
+                             (bot_id, requester_id))
+        return bool(row)
 
     def mark_permanently_unreachable(self, bot_id: str, requester_id, reason: str = ""):
         """Jo user permanently reachable nahi hai (block / chat not found / deactivated)
@@ -3942,6 +3950,13 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
         return
 
     db.mark_unreachable(bot_id, member_user.id)
+    try:
+        if db.is_permanently_unreachable(bot_id, member_user.id):
+            # Pehle hi block/can't-initiate nikla tha - dobara try karne ka fayda nahi
+            logging.info(f"leave recovery skip: user {member_user.id} pehle hi unreachable mark hai")
+            return
+    except Exception:
+        pass
     leave_cfg = db.get_leave_recovery_config()
     target_channel_id = leave_cfg.get("target_channel_id")
     target_link = (leave_cfg.get("target_channel_link") or "").strip()
@@ -3980,13 +3995,32 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
             else:
                 leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
 
-            sent = await send_user_message(context.bot, member_user.id, text,
+            try:
+                sent = await send_user_message(context.bot, member_user.id, text,
                                                parse_mode=ParseMode.HTML, reply_markup=leave_markup)
+            except Forbidden as ex:
+                # User ne bot block kiya / DM shuru nahi ho sakti -> aage ke messages bhi
+                # fail honge. Ek hi line log karo (ERROR spam nahi) + yaad rakho.
+                db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
+                logging.warning(f"leave recovery DM skip (user {member_user.id} reachable nahi): "
+                                f"{mask_secrets(ex)}")
+                break
+            except BadRequest as ex:
+                if is_user_gone_error(ex):
+                    db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
+                    logging.warning(f"leave recovery DM skip (user {member_user.id}): {mask_secrets(ex)}")
+                else:
+                    logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
+                break
+            except (NetworkError, TimedOut) as ex:
+                # Transient - agli member-update par dobara try ho jayega
+                logging.warning(f"leave recovery DM network hiccup (transient): {mask_secrets(ex)}")
+                break
             if sent:
                 db.add_leave_recovery_message(bot_id, member_user.id, cmu.chat.id, int(target_channel_id), sent.message_id)
 
     except Exception as ex:
-        logging.error(f"Leave recovery DM failed: {ex}")
+        logging.error(f"Leave recovery DM failed: {mask_secrets(ex)}", exc_info=True)
 
 
 # ================= USER BOT LIFECYCLE =================
