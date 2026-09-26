@@ -76,6 +76,13 @@ sys.path.insert(0, REPO)
 import advanced as A  # noqa: E402
 from telegram import InlineKeyboardMarkup  # noqa: E402
 
+try:  # user-account mode ke error classes (telethon optional hai)
+    from telethon.errors import (SessionPasswordNeededError, PhoneCodeInvalidError,
+                                 PhoneCodeExpiredError, PasswordHashInvalidError)
+    HAS_TELETHON = True
+except Exception:  # pragma: no cover
+    HAS_TELETHON = False
+
 PASS, FAIL = [], []
 _silent = io.StringIO()
 with redirect_stdout(_silent):
@@ -333,7 +340,9 @@ class FakeDB:
         pass
 
     def get_channel_owner_data(self, channel_id, bot_id):
-        return {"channel_id": channel_id, "bot_id": bot_id}
+        return {"channel_id": channel_id, "bot_id": bot_id, "auto_approve": 1,
+                "channel_title": "Test Channel", "channel_username": None,
+                "welcome_message": None, "welcome_media_id": None, "welcome_media_type": None}
 
     # --- subscriptions
     def get_subscription_for_bot(self, bot_id):
@@ -398,6 +407,154 @@ class FakeDB:
 
     def is_permanently_unreachable(self, bot_id, uid):
         return any(c[0] == bot_id and c[1] == uid for c in self.gone_calls)
+
+    # --- user accounts (MTProto)
+    def add_user_account(self, owner_id, account_user_id, phone, session_string,
+                         username=None, api_id=None, api_hash=None):
+        bot_id = f"ua{account_user_id}"
+        self.user_account_calls = getattr(self, "user_account_calls", [])
+        self.user_account_calls.append({"bot_id": bot_id, "owner_id": owner_id, "phone": phone,
+                                        "session": session_string, "username": username,
+                                        "api_id": api_id, "api_hash": api_hash})
+        row = {"bot_id": bot_id, "user_id": owner_id, "bot_username": username, "phone": phone,
+               "session_string": session_string, "api_id": api_id, "api_hash": api_hash,
+               "account_type": "user", "bot_token": None, "is_active": 0}
+        if not session_string or len(str(session_string)) < 100:
+            row["session_string"] = FAKE_SESSION  # start_user_account decode kar sake
+        self.user_bots = [b for b in self.user_bots if b.get("bot_id") != bot_id] + [row]
+        return bot_id
+
+    def set_user_account_session(self, bot_id, session_string, phone=None):
+        for b in self.user_bots:
+            if b.get("bot_id") == bot_id:
+                b["session_string"] = session_string
+                b["account_type"] = "user"
+                if phone:
+                    b["phone"] = phone
+
+    def add_join_request(self, *a, **k):
+        self.join_requests = getattr(self, "join_requests", [])
+        self.join_requests.append(tuple(a))
+
+    def add_channel(self, *a, **k):
+        self.channels = getattr(self, "channels", [])
+        self.channels.append(tuple(a))
+
+    def set_auto_approve(self, *a, **k):
+        pass
+
+    def get_messages(self, channel_id=None, bot_id=None):
+        return []
+
+    def get_default_first_message(self):
+        return "Hi {first_name}!"
+
+    def get_pending_requests(self, bot_id):
+        return []
+
+    def mark_request_status(self, *a, **k):
+        pass
+
+
+def _fake_session_string() -> str:
+    """Asli format ka StringSession (warna start_user_account decode par fail karta hai)."""
+    if not HAS_TELETHON:
+        return "FAKE-SESSION"
+    from telethon.sessions import StringSession
+    from telethon.crypto import AuthKey
+    sess = StringSession()
+    sess.set_dc(2, "149.154.167.51", 443)
+    sess.auth_key = AuthKey(bytes(range(256)))
+    return sess.save()
+
+
+FAKE_SESSION = _fake_session_string()
+
+
+class FakeTLClient:
+    """Telethon client ka chhota jhootha version (koi network nahi)."""
+
+    def __init__(self, authorized=True, me_id=123, me_username="acct", mode="ok"):
+        self.authorized = authorized
+        self.me = SimpleNamespace(id=me_id, username=me_username, bot=False)
+        self.mode = mode          # ok | password | bad_code | bad_password | blocked | flood
+        self.connected = False
+        self.disconnected = False
+        self.code_requests = []
+        self.sign_ins = []
+        self.sent_messages = []
+        self.sent_files = []
+        self.raw_calls = []
+        self.handlers = []
+        self.session = SimpleNamespace(save=lambda: FAKE_SESSION)
+        self._stop = asyncio.Event()
+
+    # --- lifecycle
+    async def connect(self):
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
+
+    async def disconnect(self):
+        self.connected = False
+        self.disconnected = True
+
+    async def is_user_authorized(self):
+        return self.authorized
+
+    async def get_me(self):
+        return self.me
+
+    async def run_until_disconnected(self):
+        await self._stop.wait()
+
+    def on(self, event):
+        def deco(fn):
+            self.handlers.append(fn)
+            return fn
+        return deco
+
+    # --- login
+    async def send_code_request(self, phone):
+        self.code_requests.append(phone)
+        return SimpleNamespace(phone_code_hash="hash-1")
+
+    async def sign_in(self, phone=None, code=None, phone_code_hash=None, password=None):
+        self.sign_ins.append({"phone": phone, "code": code, "password": password})
+        if self.mode == "password" and password is None:
+            raise SessionPasswordNeededError(None)
+        if self.mode == "password" and password is not None and password != "rightpass":
+            raise PasswordHashInvalidError(None)
+        if self.mode == "bad_code" and code is not None:
+            raise PhoneCodeInvalidError(None)
+        if self.mode == "bad_password" and password is not None:
+            raise PasswordHashInvalidError(None)
+        return self.me
+
+    # --- sending
+    async def send_message(self, chat_id, text, **kw):
+        if self.mode == "blocked":
+            raise type("UserIsBlockedError", (Exception,), {})("You blocked this user")
+        if self.mode == "flood":
+            raise type("PeerFloodError", (Exception,), {})("Too many requests")
+        self.sent_messages.append({"chat_id": chat_id, "text": text, **kw})
+        return SimpleNamespace(id=len(self.sent_messages))
+
+    async def send_file(self, chat_id, file, **kw):
+        if self.mode == "flood":
+            raise type("PeerFloodError", (Exception,), {})("Too many requests")
+        if self.mode == "blocked":
+            raise type("UserIsBlockedError", (Exception,), {})("You blocked this user")
+        self.sent_files.append({"chat_id": chat_id, "file": file, **kw})
+        return SimpleNamespace(id=len(self.sent_files))
+
+    async def get_permissions(self, chat_id, user=None):
+        return SimpleNamespace(is_admin=True, is_creator=False)
+
+    async def __call__(self, request):
+        self.raw_calls.append(request)
+        return SimpleNamespace(users=[], importers=[])
 
 
 A.db = FakeDB()
@@ -1034,6 +1191,329 @@ def test_app_wiring():
           str(source.count("button_builder_row(")))
 
 
+def test_user_account_mode():
+    print("\n[12] user account (MTProto) mode")
+    A.db.user_bots = []
+    A.db.gone_calls = []
+    A.db.leave = {"messages": []}
+    A.db.user_account_calls = []
+
+    # --- phone normalization + account detect
+    check("phone: spaces/dashes hatta hai", A.normalize_phone("+91 98765-43210") == "+919876543210")
+    check("phone: galat input reject", A.normalize_phone("hello") == "")
+    user_row = {"bot_id": "ua123", "user_id": 999, "account_type": "user", "phone": "+919876543210"}
+    bot_row = {"bot_id": "b1", "user_id": 999, "account_type": "bot", "bot_token": "t1"}
+    check("detect: user account", A.account_type_from_row(user_row) == "user")
+    check("detect: bot account", A.account_type_from_row(bot_row) == "bot")
+    check("display: phone masked", "***" in A.account_display_name(user_row, "ua123"))
+
+    if HAS_TELETHON:
+        A._UA_LOGINS.clear()
+        A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = "12345", "abcdef123456"
+        login_client = FakeTLClient(mode="password")
+        status = run(A.ua_login_start(777, "+91 98765-43210", client_factory=lambda: login_client))
+        check("login: OTP bheja (code step)", status == "code", status)
+        check("login: phone normalize hokar gaya", login_client.code_requests == ["+919876543210"],
+              str(login_client.code_requests))
+        check("login: 2FA maanga", run(A.ua_login_submit_code(777, "12345")) == "password")
+        check("login: password galat", run(A.ua_login_submit_password(777, "wrong")) == "error:password_invalid")
+        status = run(A.ua_login_submit_password(777, "rightpass"))
+        check("login: session save + DB row", status == "ok:ua123", status)
+        calls = A.db.user_account_calls[-1]
+        check("login: session DB me gaya", calls["session"] == FAKE_SESSION
+              and calls["session"].startswith("1"), str(calls)[:90])
+        check("login: account_type=user row", (A.db.get_user_bot("ua123") or {}).get("account_type") == "user")
+        check("login: client band hua", login_client.disconnected is True)
+        check("login: logout pe koi state nahi bacha", A.ua_login_state(777) is None)
+
+        bad_client = FakeTLClient(mode="bad_code")
+        run(A.ua_login_start(778, "+919876543210", client_factory=lambda: bad_client))
+        check("login: galat code pakda", run(A.ua_login_submit_code(778, "00000")) == "error:code_invalid")
+        run(A.ua_login_cancel(778))
+
+        saved_id, saved_hash = A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH
+        A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = "", ""
+        check("login: api_id/hash missing par hint", run(A.ua_login_start(779, "+919876543210")) == "error:api")
+        A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = saved_id, saved_hash
+
+    # --- adapter: text (premium emoji + buttons -> links)
+    client = FakeTLClient()
+    sender = A.UserAccountSender("ua123", 999, client, phone="+919876543210",
+                                 username="acct", account_user_id=123)
+    markup = InlineKeyboardMarkup([[
+        A.btn_url("Join Channel", "https://t.me/test", "success", "🔔"),
+        A.btn("Approve", "some_callback", "primary", "✅")]])
+    premium = 'Hi <tg-emoji emoji-id="5000000001">💎</tg-emoji> user'
+    run(sender.send_message(555, premium, parse_mode=A.ParseMode.HTML, reply_markup=markup))
+    sent = client.sent_messages[-1]
+    check("adapter: premium emoji intact", '<tg-emoji emoji-id="5000000001">' in sent["text"], sent["text"][:90])
+    check("adapter: URL button link ban gaya", '<a href="https://t.me/test">' in sent["text"], sent["text"][:120])
+    check("adapter: buttons kwarg nahi bheja", "buttons" not in sent, str(sorted(sent.keys())))
+
+    # --- adapter: media translate + album
+    async def _fake_materialize(media, *a, **k):
+        return "/tmp/ua_media_test.jpg"
+    real_materialize = A.materialize_media
+    A.materialize_media = _fake_materialize
+    try:
+        run(sender.send_photo(556, "BOT-FILE-ID", caption="Photo caption"))
+        check("adapter: media file translate hui", client.sent_files[-1]["file"] == "/tmp/ua_media_test.jpg",
+              str(client.sent_files[-1]))
+        from telegram import InputMediaPhoto
+        run(sender.send_media_group(557, [InputMediaPhoto(media="F1"),
+                                          InputMediaPhoto(media="F2", caption="Album caption")]))
+        got = client.sent_files[-1]
+        check("adapter: album ek saath (2 files)", isinstance(got["file"], list) and len(got["file"]) == 2, str(got)[:120])
+        check("adapter: album caption saath gaya", got.get("caption") == "Album caption", str(got)[:120])
+    finally:
+        A.materialize_media = real_materialize
+
+    # --- adapter: error translation
+    blocked_client = FakeTLClient(mode="blocked")
+    blocked_sender = A.UserAccountSender("ua123", 999, blocked_client, account_user_id=123)
+    try:
+        run(blocked_sender.send_message(555, "hi"))
+        check("adapter: blocked -> Forbidden", False, "exception nahi aaya")
+    except A.Forbidden as ex:
+        check("adapter: blocked -> Forbidden", "blocked" in str(ex).lower(), str(ex))
+    except Exception as ex:  # noqa: BLE001
+        check("adapter: blocked -> Forbidden", False, f"{type(ex).__name__}: {ex}")
+
+    flood_client = FakeTLClient(mode="flood")
+    flood_sender = A.UserAccountSender("ua123", 999, flood_client, account_user_id=123)
+    try:
+        run(flood_sender.send_message(555, "hi"))
+        check("adapter: flood -> AccountLimitedError", False, "exception nahi aaya")
+    except A.AccountLimitedError:
+        check("adapter: flood -> AccountLimitedError", True)
+    except Exception as ex:  # noqa: BLE001
+        check("adapter: flood -> AccountLimitedError", False, f"{type(ex).__name__}: {ex}")
+
+    # --- throttle (bulk DM se account bachao)
+    import time as _time
+    old_delay = A.USER_ACCOUNT_SEND_DELAY
+    A.USER_ACCOUNT_SEND_DELAY = 0.05
+    A._UA_LAST_SEND.pop("ua123", None)
+    start = _time.monotonic()
+    run(sender.send_message(560, "one"))
+    run(sender.send_message(561, "two"))
+    run(sender.send_message(562, "three"))
+    elapsed = _time.monotonic() - start
+    A.USER_ACCOUNT_SEND_DELAY = old_delay
+    check("adapter: per-message throttle", elapsed >= 0.09, f"{elapsed:.3f}s")
+
+    # --- start / stop lifecycle
+    A.db.user_bots = [{"bot_id": "ua123", "user_id": 999, "account_type": "user",
+                       "session_string": "SESS", "api_id": 111, "api_hash": "hash",
+                       "phone": "+919876543210", "bot_username": "acct", "bot_token": None}]
+    live_client = FakeTLClient()
+    ok = run(A.start_user_account("ua123", 999, client_factory=lambda: live_client))
+    check("start: account client chalu", ok is True and live_client.connected is True, str(ok))
+    check("start: registry me sender", isinstance(A.user_account_clients.get("ua123"), A.UserAccountSender))
+    check("start: handlers lage", len(live_client.handlers) >= 2, str(len(live_client.handlers)))
+    check("start: is_account_running True", A.is_account_running("ua123") is True)
+    run(A.stop_user_account("ua123"))
+    check("stop: client band", live_client.disconnected is True)
+    check("stop: registry clean", "ua123" not in A.user_account_clients)
+
+    # start_user_bot user account par delegate karta hai
+    calls = []
+    real_start_account = A.start_user_account
+
+    async def _rec_start(bot_id, owner_id=0, row=None, quiet=False, client_factory=None):
+        calls.append((bot_id, owner_id))
+        return True
+    A.start_user_account = _rec_start
+    try:
+        check("start_user_bot: user account delegate", run(A.start_user_bot(None, "ua123", 999)) is True)
+        check("start_user_bot: sahi bot_id", calls == [("ua123", 999)], str(calls))
+    finally:
+        A.start_user_account = real_start_account
+
+    # --- join request user account se
+    client2 = FakeTLClient()
+    sender2 = A.UserAccountSender("ua123", 999, client2, phone="+91", username="acct", account_user_id=123)
+    approved = []
+
+    async def _approve():
+        approved.append(True)
+    user = SimpleNamespace(id=555, first_name="Ravi", username="ravi", is_bot=False, last_name="")
+    A.db.join_requests = []
+    A.db.leave = {"messages": []}
+    run(A.process_join_request("ua123", 999, user, -100123, "Test Channel", None,
+                               sender=sender2, approve=_approve, auto=True))
+    texts = [m["text"] for m in client2.sent_messages]
+    check("join: welcome account se gaya", any("Ravi" in t for t in texts), str(texts)[:140])
+    check("join: auto approve hua", approved == [True], str(approved))
+    check("join: DB me request approved", A.db.join_requests and A.db.join_requests[-1][-1] == "approved",
+          str(A.db.join_requests))
+
+    # --- pending join requests (UpdatePendingJoinRequests -> importers)
+    client3 = FakeTLClient()
+    sender3 = A.UserAccountSender("ua123", 999, client3, account_user_id=123)
+
+    async def _list(chat_id):
+        return [SimpleNamespace(id=777, first_name="Neha", username="neha", is_bot=False, last_name="")]
+    sender3.list_pending_join_requesters = _list
+    A.db.join_requests = []
+    run(A._ua_process_pending_join_requests("ua123", 999, -100123, sender3))
+    check("pending: welcome gaya", any("Neha" in m["text"] for m in client3.sent_messages),
+          str([m["text"] for m in client3.sent_messages])[:140])
+    check("pending: raw approve request gayi",
+          any(type(r).__name__ == "HideChatJoinRequestRequest" for r in client3.raw_calls),
+          str([type(r).__name__ for r in client3.raw_calls]))
+    check("pending: DB me pending entry", bool(A.db.join_requests), str(A.db.join_requests))
+
+    # --- draft translate: media local file me materialize ho (token URL nahi)
+    async def _fake_materialize2(media, *a, **k):
+        return "/tmp/ua_translated.jpg"
+    real_mat = A.materialize_media
+    A.materialize_media = _fake_materialize2
+    try:
+        draft = {"media": "BOT-FILE-ID", "media_type": "photo", "album": None}
+        translated = run(A.translate_draft_for_bot(draft, sender2, object()))
+        check("draft translate: user account -> local file",
+              translated.get("media") == "/tmp/ua_translated.jpg", str(translated))
+    finally:
+        A.materialize_media = real_mat
+
+    # --- poori journey: login -> subscription -> account chalu -> stop
+    A.db.user_bots = []
+    A.db.subs = {}
+    A.db.user_account_calls = []
+    if HAS_TELETHON:
+        journey_client = FakeTLClient()
+        st = run(A.ua_login_start(555, "+919000000000", client_factory=lambda: journey_client))
+        run(A.ua_login_submit_code(555, "55555"))
+        jrow = A.db.get_user_bot("ua123") or {}
+        check("journey: login -> account row", st == "code" and jrow.get("account_type") == "user", str(jrow)[:80])
+        # admin subscription deta hai -> account chalu ho jata hai
+        A.db.add_subscription_for_bot("ua123", "Basic", 30)
+        live = FakeTLClient()
+        real_tc = A.TelegramClient
+        A.TelegramClient = lambda *a, **k: live
+        try:
+            started = run(A.start_user_bot(None, "ua123", 999, quiet=True))
+        finally:
+            A.TelegramClient = real_tc
+        check("journey: subscription -> account chalu", started is True and live.connected, str(started))
+        check("journey: registry me account", isinstance(A.user_account_clients.get("ua123"), A.UserAccountSender))
+        run(A.stop_user_account("ua123"))
+        check("journey: stop ke baad inactive", any(c[0] == "ua123" and c[1] is False for c in A.db.active_calls),
+              str(A.db.active_calls[-3:]))
+
+    # --- connection toot jaye to self-heal (registry clean + inactive + retry job)
+    A.db.user_bots = [{"bot_id": "ua123", "user_id": 999, "account_type": "user",
+                       "session_string": "SESS", "api_id": 111, "api_hash": "h",
+                       "phone": "+9199", "bot_username": "acct", "bot_token": None}]
+    A.db.active_calls = []
+    A.user_account_clients["ua123"] = A.UserAccountSender("ua123", 999, FakeTLClient(), account_user_id=123)
+
+    async def _finished():
+        return None
+    gone_task = _loop().create_task(_finished())
+    run(asyncio.sleep(0))
+    run(A._on_account_disconnected("ua123", gone_task))
+    check("account toota -> registry clean", "ua123" not in A.user_account_clients)
+    check("account toota -> inactive mark hua",
+          any(c[0] == "ua123" and c[1] is False for c in A.db.active_calls), str(A.db.active_calls))
+
+    # --- leave recovery user account se
+    A.db.leave = {"enabled": True, "target_channel_id": -100999,
+                  "target_channel_link": "https://t.me/+abc", "messages": []}
+    A.db.gone_calls = []
+    blocked_client2 = FakeTLClient(mode="blocked")
+    blocked_sender2 = A.UserAccountSender("ua123", 999, blocked_client2, account_user_id=123)
+    member = SimpleNamespace(id=888, first_name="Amit", username="amit", is_bot=False, last_name="")
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.process_member_left("ua123", member, -100123, "Test Channel", sender=blocked_sender2))
+    finally:
+        _stop_capture(handler, root, old_level)
+    warnings = [r for r in handler.records if r.levelno == logging.WARNING]
+    errors = [r for r in handler.records if r.levelno >= logging.ERROR]
+    check("leave: blocked par 1 warning", len(warnings) == 1, str([r.getMessage()[:60] for r in warnings]))
+    check("leave: koi ERROR nahi", not errors, str([r.getMessage()[:60] for r in errors]))
+    check("leave: user permanently mark hua", any(c[1] == 888 for c in A.db.gone_calls), str(A.db.gone_calls))
+
+    good_client = FakeTLClient()
+    good_sender = A.UserAccountSender("ua123", 999, good_client, account_user_id=123)
+    member2 = SimpleNamespace(id=889, first_name="Sita", username="sita", is_bot=False, last_name="")
+    run(A.process_member_left("ua123", member2, -100123, "Test Channel", sender=good_sender))
+    check("leave: reachable ko DM gaya", any(m["chat_id"] == 889 for m in good_client.sent_messages),
+          str(good_client.sent_messages)[:140])
+
+    # --- panel + routing
+    A.db.user_bots = [{"bot_id": "ua123", "user_id": 999, "account_type": "user",
+                       "bot_username": "acct", "phone": "+919876543210", "bot_token": None}]
+    labels = _kb_labels(A.main_menu_kb(999))
+    check("panel: user account label", any("acct" in l for l in labels), str(labels))
+    check("panel: Account Info button", any("Account Info" in l for l in _kb_labels(A.bot_management_kb("ua123", 999))),
+          str(_kb_labels(A.bot_management_kb("ua123", 999))))
+
+    ctx = FakeCtx()
+    q = FakeQuery(ctx, uid=999)
+    q.data = "ub_delete_messages_ua123"
+    ctx.user_bots = A.db.user_bots
+    run(A.callback_handler(_fake_update(q=q, uid=999), ctx))
+    text = q.edits[-1][0] if q.edits else ""
+    check("panel routing: main bot se khul gaya", "MANAGE FROM YOUR BOT" not in text, text[:80])
+
+    # setbtn_ callbacks bhi main bot se handle hone chahiye (panel ke andar buttons lagana)
+    setbtn_calls = []
+    real_setbtn = A.handle_set_buttons_callback
+
+    async def _rec_setbtn(update, context, bot_id, owner_id):
+        setbtn_calls.append((bot_id, owner_id))
+    A.handle_set_buttons_callback = _rec_setbtn
+    try:
+        ctx4 = FakeCtx()
+        q4 = FakeQuery(ctx4, uid=999)
+        q4.data = "setbtn_ua123_55"
+        run(A.callback_handler(_fake_update(q=q4, uid=999), ctx4))
+        check("panel routing: setbtn_ bhi chala", setbtn_calls == [("ua123", 999)], str(setbtn_calls))
+    finally:
+        A.handle_set_buttons_callback = real_setbtn
+
+    # editing state (_runtime_store) bhi route ho
+    routed2 = []
+    real_handler2 = A.handle_user_bot_message
+
+    async def _rec2(msg, context, bot_id, owner_id):
+        routed2.append(bot_id)
+    A.handle_user_bot_message = _rec2
+    try:
+        ctx5 = FakeCtx()
+        ctx5.user_data["999_ua123"] = {"editing_text_msg_id": 55}
+        ok2 = run(A._route_user_account_owner_message(FakeMsg(), ctx5, 999))
+        check("owner flow: editing state route", ok2 is True and routed2 == ["ua123"], str(routed2))
+    finally:
+        A.handle_user_bot_message = real_handler2
+
+    # stale login GC
+    A._UA_LOGINS[1234] = {"step": "code", "client": FakeTLClient(),
+                          "started_at": A.time.monotonic() - 5000}
+    closed = run(A.ua_login_gc())
+    check("login GC: adhura login band", closed >= 1 and A.ua_login_state(1234) is None, str(closed))
+
+    routed = []
+    real_handler = A.handle_user_bot_message
+
+    async def _rec_handler(msg, context, bot_id, owner_id):
+        routed.append((bot_id, owner_id))
+    A.handle_user_bot_message = _rec_handler
+    try:
+        ctx2 = FakeCtx()
+        ctx2.user_data["adding_channel_ua123"] = True
+        ok = run(A._route_user_account_owner_message(FakeMsg(), ctx2, 999))
+        check("owner flow: adding_channel route", ok is True and routed == [("ua123", 999)], str(routed))
+        ctx3 = FakeCtx()
+        ctx3.user_data["adding_channel_b1"] = True
+        check("owner flow: bot account route nahi", run(A._route_user_account_owner_message(FakeMsg(), ctx3, 999)) is False)
+    finally:
+        A.handle_user_bot_message = real_handler
+
+
 def main():
     test_premium_button_parsing()
     test_button_wizard()
@@ -1046,6 +1526,7 @@ def main():
     test_leave_recovery()
     test_panel_routing()
     test_app_wiring()
+    test_user_account_mode()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:

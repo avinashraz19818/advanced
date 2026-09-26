@@ -10,17 +10,20 @@
   buttons placement (default + toggle), album flush (JobQueue + fallback), admin
   multi-select + auto 1-day Basic, broadcast delivery robustness (cross-bot media,
   blocked/dead users, log noise), token masking + startup guards, network noise
-  filter + userbot retry + FORCE_IPV4, leave-recovery DMs, panel routing, app wiring
+  filter + userbot retry + FORCE_IPV4, leave-recovery DMs, panel routing, app wiring,
+  **user account (MTProto) mode** (phone/OTP/2FA login wizard, session save, premium
+  emoji + buttons->links adapter, media/album translate, throttle, flood/blocked error
+  translation, start/stop/self-heal, join request + pending list, panel routing)
 
 ## Chalane ka tarika
 ```bash
 python3 -m venv /tmp/v
-/tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes
-/tmp/v/bin/python tests/verify_advanced.py     # 115 checks
+/tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes telethon
+/tmp/v/bin/python tests/verify_advanced.py     # 173 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:
 ```bash
-python3 -m venv /tmp/v21 && /tmp/v21/bin/pip install "python-telegram-bot[job-queue]==21.11.1"
+python3 -m venv /tmp/v21 && /tmp/v21/bin/pip install "python-telegram-bot[job-queue]==21.11.1" telethon
 /tmp/v21/bin/python tests/verify_advanced.py
 ```
