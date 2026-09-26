@@ -2613,10 +2613,46 @@ async def send_saved_welcome(bot_id: str, chat_id: int, context: ContextTypes.DE
         logging.error(f"send_saved_welcome error: {ex}")
 
 
+class _UserDataContext:
+    """Context proxy: sab kuch real context se, sirf user_data replace.
+
+    PTB me JobQueue callback ko `CallbackContext.from_job()` wala context deta hai
+    aur usme `user_data` **None** hota hai (job me user_id set nahi hota). Isi wajah
+    se album flush job me `context.user_data.pop(...)` crash ho jata tha
+    ("'NoneType' object has no attribute 'pop'") aur broadcast album save hi nahi hota.
+    Ab schedule karte waqt asli user_data dict job ke data me jaata hai."""
+
+    __slots__ = ("_wrapped", "_user_data")
+
+    def __init__(self, context, user_data: dict):
+        object.__setattr__(self, "_wrapped", context)
+        object.__setattr__(self, "_user_data", user_data)
+
+    @property
+    def user_data(self) -> dict:
+        return object.__getattribute__(self, "_user_data")
+
+    def __getattr__(self, item):
+        return getattr(object.__getattribute__(self, "_wrapped"), item)
+
+
+def _context_with_user_data(context, user_data):
+    """Job context (user_data None) ko live user_data ke saath usable banao."""
+    if isinstance(user_data, dict) and getattr(context, "user_data", None) is not user_data:
+        return _UserDataContext(context, user_data)
+    return context
+
+
 def _runtime_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict:
-    if key not in context.user_data:
-        context.user_data[key] = {}
-    return context.user_data[key]
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        # Never crash on a context without user_data (job contexts). Callers that can
+        # only work with real storage get an empty dict and simply skip the work.
+        logging.error("_runtime_store: is context me user_data available nahi hai")
+        return {}
+    if key not in user_data:
+        user_data[key] = {}
+    return user_data[key]
 
 
 async def sync_pending_join_requests_for_channel(bot_id: str, channel_id: int, bot):
@@ -3094,8 +3130,10 @@ async def _flush_media_group(bot_id: str, actor_uid: int, managed_uid: int, chat
 
 async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
+    # Job context me user_data None hota hai - captured dict se replace karo
+    ctx = _context_with_user_data(context, data.get("user_data"))
     await _flush_media_group(data.get("bot_id"), data.get("actor_uid"), data.get("managed_uid"),
-                             data.get("chat_id"), context, data.get("media_group_id"))
+                             data.get("chat_id"), ctx, data.get("media_group_id"))
 
 
 async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -3359,7 +3397,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                     pass
             j = context.job_queue.run_once(_flush_media_group_job, when=1.2,
                 data={"bot_id": bot_id, "actor_uid": uid, "managed_uid": owner_id,
-                      "chat_id": msg.chat_id, "media_group_id": media_group_id})
+                      "chat_id": msg.chat_id, "media_group_id": media_group_id,
+                      "user_data": context.user_data})
             ud[job_key] = j
             return
 
@@ -3820,7 +3859,18 @@ def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1
     """Wait a moment for the rest of an album, then save the draft.
 
     Uses the JobQueue when available and falls back to an asyncio task, so album
-    broadcasts keep working even without the job-queue extra."""
+    broadcasts keep working even without the job-queue extra.
+
+    IMPORTANT: the live `user_data` dict is carried inside the job data. PTB's job
+    context has `user_data = None`, so without this the flush crashed with
+    "'NoneType' object has no attribute 'pop'" and the draft was never saved.
+    """
+    data = dict(data or {})
+    if not isinstance(data.get("user_data"), dict):
+        user_data = getattr(context, "user_data", None)
+        if isinstance(user_data, dict):
+            data["user_data"] = user_data
+
     if getattr(context, "job_queue", None):
         context.user_data[job_key] = context.job_queue.run_once(_flush_broadcast_album_job, when=when, data=data)
         return
@@ -3829,9 +3879,10 @@ def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1
         try:
             await asyncio.sleep(when)
             await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
-                                        data.get("chat_id"), data.get("media_group_id"))
+                                        data.get("chat_id"), data.get("media_group_id"),
+                                        user_data=data.get("user_data"))
         except Exception as ex:
-            logging.error(f"broadcast album flush task failed: {ex}")
+            logging.error(f"broadcast album flush task failed: {mask_secrets(ex)}")
 
     task = asyncio.ensure_future(_runner())
     _PENDING_TASKS.add(task)
@@ -3850,8 +3901,12 @@ async def collect_broadcast_album(context, scope: str, bot_id: Optional[str], ms
     media_group_id = extracted.get("media_group_id")
     if not media_group_id:
         return False
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        logging.error("broadcast album collect: user_data available nahi hai")
+        return False
     key = _broadcast_album_key(scope, bot_id, media_group_id)
-    items = context.user_data.setdefault(key, [])
+    items = user_data.setdefault(key, [])
     first = len(items) == 0
     items.append(make_media_item(extracted))
     if first:
@@ -3879,14 +3934,20 @@ async def collect_broadcast_album(context, scope: str, bot_id: Optional[str], ms
 async def _flush_broadcast_album_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
     await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
-                                data.get("chat_id"), data.get("media_group_id"))
+                                data.get("chat_id"), data.get("media_group_id"),
+                                user_data=data.get("user_data"))
 
 
 async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
-                                chat_id, media_group_id):
+                                chat_id, media_group_id, user_data: Optional[dict] = None):
+    ctx = _context_with_user_data(context, user_data)
+    user_data = getattr(ctx, "user_data", None)
+    if not isinstance(user_data, dict):
+        logging.error(f"album flush: user_data available nahi hai (scope={scope}, bot={bot_id})")
+        return
     key = _broadcast_album_key(scope, bot_id, media_group_id)
-    items = context.user_data.pop(key, None) or []
-    context.user_data.pop(f"{key}_job", None)
+    items = user_data.pop(key, None) or []
+    user_data.pop(f"{key}_job", None)
     if not items or not chat_id:
         return
     first = items[0]
@@ -3901,20 +3962,20 @@ async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
         "buttons_json": None,
     }
     if scope == "admin":
-        draft["target_bots"] = broadcast_selected_ids(context) or None
+        draft["target_bots"] = broadcast_selected_ids(ctx) or None
         draft["target_bot"] = None
-        context.user_data["admin_broadcast_draft"] = draft
-        context.user_data["admin_broadcast_stage"] = "buttons_or_send"
-        context.user_data.pop("admin_broadcast", None)
-        kb = admin_broadcast_ready_kb(context)
+        user_data["admin_broadcast_draft"] = draft
+        user_data["admin_broadcast_stage"] = "buttons_or_send"
+        user_data.pop("admin_broadcast", None)
+        kb = admin_broadcast_ready_kb(ctx)
         label = broadcast_target_label(draft)
     else:
         draft["target_bot"] = bot_id
-        context.user_data[f"broadcast_draft_{bot_id}"] = draft
-        context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
-        kb = user_broadcast_ready_kb(context, bot_id, 0)
+        user_data[f"broadcast_draft_{bot_id}"] = draft
+        user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
+        kb = user_broadcast_ready_kb(ctx, bot_id, 0)
         label = "your users"
-    await send_premium_message(context.bot, chat_id,
+    await send_premium_message(ctx.bot, chat_id,
                                f"{pe('✅')} <b>Album saved</b> ({len(items)} media) — target: {label}\n\n"
                                f"Buttons add karo ya abhi send kar do.",
                                parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -5152,17 +5213,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err_str = str(context.error)
-    logging.error(f"Update {update} caused error {err_str}")
-    if "Message is not modified" in err_str:
-        return
-    if "Query is too old" in err_str:
+    err_str = mask_secrets(str(context.error))
+    if "Message is not modified" in err_str or "Query is too old" in err_str:
         return
     if "Forbidden" in err_str:
+        logging.warning(f"Forbidden (bot blocked / no rights): {err_str}")
         return
     if "NetworkError" in err_str or "ReadError" in err_str:
         logging.warning(f"Network error (will retry later): {err_str}")
         return
+    # Real bug: full traceback log karo, warna sirf "Update None caused error xxx"
+    # dikhta hai aur debug karna mushkil ho jata hai.
+    logging.error(f"Update {update} caused error {err_str}", exc_info=context.error)
 
 
 # ================= START / ADMIN COMMANDS =================
