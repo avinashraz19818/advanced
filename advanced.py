@@ -607,7 +607,7 @@ def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [btn("All Users", "admin_all_users", "primary", "📇"),
          btn("Manage UserBots", "admin_userbots", "success", "🤖")],
-        [btn("Add UserBot", "admin_add_userbot", "success", "➕"),
+        [btn("Add Account", "admin_add_userbot", "success", "➕"),
          btn("Add Subscription", "admin_add_sub", "success", "⭐️")],
         [btn("Subscription List", "admin_sub_list", "primary", "📋")],
         [btn("Check Expiry", "admin_check_expiry", "primary", "⏰"),
@@ -5326,6 +5326,15 @@ async def ua_login_handle_message(msg, uid: int) -> bool:
                 await start_user_bot(None, bot_id, owner_id, quiet=True)
         except Exception as ex:
             logging.warning(f"{bot_id}: login ke baad account start nahi hua: {mask_secrets(ex)}")
+        if is_admin(uid) and owner_id != uid:
+            await reply_premium_message(
+                msg,
+                f"{pe('📌')} Admin: is user account ko <b>subscription</b> do, tabhi ye chalu hoga.\n"
+                f"{pp('🆔')} <code>{bot_id}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("💰 Add Subscription (30 days Basic)", f"admin_quick_sub_{bot_id}", "success", "💰")],
+                    [btn("👑 Admin Panel", "admin_panel", "primary", "👑")]]))
         if owner_id != uid:
             try:
                 await send_premium_message(MAIN_BOT_REF, owner_id,
@@ -5700,6 +5709,196 @@ async def ensure_broadcast_subscription(bot_id: str, bot_token: Optional[str] = 
 
 
 # ================= ADMIN PANEL FUNCTIONS =================
+async def _try_delete_message(msg):
+    """Secret wala message (bot token / phone) chat se hata do - best effort."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+ADMIN_ADD_ACCOUNT_KEY = "admin_add_account"
+
+
+def _admin_add_state(context) -> Optional[Dict[str, Any]]:
+    st = context.user_data.get(ADMIN_ADD_ACCOUNT_KEY)
+    return st if isinstance(st, dict) else None
+
+
+def _admin_add_set(context, kind: str, step: str, user_id: Optional[int] = None):
+    st = _admin_add_state(context) or {}
+    st.update({"kind": kind, "step": step})
+    if user_id is not None:
+        st["user_id"] = int(user_id)
+    context.user_data[ADMIN_ADD_ACCOUNT_KEY] = st
+    return st
+
+
+def _admin_add_clear(context):
+    context.user_data.pop(ADMIN_ADD_ACCOUNT_KEY, None)
+
+
+def admin_add_kb(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(list(rows) + [[btn("❌ Cancel", "admin_add_cancel", "danger", "❌")]])
+
+
+async def admin_add_chooser(q):
+    """ADD ACCOUNT ka pehla step: bot ya user account?"""
+    await safe_edit_message_text(
+        q,
+        f"<blockquote>{pp('🚀')} <b>ADD ACCOUNT</b></blockquote>\n\n"
+        f"{pp('🤖')} <b>Bot Account</b> — BotFather token se. Messages <b>bot</b> ke naam se jayenge "
+        f"aur bot ko channel me admin banana padega.\n\n"
+        f"{pp('👤')} <b>User Account</b> — client ke phone + OTP se login. Messages <b>uske account</b> "
+        f"se jayenge, bot token ki zaroorat nahi.\n\n"
+        "Pehle choose karo, phir main step-by-step user_id aur token/phone maangunga:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [btn("🤖 Bot Account (token)", "admin_add_bot", "primary", "🤖")],
+            [btn("👤 User Account (phone login)", "admin_add_ua", "success", "👤")],
+            [btn("Back", "admin_panel", "primary", "🔙")]]))
+
+
+def admin_add_user_id_text(kind: str) -> str:
+    who = "bot" if kind == "bot" else "user account"
+    return (f"<blockquote>{pp('🆔')} <b>USER ID (1/3)</b></blockquote>\n\n"
+            f"Jis client ka {who} add karna hai uska <b>Telegram user ID</b> bhejo (sirf numbers).\n\n"
+            "Example: <code>123456789</code>")
+
+
+def admin_add_token_text() -> str:
+    return ("<blockquote>🤖 <b>BOT TOKEN (2/3)</b></blockquote>\n\n"
+            "Ab <b>BotFather</b> wala token bhejo.\n"
+            "Format: <code>123456789:ABCdef...</code>\n\n"
+            "BotFather -> /mybots -> apna bot -> API Token")
+
+
+def admin_add_phone_text() -> str:
+    return ("<blockquote>👤 <b>PHONE NUMBER (2/3)</b></blockquote>\n\n"
+            "Ab us account ka <b>phone number</b> bhejo (country code ke saath).\n"
+            "Example: <code>+919876543210</code>\n\n"
+            f"{pe('📩')} Iske baad Telegram OTP aayega - wahi code yahan bhejna hai.")
+
+
+def _known_user_hint(user_id: int) -> str:
+    try:
+        if db.get_user(user_id):
+            return ""
+    except Exception:
+        return ""
+    return (f"\n\n{pe('ℹ️')} Note: is user_id ka record DB me nahi mila (client ne shayad kabhi main bot "
+            f"start nahi kiya) — phir bhi account add ho jayega.")
+
+
+async def _admin_add_finish_bot(msg, context, target: int, token: str):
+    """Token check karo, bot add karo, phir subscription ka rasta dikhao."""
+    try:
+        test_bot = Bot(token=token)
+        bot_info = await test_bot.get_me()
+        bot_id = db.add_user_bot(target, token, bot_info.username)
+    except Exception as ex:
+        await reply_premium_message(msg, f"{pe('❌')} Token check fail hua: {mask_secrets(ex)}\n\n"
+                                        f"Sahi token dobara bhejo (yehi step chalu rahega).",
+                                    parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+        return
+    _admin_add_clear(context)
+    # token wala message chat me na rahe (leak se bachav) - response ke baad delete
+    await _try_delete_message(msg)
+    await reply_premium_message(
+        msg,
+        f"<blockquote>{pp('✅')} <b>BOT ACCOUNT ADDED</b></blockquote>\n\n"
+        f"{pp('🤖')} @{bot_info.username}\n"
+        f"{pp('🆔')} <code>{bot_id}</code>\n"
+        f"{pp('👤')} Owner: <code>{target}</code>\n\n"
+        f"{pe('⚠️')} Ab is bot ko <b>subscription</b> do - tabhi ye chalu hoga.\n"
+        f"{pe('📌')} Aur bot ko apne channel me <b>admin</b> banana padega.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [btn("💰 Add Subscription (30 days Basic)", f"admin_quick_sub_{bot_id}", "success", "💰")],
+            [btn("➕ Add Another Account", "admin_add_userbot", "primary", "➕")],
+            [btn("👑 Admin Panel", "admin_panel", "primary", "👑")]]))
+    logging.info(f"admin: bot account {bot_id} (@{bot_info.username}) user {target} ke liye add hua")
+
+
+async def _admin_add_start_ua_login(msg, context, user, target: int, phone: str):
+    """User account: OTP login wizard ko hand over (baaki steps wahi sambhalta hai)."""
+    _admin_add_clear(context)
+    ua_login_begin(user.id, target_owner=target)
+    status = await ua_login_start(user.id, phone, target_owner=target)
+    if status in ("code", "password"):
+        await reply_premium_message(msg, UA_LOGIN_CODE_TEXT if status == "code" else UA_LOGIN_PASSWORD_TEXT,
+                                    parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
+        await _try_delete_message(msg)  # phone number chat me na rahe
+    else:
+        # login start nahi hua (jaise .env me api_id/api_hash missing) - state "phone" par
+        # hi rehti hai, theek karne ke baad admin dobara phone bhej sakta hai
+        await reply_premium_message(msg, f"{pe('❌')} {_ua_login_error(status)}",
+                                    parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
+
+
+async def admin_add_account_message(msg, context, user) -> bool:
+    """ADD ACCOUNT wizard: choose -> user_id -> token/phone (purana ek-line format bhi chalta hai)."""
+    st = _admin_add_state(context)
+    if not st or not is_admin(user.id):
+        return False
+    text = (msg.text or msg.caption or "").strip()
+    if not text:
+        await reply_premium_message(msg, f"{pe('❌')} Text bhejo.", parse_mode=ParseMode.HTML,
+                                    reply_markup=admin_add_kb())
+        return True
+    kind = st.get("kind") or "bot"
+    step = st.get("step") or "user_id"
+
+    if step == "user_id":
+        parts = text.split()
+        # purana format bhi support: "user_id bot_token" ya "user_id +9198..."
+        if len(parts) >= 2 and parts[0].isdigit():
+            if ":" in parts[1]:
+                await _admin_add_finish_bot(msg, context, int(parts[0]), parts[1])
+                return True
+            pref_phone = normalize_phone(parts[1])
+            if pref_phone:
+                await _admin_add_start_ua_login(msg, context, user, int(parts[0]), pref_phone)
+                return True
+        digits = re.sub(r"\D", "", text)
+        if len(digits) < 5:
+            await reply_premium_message(msg, f"{pe('❌')} Ye user ID nahi lag rahi — sirf numbers bhejo "
+                                            f"(jaise <code>123456789</code>).",
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+            return True
+        target = int(digits)
+        if kind == "bot":
+            _admin_add_set(context, "bot", "token", target)
+            await reply_premium_message(msg, admin_add_token_text() + _known_user_hint(target),
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+        else:
+            _admin_add_set(context, "user", "phone", target)
+            await reply_premium_message(msg, admin_add_phone_text() + _known_user_hint(target),
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+        return True
+
+    if step == "token":
+        token = text
+        if ":" not in token or len(token) < 20:
+            await reply_premium_message(msg, f"{pe('❌')} Token galat format me hai. BotFather se poora token "
+                                            f"copy karke bhejo (jaise <code>123456789:ABCdef...</code>).",
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+            return True
+        await _admin_add_finish_bot(msg, context, int(st.get("user_id") or 0), token)
+        return True
+
+    if step == "phone":
+        phone = normalize_phone(text)
+        if not phone:
+            await reply_premium_message(msg, f"{pe('❌')} Phone number galat hai. Country code ke saath bhejo "
+                                            f"(jaise <code>+919876543210</code>).",
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+            return True
+        await _admin_add_start_ua_login(msg, context, user, int(st.get("user_id") or 0), phone)
+        return True
+    return False
+
+
 async def show_admin_userbot_control(q, context: ContextTypes.DEFAULT_TYPE):
     bots = db.get_all_user_bots()
     if not bots:
@@ -6131,15 +6330,52 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_add_userbot":
             if not is_admin(uid):
                 return
+            _admin_add_clear(context)
+            await admin_add_chooser(q)
+            return
+
+        if data == "admin_add_bot":
+            if not is_admin(uid):
+                return
+            _admin_add_set(context, "bot", "user_id")
+            await safe_edit_message_text(q, admin_add_user_id_text("bot"), parse_mode=ParseMode.HTML,
+                                         reply_markup=admin_add_kb())
+            return
+
+        if data == "admin_add_ua":
+            if not is_admin(uid):
+                return
+            _admin_add_set(context, "user", "user_id")
+            await safe_edit_message_text(q, admin_add_user_id_text("user"), parse_mode=ParseMode.HTML,
+                                         reply_markup=admin_add_kb())
+            return
+
+        if data == "admin_add_cancel":
+            if not is_admin(uid):
+                return
+            _admin_add_clear(context)
+            context.user_data.pop("admin_add_sub", None)
+            context.user_data.pop("admin_add_sub_bot", None)
+            await safe_edit_message_text(q, f"{pe('❌')} Add-account cancel kar diya.",
+                                         parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            return
+
+        if data.startswith("admin_quick_sub_"):
+            # ADD ACCOUNT ke turant baad: bot_id pehle se pata hai -> "days Plan" kaafi hai
+            if not is_admin(uid):
+                return
+            bot_id = data.replace("admin_quick_sub_", "")
+            row = db.get_user_bot(bot_id) or {}
+            context.user_data["admin_add_sub"] = True
+            context.user_data["admin_add_sub_bot"] = bot_id
             await safe_edit_message_text(
                 q,
-                f"<blockquote>{pp('🚀')} <b>ADD ACCOUNT</b></blockquote>\n\n"
-                f"{pp('🤖')} Bot: <code>user_id bot_token</code>\n"
-                f"{pp('👤')} User account: <code>user_id phone</code> (OTP login)\n\n"
-                "Example: <code>123456789 123456:ABCdef...</code> ya <code>123456789 +919876543210</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
-            context.user_data["admin_add_userbot"] = True
+                f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\n"
+                f"{pp('🤖')} {account_display_name(row, bot_id) if row else bot_id}\n"
+                f"{pp('🆔')} <code>{bot_id}</code>\n\n"
+                "Ab sirf <b>days aur plan</b> bhejo:\n"
+                "<code>30 Basic</code>  ya  <code>90 Pro</code>",
+                parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             return
 
         if data == "admin_add_sub":
@@ -6765,6 +7001,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_premium_message(msg, f"{pe('❌')} Invalid token format. Please send the correct BotFather token.", parse_mode=ParseMode.HTML)
         return
 
+    # ADD ACCOUNT wizard (bot ya user account) - step by step
+    if _admin_add_state(context) and await admin_add_account_message(msg, context, user):
+        return
+
     if context.user_data.get("admin_add_userbot") and is_admin(user.id):
         parts = msg.text.strip().split()
         if len(parts) == 2 and parts[0].isdigit() and normalize_phone(parts[1]) and ":" not in parts[1]:
@@ -6798,6 +7038,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_add_sub") and is_admin(user.id):
         parts = msg.text.strip().split()
+        _prefill = context.user_data.get("admin_add_sub_bot")
+        if _prefill and len(parts) == 2 and parts[0].isdigit():
+            parts = [str(_prefill)] + parts  # "30 Basic" -> "bot_id 30 Basic"
         if len(parts) >= 3:
             bot_identifier = parts[0]
             days = int(parts[1])
@@ -6817,6 +7060,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             db.add_subscription_for_bot(bot["bot_id"], plan, days)
             context.user_data.pop("admin_add_sub", None)
+            context.user_data.pop("admin_add_sub_bot", None)
             await reply_premium_message(msg, f"{pe('✅')} Subscription added!\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             try:
                 started = await start_user_bot(bot.get("bot_token"), bot["bot_id"], bot["user_id"])
@@ -6832,7 +7076,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Auto-start failed: {e}")
                 await send_premium_message(context.bot, bot["user_id"], f"<blockquote>{pp('✅')} <b>SUBSCRIPTION ACTIVATED</b></blockquote>\n\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days\n\nUse /start to access your bot panel.", parse_mode=ParseMode.HTML)
         else:
-            await reply_premium_message(msg, f"{pe('❌')} Format: <code>@bot_username days Plan</code> or <code>bot_id days Plan</code>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            _hint = ("<code>days Plan</code> (jaise <code>30 Basic</code>)"
+                     if context.user_data.get("admin_add_sub_bot") else
+                     "<code>@bot_username days Plan</code> or <code>bot_id days Plan</code>")
+            await reply_premium_message(msg, f"{pe('❌')} Format: {_hint}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
 
     if context.user_data.get("admin_set_leave_target") and is_admin(user.id):

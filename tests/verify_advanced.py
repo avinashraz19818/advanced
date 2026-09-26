@@ -291,6 +291,11 @@ class FakeMsg:
         self.message_id = 77
         self.replies = []
         self.media_group_id = None
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+        return True
 
     async def reply_text(self, text, **kw):
         self.replies.append((text, kw))
@@ -379,6 +384,27 @@ class FakeDB:
 
     def set_user_bot_active(self, bot_id, active):
         self.active_calls.append((bot_id, bool(active)))
+
+    def get_user(self, user_id):
+        return getattr(self, "users", {}).get(int(user_id))
+
+    def add_user(self, *a, **k):
+        pass
+
+    def add_user_bot(self, owner_id, token, username):
+        bot_id = f"b{len(self.user_bots) + 1}"
+        self.user_bots = self.user_bots + [{"bot_id": bot_id, "user_id": owner_id,
+                                            "bot_token": token, "bot_username": username,
+                                            "account_type": "bot", "is_active": 1}]
+        self.added_bots = getattr(self, "added_bots", [])
+        self.added_bots.append((owner_id, token, username, bot_id))
+        return bot_id
+
+    def get_bot_by_username(self, username):
+        for b in self.user_bots:
+            if b.get("bot_username") == username:
+                return b
+        return None
 
     def get_bot_channels(self, bot_id):
         return [{"channel_id": -100123, "channel_title": "Test Channel", "auto_approve": 0}]
@@ -1526,6 +1552,209 @@ def test_user_account_mode():
         A.handle_user_bot_message = real_handler
 
 
+class FakeBotFactory:
+    """A.Bot(token=...) ki jagah - token valid ho to get_me() deta hai."""
+
+    def __init__(self, valid_tokens=("123456789:ABCdefGHIjklMNOpqrSTUvwxYZ123456789",)):
+        self.valid_tokens = tuple(valid_tokens)
+
+    def __call__(self, token=None, **kw):
+        outer = self
+
+        class _TB:
+            def __init__(self):
+                self.token = token
+
+            async def get_me(self):
+                if token in outer.valid_tokens:
+                    return SimpleNamespace(username="clientbot", id=555)
+                raise Exception("Unauthorized")
+        return _TB()
+
+
+def test_admin_add_account_wizard():
+    print("\n[13] admin ADD ACCOUNT wizard (step-by-step)")
+    A.db.user_bots = []
+    A.db.added_bots = []
+    ctx = FakeCtx()
+    ctx.user_data.clear()
+    admin = A.ADMIN_USER_ID  # harness me yahi id admin hai
+    _saved_creds = (A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH)
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = "12345", "abcdef123456"
+
+    # --- chooser
+    q = FakeQuery(ctx, uid=admin)
+    q.data = "admin_add_userbot"
+    run(A.callback_handler(_fake_update(q=q, uid=admin), ctx))
+    labels = _kb_labels(q.edits[-1][1].get("reply_markup"))
+    check("chooser: dono option dikhe", any("Bot Account" in l for l in labels) and
+          any("User Account" in l for l in labels), str(labels))
+    check("chooser: purana state clear", A._admin_add_state(ctx) is None)
+
+    # --- bot path: chooser -> user_id -> token
+    q2 = FakeQuery(ctx, uid=admin)
+    q2.data = "admin_add_bot"
+    run(A.callback_handler(_fake_update(q=q2, uid=admin), ctx))
+    check("bot: user_id maanga", "USER ID (1/3)" in q2.edits[-1][0], q2.edits[-1][0][:60])
+    check("bot: state set", (A._admin_add_state(ctx) or {}).get("step") == "user_id", str(A._admin_add_state(ctx)))
+
+    msg = FakeMsg(text="123456789")
+    run(A.handle_message(_fake_update(msg=msg, uid=admin), ctx))
+    check("bot: token maanga", any("BOT TOKEN (2/3)" in (t or "") for t, _ in msg.replies),
+          str([t[:40] for t, _ in msg.replies]))
+    check("bot: user_id yaad rahi", (A._admin_add_state(ctx) or {}).get("user_id") == 123456789,
+          str(A._admin_add_state(ctx)))
+
+    msg_bad = FakeMsg(text="galat-token")
+    run(A.handle_message(_fake_update(msg=msg_bad, uid=admin), ctx))
+    check("bot: galat token par dobara maanga", any("Token galat format" in (t or "") for t, _ in msg_bad.replies),
+          str([t[:50] for t, _ in msg_bad.replies]))
+    check("bot: state token par hi rahi", (A._admin_add_state(ctx) or {}).get("step") == "token",
+          str(A._admin_add_state(ctx)))
+
+    real_bot = A.Bot
+    A.Bot = FakeBotFactory()
+    try:
+        msg_token = FakeMsg(text="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ123456789")
+        run(A.handle_message(_fake_update(msg=msg_token, uid=admin), ctx))
+    finally:
+        A.Bot = real_bot
+    check("bot: account add hua", any(b[0] == 123456789 and b[2] == "clientbot" for b in A.db.added_bots),
+          str(A.db.added_bots))
+    check("bot: token message delete hua", getattr(msg_token, "deleted", False) is True,
+          str(getattr(msg_token, "deleted", None)))
+    check("bot: success me subscription button",
+          any("Subscription" in l for l in _kb_labels(msg_token.replies[-1][1].get("reply_markup"))),
+          str(_kb_labels(msg_token.replies[-1][1].get("reply_markup"))))
+    check("bot: state clear ho gayi", A._admin_add_state(ctx) is None)
+
+    # --- quick subscription: "30 Basic" kaafi hai
+    bot_id = A.db.added_bots[-1][3]
+    qs = FakeQuery(ctx, uid=admin)
+    qs.data = f"admin_quick_sub_{bot_id}"
+    run(A.callback_handler(_fake_update(q=qs, uid=admin), ctx))
+    check("quick sub: bot prefill set", ctx.user_data.get("admin_add_sub_bot") == bot_id,
+          str(ctx.user_data.get("admin_add_sub_bot")))
+    db_test = A.db
+    real_start_bot = A.start_user_bot
+    started_bots = []
+
+    async def _fake_start(bot_token, bot_id, owner_id, quiet=False):
+        started_bots.append(bot_id)
+        return True
+    A.start_user_bot = _fake_start
+    msg_sub = FakeMsg(text="30 Basic")
+    try:
+        run(A.handle_message(_fake_update(msg=msg_sub, uid=admin), ctx))
+    finally:
+        A.start_user_bot = real_start_bot
+    check("quick sub: 30 Basic se subscription lag gayi", db_test.subs.get(bot_id) is not None,
+          str(db_test.subs))
+    check("quick sub: prefill clear", ctx.user_data.get("admin_add_sub_bot") is None)
+
+    # --- user account path: chooser -> user_id -> phone -> OTP
+    ctx.user_data.clear()
+    A.db.user_account_calls = []
+    q3 = FakeQuery(ctx, uid=admin)
+    q3.data = "admin_add_ua"
+    run(A.callback_handler(_fake_update(q=q3, uid=admin), ctx))
+    check("user: user_id maanga", "USER ID (1/3)" in q3.edits[-1][0], q3.edits[-1][0][:60])
+
+    msg_uid = FakeMsg(text="not-a-number")
+    run(A.handle_message(_fake_update(msg=msg_uid, uid=admin), ctx))
+    check("user: galat user_id reject", any("user ID nahi lag rahi" in (t or "") for t, _ in msg_uid.replies),
+          str([t[:50] for t, _ in msg_uid.replies]))
+
+    msg_uid2 = FakeMsg(text="987654321")
+    run(A.handle_message(_fake_update(msg=msg_uid2, uid=admin), ctx))
+    check("user: phone maanga", any("PHONE NUMBER (2/3)" in (t or "") for t, _ in msg_uid2.replies),
+          str([t[:45] for t, _ in msg_uid2.replies]))
+
+    A._UA_LOGINS.clear()
+    real_tc_admin = A.TelegramClient
+    A.TelegramClient = lambda *a, **k: FakeTLClient()
+    msg_phone = FakeMsg(text="+91 98765-43210")
+    try:
+        run(A.handle_message(_fake_update(msg=msg_phone, uid=admin), ctx))
+    finally:
+        A.TelegramClient = real_tc_admin
+    check("user: phone normalize hokar login shuru", any("OTP BHEJ DIYA" in (t or "") or "OTP" in (t or "")
+                                                        for t, _ in msg_phone.replies),
+          str([t[:45] for t, _ in msg_phone.replies]))
+    login_state = A.ua_login_state(admin)
+    check("user: login wizard chalu", bool(login_state) and login_state.get("step") == "code",
+          str(login_state))
+    check("user: target owner yaad hai", (login_state or {}).get("owner_id") == 987654321,
+          str(login_state))
+    check("user: wizard state handover ke baad clear", A._admin_add_state(ctx) is None)
+
+    # OTP -> account save
+    msg_code = FakeMsg(text="55555")
+    real_start_after_login = A.start_user_bot
+    after_login_started = []
+
+    async def _fake_after_login(bot_token, bot_id, owner_id, quiet=False):
+        after_login_started.append(bot_id)
+        return True
+    A.start_user_bot = _fake_after_login
+    try:
+        run(A.handle_message(_fake_update(msg=msg_code, uid=admin), ctx))
+    finally:
+        A.start_user_bot = real_start_after_login
+    check("user: login ke baad account start hua", after_login_started == ["ua123"], str(after_login_started))
+    row = A.db.get_user_bot("ua123")
+    check("user: account DB me aa gaya", bool(row) and row.get("account_type") == "user", str(row))
+    check("user: admin ko subscription hint",
+          any("subscription" in (t or "").lower() for t, _ in msg_code.replies),
+          str([t[:60] for t, _ in msg_code.replies]))
+
+    # --- cancel + purana ek-line format (backward compat)
+    ctx.user_data.clear()
+    q4 = FakeQuery(ctx, uid=admin)
+    q4.data = "admin_add_bot"
+    run(A.callback_handler(_fake_update(q=q4, uid=admin), ctx))
+    q5 = FakeQuery(ctx, uid=admin)
+    q5.data = "admin_add_cancel"
+    run(A.callback_handler(_fake_update(q=q5, uid=admin), ctx))
+    check("cancel: state clear", A._admin_add_state(ctx) is None)
+
+    ctx.user_data.clear()
+    q6 = FakeQuery(ctx, uid=admin)
+    q6.data = "admin_add_bot"
+    run(A.callback_handler(_fake_update(q=q6, uid=admin), ctx))
+    real_bot2 = A.Bot
+    A.Bot = FakeBotFactory()
+    try:
+        legacy = FakeMsg(text="444555666 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ123456789")
+        run(A.handle_message(_fake_update(msg=legacy, uid=admin), ctx))
+    finally:
+        A.Bot = real_bot2
+    check("legacy: ek line format ab bhi chalta hai",
+          any(b[0] == 444555666 for b in A.db.added_bots), str(A.db.added_bots[-2:]))
+
+    # --- bot token ke bina (khaali text) par crash nahi
+    ctx.user_data.clear()
+    q7 = FakeQuery(ctx, uid=admin)
+    q7.data = "admin_add_bot"
+    run(A.callback_handler(_fake_update(q=q7, uid=admin), ctx))
+    empty = FakeMsg(text=None)
+    run(A.handle_message(_fake_update(msg=empty, uid=admin), ctx))
+    check("empty text: soft error", any("Text bhejo" in (t or "") for t, _ in empty.replies),
+          str([t[:40] for t, _ in empty.replies]))
+    A._admin_add_clear(ctx)
+
+    # --- non-admin ke liye wizard chalega hi nahi
+    ctx2 = FakeCtx()
+    ctx2.user_data.clear()
+    A._admin_add_set(ctx2, "bot", "user_id")
+    other = FakeMsg(text="123456789")
+    run(A.handle_message(_fake_update(msg=other, uid=A.ADMIN_USER_ID + 777), ctx2))
+    check("non-admin: wizard ignore", (A._admin_add_state(ctx2) or {}).get("step") == "user_id",
+          str(A._admin_add_state(ctx2)))
+    A._admin_add_clear(ctx2)
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = _saved_creds
+
+
 def main():
     test_premium_button_parsing()
     test_button_wizard()
@@ -1539,6 +1768,7 @@ def main():
     test_panel_routing()
     test_app_wiring()
     test_user_account_mode()
+    test_admin_add_account_wizard()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:
