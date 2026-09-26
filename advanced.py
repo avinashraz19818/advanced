@@ -2441,35 +2441,43 @@ async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], mar
     broadcast flows - previously only the first item of the album was ever sent.
 
     Albums can't carry inline buttons (Telegram limit), so for an album the buttons
-    travel in a follow-up message. By default the album caption moves into that
-    message too (draft["caption_with_buttons"]) so text + buttons stay together.
+    travel in a small follow-up message right below the album. By default the caption
+    stays ON the album; draft["caption_with_buttons"] = True karne par caption buttons
+    wale message me chala jata hai (dono ek saath).
     """
     bot = _resolve_bot(bot_or_context)
     draft = draft or {}
     items = draft_items(draft)
     if move_caption is None:
-        move_caption = bool(draft.get("caption_with_buttons", True))
+        move_caption = bool(draft.get("caption_with_buttons", False))
     usable = [it for it in items if it.get("media") and it.get("media_type") in ALBUM_MEDIA_TYPES]
     if len(usable) >= 2:
         sent = await send_album(bot, chat_id, items, markup=markup if with_buttons else None,
                                 button_text=button_text, move_caption=bool(move_caption and with_buttons))
         if sent:
             return True
-        # album failed -> deliver every item on its own, buttons (+ caption) after
-        cap_idx = album_caption_index(items) if (move_caption and with_buttons) else -1
-        moved = ""
-        if cap_idx >= 0:
-            moved = MessageManager.prepare_for_sending(items[cap_idx].get("text") or "",
-                                                       items[cap_idx].get("entities_json"))
+        # Album fail ho gaya -> items alag-alag bhejo. Buttons us aakhri media message
+        # par hi attach hote hain (album na hone par media message par markup allowed hai),
+        # aur moved caption bhi wahin jata hai.
+        cap_idx = album_caption_index(items) if move_caption else -1
         cap_item = items[cap_idx] if 0 <= cap_idx < len(items) else None
-        for it in usable:
-            skip = it is cap_item   # identity compare (duplicate dicts par bhi sahi)
+        moved = MessageManager.prepare_for_sending(cap_item.get("text") or "",
+                                                   cap_item.get("entities_json")) if cap_item else ""
+        for k, it in enumerate(usable):
+            last = k == len(usable) - 1
+            skip = it is cap_item
+            text = it.get("text") or ""
+            entities = it.get("entities_json")
+            if skip:
+                text, entities = "", None
+            if last and cap_item is not None and not skip:
+                text, entities = moved, cap_item.get("entities_json")
             await send_media(bot, chat_id, it.get("media"), it.get("media_type") or "text",
-                             "" if skip else (it.get("text") or ""), None,
-                             entities_json=None if skip else it.get("entities_json"),
+                             text or "", markup if (last and with_buttons) else None,
+                             entities_json=entities,
                              file_name=it.get("file_name"), mime_type=it.get("mime_type"))
-        if with_buttons and markup:
-            await send_buttons_after_album(bot, chat_id, moved or button_text, markup)
+        if not usable and with_buttons and markup:
+            await send_buttons_after_album(bot, chat_id, button_text, markup)
         return True
     item = usable[0] if usable else (items[0] if items else {})
     await send_media(bot, chat_id, item.get("media"), item.get("media_type") or "text",
@@ -2590,7 +2598,6 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
             raw_items = []          # har media ka raw data (caption baad me decide hota hai)
             group_buttons_json = None
             group_caption_text = None
-            caption_idx = -1
             j = i
             while j < len(msgs) and msgs[j].get("media_group_id") == media_group_id:
                 g = msgs[j]
@@ -2602,23 +2609,19 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                 if not group_caption_text and g_text:
                     group_caption_text = g_text
                 if g_media_id and g_media_type in ("photo", "video", "document", "audio"):
-                    if caption_idx < 0 and (g_text or "").strip():
-                        caption_idx = len(raw_items)
                     raw_items.append({"media_id": g_media_id, "media_type": g_media_type,
                                       "text": g_text, "entities_json": g.get("entities_json"),
                                       "display": MessageManager.prepare_for_sending(g_text, g.get("entities_json")) if g_text else ""})
                 j += 1
             if raw_items:
                 group_markup = buttons_to_markup(group_buttons_json)
-                # Telegram album (media group) par inline buttons support nahi hai, isliye
-                # buttons ek chhote follow-up message me jate hain. Us message ka text
-                # album ka caption hi rakhte hain (aur caption album se hata dete hain)
-                # taaki users ko album ke turant neeche text + buttons ek saath dikhein.
-                skip_idx = caption_idx if group_markup else -1
+                # Telegram album (media group) par inline buttons attach nahi hote, isliye:
+                # caption album par hi rehta hai aur buttons album ke turant neeche ek chhote
+                # follow-up message me jate hain.
                 group_items = []
                 for k, item in enumerate(raw_items):
                     kwargs = {}
-                    if item["display"] and k != skip_idx:
+                    if item["display"]:
                         kwargs = {"caption": item["display"], "parse_mode": ParseMode.HTML}
                     cls = {"photo": InputMediaPhoto, "video": InputMediaVideo,
                            "document": InputMediaDocument, "audio": InputMediaAudio}[item["media_type"]]
@@ -2626,17 +2629,20 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                 try:
                     await context.bot.send_media_group(chat_id=chat_id, media=group_items)
                 except BadRequest as ex:
-                    # Fall back to sending the album items one by one instead of losing them
+                    # Album fail -> items alag-alag bhejo; buttons aakhri media message par
+                    # attach ho jate hain (tab wo album nahi, normal media message hai).
                     logging.error(f"send_media_group failed for {chat_id}: {ex}; sending items separately")
                     for k, item in enumerate(raw_items):
                         try:
-                            text = "" if k == skip_idx else item["display"]
+                            last = k == len(raw_items) - 1
                             await send_media(context, chat_id, item["media_id"], item["media_type"],
-                                             text or "", None, entities_json=None)
+                                             item["display"] or "", group_markup if last else None,
+                                             entities_json=None)
                         except Exception as inner_ex:
                             logging.error(f"album item fallback failed for {chat_id}: {inner_ex}")
-                if group_markup:
-                    await send_buttons_after_album(context.bot, chat_id, group_caption_text or "", group_markup)
+                else:
+                    if group_markup:
+                        await send_buttons_after_album(context.bot, chat_id, "", group_markup)
             i = j
             continue
 
@@ -2946,9 +2952,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if not draft:
             await q.answer("Pehle album/message bhejo", show_alert=True)
             return
-        draft["caption_with_buttons"] = not draft.get("caption_with_buttons", True)
+        draft["caption_with_buttons"] = not draft.get("caption_with_buttons", False)
         save_broadcast_draft(context, "user", bot_id, draft)
-        await q.answer("Caption " + ("buttons ke saath (album ke neeche ek message me)" if draft["caption_with_buttons"] else "album par hi rahega"))
+        await q.answer("Caption ab " + ("buttons ke saath (album ke neeche ek message me)" if draft["caption_with_buttons"] else "album par hi rahega"))
         try:
             await q.edit_message_reply_markup(reply_markup=user_broadcast_ready_kb(context, bot_id, uid))
         except Exception as ex:
@@ -3499,7 +3505,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         draft = {"text": extracted["text"], "media": extracted["media_id"], "media_type": extracted["media_type"],
                  "emoji_map": extracted["emoji_map"], "entities_json": extracted["entities_json"],
                  "file_name": extracted.get("file_name"), "mime_type": extracted.get("mime_type"),
-                 "buttons_json": None, "caption_with_buttons": True, "target_bot": bot_id}
+                 "buttons_json": None, "caption_with_buttons": False, "target_bot": bot_id}
         context.user_data[f"broadcast_draft_{bot_id}"] = draft
         context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
         await reply_premium_message(msg,
@@ -3872,18 +3878,22 @@ def admin_broadcast_target() -> dict:
 
 
 def broadcast_caption_mode_label(draft: dict) -> str:
-    return "Caption: Buttons ke saath" if draft.get("caption_with_buttons", True) else "Caption: Album par"
+    """Button tap karne par kya hoga, wahi label (toggle = action)."""
+    if draft.get("caption_with_buttons", False):
+        return "📝 Caption: Album par"
+    return "📝 Caption: Buttons ke saath"
 
 
 def broadcast_caption_mode_row(draft: dict, cb: str) -> List[InlineKeyboardButton]:
     """Album + buttons wale draft ke liye ek toggle row.
 
-    Telegram albums par buttons attach nahi hote, isliye default me album ka caption
-    buttons wale message me jata hai (dono ek saath dikhte hain). Jise caption album par
-    hi chahiye wo is toggle se badal sakta hai."""
+    Telegram albums par buttons attach nahi hote (send_media_group me reply_markup hi
+    nahi hai), isliye buttons album ke turant neeche ek chhote message me jate hain.
+    Default me caption ALBUM par hi rehta hai; is toggle se caption us buttons wale
+    message me bhi le jaya ja sakta hai (dono ek saath dikhte hain)."""
     if len(draft_items(draft)) < 2:
         return []
-    return [btn(broadcast_caption_mode_label(draft), cb, "primary", "📝")]
+    return [btn(broadcast_caption_mode_label(draft), cb, "primary")]
 
 
 def user_broadcast_ready_kb(context, bot_id: str, owner_id: int) -> InlineKeyboardMarkup:
@@ -3934,7 +3944,7 @@ def make_broadcast_draft(extracted: dict, target_bots: Optional[List[str]] = Non
         "file_name": extracted.get("file_name"),
         "mime_type": extracted.get("mime_type"),
         "buttons_json": None,
-        "caption_with_buttons": True,
+        "caption_with_buttons": False,
         "target_bots": list(target_bots) if target_bots else None,
         "target_bot": target_bot,
     }
@@ -4053,7 +4063,7 @@ async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
         "mime_type": first.get("mime_type"),
         "album": items,
         "buttons_json": None,
-        "caption_with_buttons": True,
+        "caption_with_buttons": False,
     }
     if scope == "admin":
         draft["target_bots"] = broadcast_selected_ids(ctx) or None
@@ -4071,10 +4081,10 @@ async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
         label = "your users"
     await send_premium_message(ctx.bot, chat_id,
                                f"{pe('✅')} <b>Album saved</b> ({len(items)} media) — target: {label}\n\n"
-                               f"{pe('🔘')} Buttons add karo ya abhi send kar do.\n"
-                               f"{pe('📝')} Telegram album par buttons attach nahi karta, "
-                               f"isliye buttons album ke turant neeche ek message me jayenge "
-                               f"(caption bhi usi ke saath — neeche wale button se badal sakte ho).",
+                               f"{pe('📝')} Caption album par hi rahega aur {pe('🔘')} buttons album ke "
+                               f"turant neeche ek chhote message me jayenge (Telegram album par buttons "
+                               f"attach nahi hota). Chaaho to neeche wale {pe('📝')} button se caption "
+                               f"bhi buttons ke saath le ja sakte ho.",
                                parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
@@ -4826,9 +4836,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not draft:
                 await q.answer("Pehle album/message bhejo", show_alert=True)
                 return
-            draft["caption_with_buttons"] = not draft.get("caption_with_buttons", True)
+            draft["caption_with_buttons"] = not draft.get("caption_with_buttons", False)
             save_broadcast_draft(context, "admin", None, draft)
-            await q.answer("Caption " + ("buttons ke saath (album ke neeche ek message me)" if draft["caption_with_buttons"] else "album par hi rahega"))
+            await q.answer("Caption ab " + ("buttons ke saath (album ke neeche ek message me)" if draft["caption_with_buttons"] else "album par hi rahega"))
             try:
                 await q.edit_message_reply_markup(reply_markup=admin_broadcast_ready_kb(context))
             except Exception as ex:
