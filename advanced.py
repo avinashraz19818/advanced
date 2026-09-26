@@ -104,6 +104,59 @@ class MaskingFormatter(logging.Formatter):
         return mask_secrets(super().format(record))
 
 
+NETWORK_NOISE_MARKERS = (
+    "ReadError", "ConnectError", "WriteError", "PoolTimeout", "ConnectTimeout",
+    "ReadTimeout", "httpx.", "NetworkError", "TimedOut", "ServerDisconnected",
+)
+
+
+class TransientNetworkFilter(logging.Filter):
+    """PTB ke polling network errors ko chhote warning me badlo.
+
+    VPS <-> Telegram link par transient hiccup (httpx.ReadError etc.) PTB khud retry
+    karta hai, par har baar ek poora 40-line traceback ERROR par log karta hai - log
+    itna bhar jata hai ki asli bug chhup jate hain. Ye filter un records ko ek line ka
+    WARNING bana deta hai (aur traceback hata deta hai)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if record.levelno < logging.WARNING:
+            return True
+        # Network error ka pata message me ya exception me kahin bhi lag sakta hai
+        haystack = message
+        exc_name = ""
+        if record.exc_info and record.exc_info[1] is not None:
+            try:
+                exc_name = type(record.exc_info[1]).__name__
+                haystack = f"{message} {exc_name} {record.exc_info[1]}"
+            except Exception:
+                pass
+        if not any(m in haystack for m in NETWORK_NOISE_MARKERS):
+            return True
+        record.levelno = logging.WARNING
+        record.levelname = "WARNING"
+        record.exc_info = None
+        record.exc_text = None
+        detail = f" ({exc_name})" if exc_name else ""
+        record.msg = ("Telegram network hiccup (PTB khud retry kar raha hai, koi action "
+                      f"zaroori nahi): {message[:140]}{detail}")
+        record.args = ()
+        return True
+
+
+def install_network_log_filter():
+    """PTB ke interne loggers par transient-network filter lagao."""
+    filt = TransientNetworkFilter()
+    for name in ("telegram.ext.Updater", "telegram.request", "telegram.ext",
+                 "telegram.ext._utils.networkloop", "httpx", "httpcore"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, TransientNetworkFilter) for f in logger.filters):
+            logger.addFilter(filt)
+
+
 def install_log_masking():
     """Root logger ke saare handlers par masking formatter laga do."""
     root = logging.getLogger()
@@ -111,6 +164,34 @@ def install_log_masking():
         logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
     for handler in root.handlers:
         handler.setFormatter(MaskingFormatter(LOG_FORMAT))
+    install_network_log_filter()
+
+
+def force_ipv4_enabled() -> bool:
+    return os.getenv("FORCE_IPV4", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def install_force_ipv4() -> bool:
+    """Kuch VPS par IPv6 route toota hota hai -> Telegram API calls par httpx.ReadError.
+
+    .env me FORCE_IPV4=1 karne par sirf IPv4 addresses resolve honge (Telegram IPv4 par
+    poori tarah kaam karta hai). Default off - sirf tab lagao jab logs me ReadError aayein.
+    """
+    if not force_ipv4_enabled():
+        return False
+    import socket
+    if getattr(socket, "_advanced_force_ipv4", False):
+        return True
+    original = socket.getaddrinfo
+
+    def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        results = original(host, port, family, type, proto, flags)
+        filtered = [r for r in results if r[0] != socket.AF_INET6]
+        return filtered or results
+
+    socket.getaddrinfo = ipv4_only
+    socket._advanced_force_ipv4 = True
+    return True
 
 
 def load_env_file():
@@ -2690,6 +2771,34 @@ async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
                 ]]))
 
 
+async def retry_inactive_userbots_job(context: ContextTypes.DEFAULT_TYPE):
+    """Har 10 min: jo userbot network hiccup ki wajah se start nahi ho paya use dobara
+    chalu karo (pehle wo agle manual restart tak band pada rehta tha)."""
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        return
+    attempted = 0
+    started = 0
+    for bot in bots:
+        bot_id = bot["bot_id"]
+        if bot_id in user_bot_applications:
+            continue
+        try:
+            if not db.get_active_subscription(bot_id):
+                continue
+        except Exception:
+            continue
+        attempted += 1
+        if await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0, quiet=True):
+            started += 1
+            try:
+                db.set_user_bot_active(bot_id, True)
+            except Exception:
+                pass
+    if attempted:
+        logging.info(f"userbot retry job: {started}/{attempted} inactive userbot start ho gaye")
+
+
 async def subscription_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     _cleanup_support_maps()
     for days_threshold in [3, 1]:
@@ -3942,12 +4051,12 @@ async def flush_token_failures(bot=None):
                 logging.warning(f"Token warning owner {uid} ko nahi bhej paye: {mask_secrets(ex)}")
 
 
-async def start_user_bot(token: str, bot_id: str, owner_id: int):
-    try:
-        app = ApplicationBuilder().token(token).concurrent_updates(True).request(_tuned_request()).build()
-    except Exception as ex:
-        logging.error(f"{pp('❌')} User bot {bot_id} bana nahi paya: {mask_secrets(ex)}")
-        return False
+USERBOT_START_ATTEMPTS = 3          # network hiccup par itni baar try karo
+USERBOT_RETRY_DELAY = 1.5           # attempt ke beech base delay (test me patch hota hai)
+
+
+def _build_userbot_app(token: str, bot_id: str, owner_id: int):
+    app = ApplicationBuilder().token(token).concurrent_updates(True).request(_tuned_request()).build()
     app.bot_data["bot_id"] = bot_id
     app.bot_data["owner_id"] = owner_id
     app.add_handler(CommandHandler("start", lambda u, c: user_bot_start(u, c, bot_id, owner_id)))
@@ -3958,33 +4067,64 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
-    try:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
-    except (InvalidToken, Forbidden) as ex:
-        # Token revoke/delete ho gaya - retry karne ka koi fayda nahi. Sirf is bot ko
-        # band karo, main bot chalta rahe (pehle ye poore bot ko restart loop me daal deta tha).
-        logging.error(f"{pp('❌')} User bot {bot_id} ka token Telegram ne reject kar diya "
-                      f"({mask_secrets(ex)}) - is bot ko band kiya, naya token chahiye")
-        await _cleanup_failed_app(app)
+    return app
+
+
+async def start_user_bot(token: str, bot_id: str, owner_id: int, quiet: bool = False):
+    """Userbot start karo.
+
+    Network hiccup (httpx.ReadError / TimedOut) par 2 baar dobara try hota hai - VPS ki
+    link kabhi-kabhi toot jati hai aur pehle ek hi ReadError par userbot band pada rehta
+    tha jab tak dobara restart na ho ("Failed to start user bot ... httpx.ReadError:").
+    Permanent errors (revoked token / blocked) par turant band.
+    """
+    fail_log = logging.warning if quiet else logging.error
+    for attempt in range(1, USERBOT_START_ATTEMPTS + 1):
         try:
-            db.set_user_bot_active(bot_id, False)
-        except Exception:
-            pass
-        remember_token_failure(bot_id, owner_id, str(ex))
-        return False
-    except Exception as ex:
-        logging.error(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
-        await _cleanup_failed_app(app)
-        return False
-    user_bot_applications[bot_id] = app
-    try:
-        for ch in db.get_bot_channels(bot_id) or []:
-            await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], app.bot)
-    except Exception as ex:
-        logging.error(f"Startup pending sync failed: {ex}")
-    return True
+            app = _build_userbot_app(token, bot_id, owner_id)
+        except Exception as ex:
+            fail_log(f"{pp('❌')} User bot {bot_id} bana nahi paya: {mask_secrets(ex)}")
+            return False
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+        except (InvalidToken, Forbidden) as ex:
+            # Token revoke/delete ho gaya - retry karne ka koi fayda nahi. Sirf is bot ko
+            # band karo, main bot chalta rahe (pehle ye poore bot ko restart loop me daal deta tha).
+            fail_log(f"{pp('❌')} User bot {bot_id} ka token Telegram ne reject kar diya "
+                     f"({mask_secrets(ex)}) - is bot ko band kiya, naya token chahiye")
+            await _cleanup_failed_app(app)
+            try:
+                db.set_user_bot_active(bot_id, False)
+            except Exception:
+                pass
+            remember_token_failure(bot_id, owner_id, str(ex))
+            return False
+        except (NetworkError, TimedOut) as ex:
+            await _cleanup_failed_app(app)
+            if attempt < USERBOT_START_ATTEMPTS:
+                (logging.debug if quiet else logging.warning)(
+                    f"userbot {bot_id}: attempt {attempt} par network error "
+                    f"({mask_secrets(ex)}) - dobara try kar rahe hain")
+                await asyncio.sleep(USERBOT_RETRY_DELAY * attempt)
+                continue
+            fail_log(f"{pp('⚠️')} User bot {bot_id} {USERBOT_START_ATTEMPTS} attempts ke baad bhi "
+                     f"start nahi ho paya (network: {mask_secrets(ex)}) - retry job ~10 min me "
+                     f"dobara koshish karega")
+            return False
+        except Exception as ex:
+            fail_log(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
+            await _cleanup_failed_app(app)
+            return False
+        user_bot_applications[bot_id] = app
+        try:
+            for ch in db.get_bot_channels(bot_id) or []:
+                await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], app.bot)
+        except Exception as ex:
+            logging.error(f"Startup pending sync failed: {mask_secrets(ex)}")
+        return True
+    return False
 
 
 async def stop_user_bot(bot_id: str):
@@ -5621,6 +5761,9 @@ async def start_bots_on_boot():
 async def main():
     logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
     install_log_masking()
+    if install_force_ipv4():
+        logging.info(f"{pp('🌐')} FORCE_IPV4=1 - sirf IPv4 use hoga (IPv6 route ki wajah se "
+                     f"aane wale httpx.ReadError ke liye)")
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
 
     expired_bots = db.get_expired_subscriptions()
@@ -5656,6 +5799,7 @@ async def main():
 
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")
     app.job_queue.run_repeating(check_expired_subscriptions_job, interval=3600, first=120, name="expired_subscriptions_check")
+    app.job_queue.run_repeating(retry_inactive_userbots_job, interval=600, first=180, name="retry_inactive_userbots")
 
     try:
         await app.initialize()
