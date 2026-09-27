@@ -2225,6 +2225,181 @@ def test_user_account_premium_emoji_fallback():
     check("flood: flag waisa hi", A._UA_PREMIUM_EMOJI_OK.get("ua8394878310") is not False)
 
 
+def test_user_account_boot_without_subscription():
+    print("\n[20] user account bina subscription bhi boot par chalu (\"restart ke baad chup\" fix)")
+    A.reset_premium_styling_state()
+    A.db.user_bots = [{"bot_id": "ua8394878310", "user_id": A.ADMIN_USER_ID, "account_type": "user",
+                       "bot_username": None, "phone": "+19312837172", "bot_token": None,
+                       "session_string": FAKE_SESSION, "api_id": 1, "api_hash": "h"},
+                      {"bot_id": "b9", "user_id": A.ADMIN_USER_ID, "account_type": "bot",
+                       "bot_username": "nobot", "bot_token": "t9", "is_active": 1}]
+    A.db.subs = {}          # koi subscription nahi
+    A.db.active_calls = []
+    A.user_account_clients.pop("ua8394878310", None)
+    started = []
+
+    async def _fake_start(token, bot_id, owner_id, quiet=False):
+        started.append(bot_id)
+        return True
+
+    orig_start = A.start_user_bot
+    A.start_user_bot = _fake_start
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.start_bots_on_boot())
+    finally:
+        _stop_capture(handler, root, old_level)
+        A.start_user_bot = orig_start
+    msgs = [r.getMessage() for r in handler.records]
+    check("boot: user account start hua (sub ke bina)", "ua8394878310" in started, str(started))
+    check("boot: bot account skip hua (sub ke bina)", "b9" not in started, str(started))
+    check("boot: wajah log me saaf", any("user account no subscription hone par bhi chalu" in m for m in msgs),
+          str(msgs)[:220])
+    check("boot: bot ka skip log", any("Skipping b9" in m for m in msgs), str(msgs)[:220])
+    check("boot: active mark hua", ("ua8394878310", True) in A.db.active_calls, str(A.db.active_calls)[:120])
+
+    # --- retry job bhi sub ke bina account ko chalu kare
+    started.clear()
+    A.user_account_clients.pop("ua8394878310", None)
+    A.start_user_bot = _fake_start
+    try:
+        run(A.retry_inactive_userbots_job(FakeCtx()))
+    finally:
+        A.start_user_bot = orig_start
+    check("retry: account dobara start hua", "ua8394878310" in started, str(started))
+
+    # --- setting off karo to purana behaviour (skip) wapas aa jaye
+    A.UA_START_WITHOUT_SUBSCRIPTION = False
+    started.clear()
+    A.user_account_clients.pop("ua8394878310", None)
+    A.start_user_bot = _fake_start
+    try:
+        run(A.start_bots_on_boot())
+    finally:
+        A.start_user_bot = orig_start
+        A.UA_START_WITHOUT_SUBSCRIPTION = True
+    check("setting off: purana skip behaviour", "ua8394878310" not in started, str(started))
+
+
+def test_diagnostics():
+    print("\n[19] diagnostics: build tag, /diag report, test DM, disconnect watchdog")
+    A.reset_premium_styling_state()
+    check("build tag set", bool(A.BUILD_TAG) and len(A.BUILD_TAG) > 5, A.BUILD_TAG)
+    A.db.user_bots = [{"bot_id": "ua8394878310", "user_id": A.ADMIN_USER_ID, "account_type": "user",
+                       "bot_username": None, "phone": "+19312837172", "bot_token": None,
+                       "session_string": FAKE_SESSION, "api_id": 1, "api_hash": "h"},
+                      {"bot_id": "b7", "user_id": A.ADMIN_USER_ID, "account_type": "bot",
+                       "bot_username": "mybot", "bot_token": "t", "is_active": 1}]
+    A.db.subs = {"ua8394878310": {"subscription_type": "Basic",
+                                  "expiry_date": A.now_aware() + timedelta(days=30), "max_channels": 1}}
+    A.db.bot_channels = [{"channel_id": -1001, "channel_title": "C1", "auto_approve": 0}]
+    A.db.active_calls = []
+    A._UA_LOGINS.clear()
+    A._UA_DM_SEEN.clear()
+
+    # --- account band hai: diag me saaf dikhe
+    A.user_account_clients.pop("ua8394878310", None)
+    text = A.strip_premium_emojis(A.build_diag_text())
+    check("diag: build tag dikhta hai", A.BUILD_TAG in text, text[:120])
+    check("diag: account id dikhta hai", "ua8394878310" in text)
+    check("diag: band account saaf likha", "account band hai" in text, text)
+    check("diag: plan dikhta hai", "Basic" in text)
+
+    # --- account chalu: counters dikhein
+    fake = FakeTLClient(me_id=8394878310)
+    fake.connected = True
+    sender = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake,
+                                 account_user_id=8394878310, premium=False)
+    A.user_account_clients["ua8394878310"] = sender
+    sender.connected_at = A.time.time()
+    sender.raw_updates = 5
+    sender.dm_count = 2
+    sender.last_dm_at = A.time.time() - 90
+    sender.last_dm_from = 8015937475
+    sender.last_dm_text = "/start"
+    text = A.strip_premium_emojis(A.build_diag_text())
+    check("diag: chalu account", "chalu: 🟢" in text, text)
+    check("diag: connected", "connected: 🟢" in text or "connected: haan" in text, text)
+    check("diag: DM count", "DM mile: 2" in text, text)
+    check("diag: aakhri DM", "aakhri: 1m" in text, text)
+    check("diag: raw updates", "raw updates: 5" in text, text)
+    check("diag: plain emoji mode", "plain emoji" in text, text)
+
+    # --- /diag command admin ko report bhejta hai
+    msg = FakeMsg(text="/diag", chat_id=A.ADMIN_USER_ID, from_user=A._RouterUser(A.ADMIN_USER_ID, "Admin"))
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.diag_command(_fake_update(msg=msg, uid=A.ADMIN_USER_ID), FakeCtx()))
+    finally:
+        _stop_capture(handler, root, old_level)
+    replies = [t or "" for t, _ in msg.replies]
+    check("diag cmd: report gaya", any("DIAGNOSTICS" in t for t in replies), str([t[:40] for t in replies]))
+    check("diag cmd: log me bhi gaya", any("DIAGNOSTICS" in r.getMessage() for r in handler.records),
+          str([r.getMessage()[:40] for r in handler.records])[:120])
+    check("diag cmd: non-admin ko nahi", _check_non_admin_diag())
+
+    # --- admin panel button
+    mctx = FakeCtx()
+    mq = FakeQuery(mctx, uid=A.ADMIN_USER_ID)
+    mq.data = "admin_diag"
+    run(A.callback_handler(_fake_update(q=mq, uid=A.ADMIN_USER_ID), mctx))
+    check("diag button: panel se khula", any("DIAGNOSTICS" in (t or "") for t, _ in mq.edits),
+          str([t[:40] for t, _ in mq.edits]))
+    check("diag button: test DM button bhi", any("diag_test_ua8394878310" in
+          [b.get("callback_data") for row in (kw.get("reply_markup").to_dict()["inline_keyboard"] if kw.get("reply_markup") else []) for b in row]
+          for _t, kw in mq.edits), "test DM button missing")
+
+    # --- test DM button: account se asli DM jata hai
+    fake.sent_messages.clear()
+    tq = FakeQuery(FakeCtx(), uid=A.ADMIN_USER_ID)
+    tq.data = "diag_test_ua8394878310"
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.callback_handler(_fake_update(q=tq, uid=A.ADMIN_USER_ID), FakeCtx()))
+    finally:
+        _stop_capture(handler, root, old_level)
+    check("test dm: DM gaya", len(fake.sent_messages) == 1, str(fake.sent_messages)[:80])
+    check("test dm: test text", "Test DM" in fake.sent_messages[-1]["text"], fake.sent_messages[-1]["text"][:60])
+    check("test dm: manager ko gaya", fake.sent_messages[-1]["chat_id"] == A.ADMIN_USER_ID)
+    check("test dm: log me ok", any("test DM -> " in r.getMessage() and "ok" in r.getMessage()
+                                    for r in handler.records),
+          str([r.getMessage() for r in handler.records if "test DM" in r.getMessage()])[:120])
+    check("test dm: reply me confirm", any("Test DM bhej diya" in (t or "") for t, _ in tq.edits),
+          str([t[:50] for t, _ in tq.edits]))
+
+    # --- watchdog: active par disconnected client -> registry saaf + dobara start try
+    dead = FakeTLClient(me_id=8394878310)
+    dead.connected = False
+    dead_sender = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, dead, account_user_id=8394878310)
+    A.user_account_clients["ua8394878310"] = dead_sender
+    started = []
+
+    async def _fake_start(token, bot_id, owner_id, quiet=False):
+        started.append(bot_id)      # asli network connection test me nahi chahiye
+        return True
+
+    orig_start = A.start_user_bot
+    A.start_user_bot = _fake_start
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.retry_inactive_userbots_job(FakeCtx()))
+    finally:
+        _stop_capture(handler, root, old_level)
+        A.start_user_bot = orig_start
+    msgs = [r.getMessage() for r in handler.records]
+    check("watchdog: disconnect pakda", any("disconnect mila" in m for m in msgs), str(msgs)[:200])
+    check("watchdog: dead client registry se hata", A.user_account_clients.get("ua8394878310") is not dead_sender)
+    check("watchdog: account dobara start try hua", "ua8394878310" in started, str(started))
+    A.user_account_clients.pop("ua8394878310", None)
+
+
+def _check_non_admin_diag():
+    """Non-admin /diag bheje to kuch na aaye."""
+    msg = FakeMsg(text="/diag", chat_id=555, from_user=A._RouterUser(555, "Random"))
+    run(A.diag_command(_fake_update(msg=msg, uid=555), FakeCtx()))
+    return msg.replies == []
+
+
 def test_user_account_owner_flow_adapter():
     print("\n[16] user account owner flows (main bot ke messages se)")
     A.reset_premium_styling_state()
@@ -2381,6 +2556,8 @@ def main():
     test_user_account_owner_flow_adapter()
     test_user_account_dm_start()
     test_user_account_premium_emoji_fallback()
+    test_diagnostics()
+    test_user_account_boot_without_subscription()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:

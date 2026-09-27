@@ -297,6 +297,14 @@ MAIN_BOT_TOKEN_HINT = (
     "(Naya token kabhi GitHub/chat me mat bhejo - Telegram use turant revoke kar deta hai.)")
 ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
+# Konsa code chal raha hai - server par purana process pada ho to turant pata chale
+# (./start ke baad log me is line ka hona zaroori hai)
+BUILD_TAG = "2026-09-27-r13f"
+START_TS = time.time()
+# User account subscription ke bina bhi online rahe? (owner ka apna account hai, DM/panel
+# chalta rehna chahiye). Purana behaviour chahiye to .env me UA_START_WITHOUT_SUBSCRIPTION=0
+UA_START_WITHOUT_SUBSCRIPTION = os.getenv("UA_START_WITHOUT_SUBSCRIPTION", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
 if _ADMIN_IDS_RAW:
@@ -702,6 +710,105 @@ def subscription_plans_kb(bot_id: str = None) -> InlineKeyboardMarkup:
         [btn("Back", back_cb, "primary", "🔙")],
     ])
 
+def _fmt_ago(ts: Optional[float]) -> str:
+    if not ts:
+        return "kabhi nahi"
+    secs = max(0, int(time.time() - ts))
+    if secs < 60:
+        return f"{secs}s pehle"
+    if secs < 3600:
+        return f"{secs // 60}m pehle"
+    return f"{secs // 3600}h {(secs % 3600) // 60}m pehle"
+
+
+def build_diag_text() -> str:
+    """Ek message me poora status: build, main bot, har user account, DM counters."""
+    lines = [f"<blockquote>{pp('🩺')} <b>DIAGNOSTICS</b></blockquote>", ""]
+    lines.append(f"{pp('🏷')} Build: <code>{BUILD_TAG}</code>")
+    lines.append(f"{pe('⏱')} Bot chalu: {_fmt_ago(START_TS).replace(' pehle', '')}")
+    try:
+        import telegram as _tg
+        lines.append(f"{pe('🐍')} python-telegram-bot {getattr(_tg, '__version__', '?')}")
+    except Exception:
+        pass
+    lines.append(f"{pe('🔑')} Main bot token: {'haan' if MAIN_BOT_TOKEN else 'NAHI'} "
+                 f"| admins: {len(ADMIN_USER_IDS)}")
+    lines.append("")
+    accounts = [b for b in (db.get_all_user_bots() or [])
+                if (b.get("account_type") or "bot") == "user"]
+    bots = [b for b in (db.get_all_user_bots() or [])
+            if (b.get("account_type") or "bot") != "user"]
+    lines.append(f"{pp('👤')} <b>User accounts ({len(accounts)})</b>")
+    if not accounts:
+        lines.append(f"{pe('ℹ️')} ek bhi user account add nahi hai")
+    for row in accounts:
+        bot_id = row.get("bot_id") or "?"
+        sender = user_account_clients.get(bot_id)
+        running = sender is not None
+        connected = "-"
+        if running:
+            try:
+                connected = "🟢 haan" if sender.client.is_connected() else "🔴 nahi"
+            except Exception:
+                connected = "?"
+        sub = db.get_subscription_for_bot(bot_id)
+        plan = "no plan"
+        if sub:
+            plan = f"{sub.get('subscription_type')} ({str(sub.get('expiry_date'))[:10]})"
+        try:
+            chans = len(db.get_bot_channels(bot_id) or [])
+        except Exception:
+            chans = "?"
+        lines.append(f"{pe('🆔')} <code>{bot_id}</code> | {account_display_name(row, bot_id)}")
+        lines.append(f"   {pe('▶️')} chalu: {'🟢 haan' if running else '🔴 NAHI'}"
+                     f" | connected: {connected} | channels: {chans}")
+        if running:
+            mode = "custom emoji OK" if _ua_premium_emoji_allowed(bot_id) else "plain emoji (fallback)"
+            lines.append(f"   {pe('📨')} DM mile: {sender.dm_count}"
+                         f" | aakhri: {_fmt_ago(sender.last_dm_at)}"
+                         f"{f' (user {sender.last_dm_from})' if sender.last_dm_from else ''}")
+            lines.append(f"   {pe('🛰')} raw updates: {sender.raw_updates}"
+                         f" | {mode}"
+                         f"{f' | last: {sender.last_dm_text!r}' if sender.last_dm_text else ''}")
+        else:
+            lines.append(f"   {pe('⚠️')} account band hai - 10 min wala retry job ise chalu karega")
+        lines.append(f"   {pe('⭐️')} plan: {plan}")
+        pending = 1 if bot_id in _UA_LOGINS else 0
+        if pending:
+            lines.append(f"   {pe('⏳')} login adhoora pada hai (OTP/2FA wait)")
+        lines.append("")
+    lines.append(f"{pp('🤖')} <b>Bot accounts ({len(bots)})</b>")
+    if not bots:
+        lines.append(f"{pe('ℹ️')} koi bot account add nahi hai")
+    for row in bots[:5]:
+        bot_id = row.get("bot_id") or "?"
+        lines.append(f"   {pe('▶️')} <code>{bot_id}</code> | "
+                     f"{'🟢 chalu' if bot_id in user_bot_applications else '🔴 band'}")
+    lines.append("")
+    lines.append(f"{pe('📌')} DM test: account chat me <code>/start</code> bhejo, phir yahi /diag "
+                 f"- 'DM mile' aur 'aakhri' bad jana chahiye.")
+    lines.append(f"{pe('🧪')} Account se khud test DM bhejne ke liye niche button dabao.")
+    return "\n".join(lines)
+
+
+def diag_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for bot_id in list(user_account_clients.keys())[:5]:
+        rows.append([btn("Test DM bhejo", f"diag_test_{bot_id}", "success", "🧪")])
+    rows.append([btn("Refresh", "admin_diag", "primary", "🔄")])
+    rows.append([btn("Admin Panel", "admin_panel", "primary", "👑")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    text = build_diag_text()
+    logging.info(f"diag ({user.id}):\n{strip_premium_emojis(text)}")
+    await reply_premium_message(update.message, text, parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+
+
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [btn("All Users", "admin_all_users", "primary", "📇"),
@@ -717,6 +824,7 @@ def admin_kb() -> InlineKeyboardMarkup:
         [btn("Default First Message", "admin_default_first_msg", "primary", "💬")],
         [btn("Broadcast", "admin_broadcast", "success", "✈️"),
          btn("Send Reminders", "admin_send_reminders", "primary", "🔔")],
+        [btn("Diagnostics", "admin_diag", "primary", "🩺")],
         [btn("Main Menu", "main_menu", "primary", "🔙")],
     ])
 
@@ -3066,12 +3174,26 @@ async def retry_inactive_userbots_job(context: ContextTypes.DEFAULT_TYPE):
     started = 0
     for bot in bots:
         bot_id = bot["bot_id"]
+        # active dikh raha hai par client disconnect ho gaya? turant registry saaf karo
+        # taaki neeche wala start dobara connect kar le (warna account chup-chaap so jata hai).
+        _sender = user_account_clients.get(bot_id)
+        if _sender is not None:
+            try:
+                if not _sender.client.is_connected():
+                    logging.warning(f"{bot_id}: account client disconnect mila - dobara connect "
+                                    f"kar rahe hain (isse pehle DM/updates sunne band the)")
+                    user_account_clients.pop(bot_id, None)
+                    user_account_tasks.pop(bot_id, None)
+            except Exception:
+                pass
         if is_account_running(bot_id):
             continue
+        is_ua = (bot.get("account_type") or "bot") == "user"
         try:
-            if not db.get_active_subscription(bot_id):
-                continue
+            has_sub = bool(db.get_active_subscription(bot_id))
         except Exception:
+            has_sub = False
+        if not has_sub and not (is_ua and UA_START_WITHOUT_SUBSCRIPTION):
             continue
         attempted += 1
         if await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0, quiet=True):
@@ -5001,6 +5123,13 @@ class UserAccountSender:
         self.token = ""  # sendable_media_id / cache keys ise dhoondhte hain
         self.premium = premium
         self._button_note_logged = False
+        # diagnostics (/diag) ke liye
+        self.connected_at = None
+        self.raw_updates = 0
+        self.dm_count = 0
+        self.last_dm_at = None
+        self.last_dm_from = None
+        self.last_dm_text = ""
         if premium is False:
             # Non-Premium account custom emoji bhej hi nahi sakta - shuru se plain mode
             # (warna har message ek baar fail hota aur phir retry)
@@ -5314,6 +5443,7 @@ async def start_user_account(bot_id: str, owner_id: int = 0, row: Optional[dict]
                                        username=getattr(me, "username", None),
                                        account_user_id=getattr(me, "id", 0),
                                        premium=premium_flag)
+            sender.connected_at = time.time()
             _register_user_account_handlers(client, sender, bot_id, owner_id)
             user_account_clients[bot_id] = sender
             task = asyncio.create_task(client.run_until_disconnected())
@@ -5424,6 +5554,7 @@ async def _notify_account_owner(owner_id: int, bot_id: str, text: str):
 
 UA_ACCOUNT_COMMANDS = ("/start", "/menu", "/panel", "/help")
 _UA_SUPPORT_GREETED: set = set()
+_UA_DM_SEEN: set = set()   # pehla DM kahan se aaya (diagnostics)
 
 
 def _main_bot_ref_name() -> str:
@@ -5526,6 +5657,7 @@ async def _ua_handle_owner_start(sender: "UserAccountSender", bot_id: str, owner
 
 def _register_user_account_handlers(client, sender: "UserAccountSender", bot_id: str, owner_id: int):
     """Telethon events -> wahi shared logic jo PTB bot use karta hai."""
+    logging.info(f"{bot_id}: DM handler laga - account ko aane wale private messages ab sunne me aayenge")
 
     @client.on(tl_events.NewMessage(incoming=True))
     async def _on_dm(event):  # pragma: no cover - live network path
@@ -5537,6 +5669,14 @@ def _register_user_account_handlers(client, sender: "UserAccountSender", bot_id:
             sender_id = int(getattr(event, "sender_id", 0) or 0)
             head = text.strip().split()[0].split("@")[0].lower() if text.strip() else ""
             is_manager = bool(sender_id) and (sender_id == owner_id or sender_id in ADMIN_USER_IDS)
+            # /diag ke liye hisaab
+            sender.dm_count += 1
+            sender.last_dm_at = time.time()
+            sender.last_dm_from = sender_id
+            sender.last_dm_text = text[:60]
+            if sender_id and sender_id not in _UA_DM_SEEN:
+                _UA_DM_SEEN.add(sender_id)
+                logging.info(f"{bot_id}: pehla DM mila user {sender_id} se: {text[:40]!r}")
             if head in UA_ACCOUNT_COMMANDS:
                 logging.info(f"{bot_id}: DM me {head} aaya ({'manager' if is_manager else 'user'} {sender_id})")
             else:
@@ -5579,6 +5719,7 @@ def _register_user_account_handlers(client, sender: "UserAccountSender", bot_id:
     @client.on(tl_events.Raw())
     async def _on_raw_update(update):  # pragma: no cover - live network path
         try:
+            sender.raw_updates += 1
             if tl_functions is None or not hasattr(update, "peer"):
                 return
             if type(update).__name__ != "UpdatePendingJoinRequests":
@@ -6897,6 +7038,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message_text(q, f"<blockquote>{pp('💰') if plan == 'Basic' else pp('⚡️')} <b>{plan} PLAN SELECTED</b></blockquote>\n\n{'Rs2599/month — 1 channel' if plan == 'Basic' else 'Rs3999/month — 5 channels'}\n\n{pp('📞')} Contact {ADMIN_USERNAME} to complete payment.", parse_mode=ParseMode.HTML, reply_markup=subscription_plans_kb(bot_id))
             return
 
+        if data == "admin_diag":
+            if not is_admin(uid):
+                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
+                return
+            text = build_diag_text()
+            logging.info(f"diag ({uid}):\n{strip_premium_emojis(text)}")
+            await safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+            return
+
+        if data.startswith("diag_test_"):
+            if not is_admin(uid):
+                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
+                return
+            test_bot_id = data.replace("diag_test_", "")
+            sender = user_account_clients.get(test_bot_id)
+            if sender is None:
+                await safe_edit_message_text(
+                    q, f"{pe('❌')} <code>{test_bot_id}</code> abhi chalu nahi hai - "
+                       f"pehle account connect hone do (10 min wala retry job chalta rehta hai).",
+                    parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+                return
+            ok, why = True, ""
+            try:
+                await sender.send_to_chat(
+                    uid, f"{pe('🧪')} Test DM - <code>{test_bot_id}</code> se. "
+                         f"Ye message aa gaya matlab account se bhejna theek chal raha hai.\n"
+                         f"{pe('🕒')} {now_aware().strftime('%Y-%m-%d %H:%M:%S')}",
+                    parse_mode=ParseMode.HTML)
+            except Exception as ex:
+                ok, why = False, mask_secrets(ex)
+            logging.info(f"{test_bot_id}: diag test DM -> {uid}: {'ok' if ok else 'FAIL ' + why}")
+            note = (f"{pe('✅')} Test DM bhej diya <code>{test_bot_id}</code> se - apne DM me dekho "
+                    f"(isi chat me aayega jab account aur ye account alag hon)." if ok else
+                    f"{pe('❌')} Test DM fail hua: {why}")
+            await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
+                                         parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+            return
+
         if data == "admin_panel":
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
@@ -7954,27 +8133,39 @@ async def start_bots_on_boot():
     if bots:
         logging.info(f"Found {len(bots)} user bots to start")
         for bot in bots:
-            sub = db.get_subscription_for_bot(bot["bot_id"])
+            bot_id = bot["bot_id"]
+            is_ua = (bot.get("account_type") or "bot") == "user"
+            reason = ""
+            sub = db.get_subscription_for_bot(bot_id)
             if not sub:
-                logging.info(f"Skipping {bot['bot_id']} - no subscription")
-                db.set_user_bot_active(bot["bot_id"], False)
-                continue
-            try:
-                expiry = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
-                if expiry < now_aware():
-                    logging.info(f"Skipping {bot['bot_id']} - subscription expired")
-                    db.set_user_bot_active(bot["bot_id"], False)
+                reason = "no subscription"
+            else:
+                try:
+                    expiry = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
+                    if expiry < now_aware():
+                        reason = "subscription expired"
+                except Exception as ex:
+                    logging.error(f"Error checking expiry for {bot_id}: {ex}")
                     continue
-            except Exception as ex:
-                logging.error(f"Error checking expiry for {bot['bot_id']}: {ex}")
-                continue
-            try:
-                if not await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"]):
+            if reason:
+                if is_ua and UA_START_WITHOUT_SUBSCRIPTION:
+                    # Owner ka apna account hai: offline rakhne ka koi fayda nahi - DM/panel
+                    # chalta rahe. (Pehle yahi wajah thi ki restart ke baad account chup ho
+                    # jata tha aur /start par kuch jawab nahi aata tha.)
+                    logging.info(f"{bot_id}: user account {reason} hone par bhi chalu kar rahe hain "
+                                 f"(DM/panel chalega; channels add karne ke liye subscription chahiye)")
+                else:
+                    logging.info(f"Skipping {bot_id} - {reason}")
+                    db.set_user_bot_active(bot_id, False)
                     continue
-                db.set_user_bot_active(bot["bot_id"], True)
-                logging.info(f"{pp('✅')} Started user bot @{bot['bot_username']} for {bot['bot_id']}")
+            try:
+                if not await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0):
+                    continue
+                db.set_user_bot_active(bot_id, True)
+                kind = "user account" if is_ua else f"user bot @{bot.get('bot_username')}"
+                logging.info(f"{pp('✅')} Started {kind} for {bot_id}")
             except Exception as ex:
-                logging.error(f"{pp('❌')} Failed to start user bot {bot['bot_id']}: {mask_secrets(ex)}")
+                logging.error(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
     else:
         logging.info("No user bots found in database")
 
@@ -7986,6 +8177,8 @@ async def main():
         logging.info(f"{pp('🌐')} FORCE_IPV4=1 - sirf IPv4 use hoga (IPv6 route ki wajah se "
                      f"aane wale httpx.ReadError ke liye)")
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
+    logging.info(f"{pp('🏷')} build {BUILD_TAG} (agar ye line purani dikhe to ./start dobara "
+                 f"chalao - purana process chal raha hai)")
     # .env se user-account credentials pick hue ya nahi - ek line me saaf dikh jaye
     if not TELETHON_AVAILABLE:
         logging.info(f"{pp('👤')} user account mode OFF: telethon install nahi hai "
@@ -8025,6 +8218,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("diag", diag_command))
     app.add_handler(CommandHandler("proof", proof_text_command))
     app.add_handler(CommandHandler("prooftext", proof_text_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
