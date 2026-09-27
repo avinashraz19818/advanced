@@ -269,7 +269,9 @@ TELEGRAM_API_HINT = (
     "User account mode ke liye ek baar my.telegram.org se API credentials chahiye:\n"
     "1. https://my.telegram.org kholo -> login (phone + OTP)\n"
     "2. 'API development tools' -> app banao -> api_id + api_hash copy karo\n"
-    "3. Server par:  cd ~/advanced && printf 'TELEGRAM_API_ID=<id>\\nTELEGRAM_API_HASH=<hash>\\n' >> .env && ./start\n"
+    "3. Server par:  cd ~/advanced && printf 'TELEGRAM_API_ID=1234567\\nTELEGRAM_API_HASH=abcdef123456\\n' "
+    ">> .env && ./start\n"
+    "    (1234567 aur abcdef123456 ki jagah apni asli values daalo)\n"
     "(Ye credentials account ka password nahi hai, sirf app registration hai.)")
 
 SUPPORT_REPLY_MAP: Dict[int, Dict] = {}
@@ -487,6 +489,45 @@ def premiumize_ui_emojis(text: Optional[str]) -> str:
     for emoji_char, eid in EMOJI_IDS.items():
         text = text.replace(emoji_char, f'<tg-emoji emoji-id="{eid}">{emoji_char}</tg-emoji>')
     return text
+
+# Telegram HTML: sirf inhi tags ko as-is jaane do, baaki "<...>" ko escape karo.
+# (Isi bug se ek `printf '<id>'` wali hint line poora message reject karwa rahi thi:
+#  "Can't parse entities: unsupported start tag id".)
+_TG_HTML_ALLOWED = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span", "tg-spoiler",
+    "tg-emoji", "a", "code", "pre", "blockquote", "br", "tg-mention",
+}
+# Sirf valid-looking tags (naam + optional key="value") match hote hain
+_TG_HTML_TAG_RE = re.compile(
+    r"</?([a-zA-Z][a-zA-Z0-9_-]*)((?:\s+[a-zA-Z-]+\s*=\s*\"[^\"]*\")*)\s*/?>")
+
+
+def sanitize_telegram_html(text: Optional[str]) -> str:
+    """HTML parse_mode ke liye text ko safe banao.
+
+    Allowed tags (b, code, tg-emoji, blockquote, a href=...) waise hi rehte hain,
+    aur baaki sab `<` escape ho jate hain. Isse ek chhoti si galti (jaise hint me
+    likha `<id>`) poore message ko fail nahi karti.
+    """
+    if not text or "<" not in text:
+        return text
+    protected = {}
+
+    def _protect(match):
+        tag = match.group(1).lower()
+        if tag not in _TG_HTML_ALLOWED:
+            return match.group(0)
+        key = f"\x00T{len(protected)}\x00"
+        protected[key] = match.group(0)
+        return key
+
+    out = _TG_HTML_TAG_RE.sub(_protect, text)
+    out = out.replace("&", "&amp;").replace("<", "&lt;")
+    # protected tags ke andar wale & ko wapas theek karo (humne sab escape kar diya tha)
+    for key, tag in protected.items():
+        out = out.replace(key, tag)
+    return out
+
 
 def strip_premium_emojis(text: Optional[str]) -> str:
     """Strip <tg-emoji> tags and return plain text with plain emojis. For user-facing messages."""
@@ -1519,10 +1560,10 @@ async def safe_edit_message_text(q, *args, **kwargs):
     if len(args) > 0:
         args = list(args)
         raw_text = args[0]
-        args[0] = premiumize_ui_emojis(raw_text)
+        args[0] = sanitize_telegram_html(premiumize_ui_emojis(raw_text))
     elif "text" in kwargs:
         raw_text = kwargs["text"]
-        kwargs["text"] = premiumize_ui_emojis(raw_text)
+        kwargs["text"] = sanitize_telegram_html(premiumize_ui_emojis(raw_text))
 
     try:
         return await q.edit_message_text(*args, **kwargs)
@@ -1563,7 +1604,7 @@ async def send_premium_message(bot, chat_id, text, *args, **kwargs):
     """Send message with PREMIUM emojis (for bot UI/admin messages). Falls back to
     a plain (non-premium) version if Telegram rejects the styled one."""
     try:
-        premium_text = premiumize_ui_emojis(text)
+        premium_text = sanitize_telegram_html(premiumize_ui_emojis(text))
         return await bot.send_message(chat_id, premium_text, *args, **kwargs)
     except Forbidden:
         logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
@@ -1591,7 +1632,7 @@ async def reply_premium_message(message, text, *args, **kwargs):
     """Reply with PREMIUM emojis (for bot UI/admin messages). Falls back to a
     plain (non-premium) version if Telegram rejects the styled one."""
     try:
-        premium_text = premiumize_ui_emojis(text)
+        premium_text = sanitize_telegram_html(premiumize_ui_emojis(text))
         return await message.reply_text(premium_text, *args, **kwargs)
     except Forbidden:
         logging.warning(f"Cannot reply to {message.chat_id}: bot blocked")
@@ -4053,6 +4094,28 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
         default_msg_text = render_dynamic_text(db.get_default_first_message(), requester)
         if default_msg_text:
             await send_user_message(sender, requester.id, default_msg_text, parse_mode=ParseMode.HTML)
+    except Forbidden as ex:
+        # User ne bot block kiya / DM shuru nahi ho sakti -> aage ke welcome messages bhi
+        # fail honge. Ek hi WARNING + yaad rakho (pehle yahan ERROR spam hota tha).
+        db.mark_unreachable(bot_id, requester.id)
+        db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
+        logging.warning(f"welcome DM skip (user {requester.id} reachable nahi): {mask_secrets(ex)}")
+        if approve is not None and auto:
+            try:
+                await approve()
+            except Exception:
+                pass
+        return
+    except BadRequest as ex:
+        if is_user_gone_error(ex):
+            db.mark_unreachable(bot_id, requester.id)
+            db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
+            logging.warning(f"welcome DM skip (user {requester.id}): {mask_secrets(ex)}")
+            return
+        logging.error(f"Default first message send error: {mask_secrets(ex)}")
+    except (NetworkError, TimedOut) as ex:
+        logging.warning(f"welcome DM network hiccup (transient): {mask_secrets(ex)}")
+        return
     except Exception as ex:
         logging.error(f"Default first message send error: {mask_secrets(ex)}")
 
@@ -4071,6 +4134,19 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
             elif wm:
                 await send_user_message(sender, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
         db.mark_reachable(bot_id, requester.id)
+    except Forbidden as ex:
+        db.mark_unreachable(bot_id, requester.id)
+        db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
+        logging.warning(f"welcome DM skip (user {requester.id} reachable nahi): {mask_secrets(ex)}")
+    except BadRequest as ex:
+        if is_user_gone_error(ex):
+            db.mark_unreachable(bot_id, requester.id)
+            db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
+            logging.warning(f"welcome DM skip (user {requester.id}): {mask_secrets(ex)}")
+        else:
+            logging.error(f"Send welcome error: {mask_secrets(ex)}")
+    except (NetworkError, TimedOut) as ex:
+        logging.warning(f"welcome DM network hiccup (transient): {mask_secrets(ex)}")
     except Exception as ex:
         logging.error(f"Send welcome error: {mask_secrets(ex)}")
 
@@ -5832,6 +5908,8 @@ async def _admin_add_start_ua_login(msg, context, user, target: int, phone: str)
     else:
         # login start nahi hua (jaise .env me api_id/api_hash missing) - state "phone" par
         # hi rehti hai, theek karne ke baad admin dobara phone bhej sakta hai
+        logging.warning(f"user account login start nahi hua ({status}) - "
+                        f"TELEGRAM_API_ID / TELEGRAM_API_HASH check karo")
         await reply_premium_message(msg, f"{pe('❌')} {_ua_login_error(status)}",
                                     parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
 
@@ -6983,8 +7061,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # User-account login wizard (phone -> OTP -> 2FA) - is user ka flow
-    if ua_login_state(user.id) and await ua_login_handle_message(msg, user.id):
-        return
+    if ua_login_state(user.id):
+        # api_id/api_hash set nahi hain to phone lene se pehle hi batao (warna phone
+        # bhejne ke baad samajh hi nahi aata kyun kuch nahi hua).
+        _st = ua_login_state(user.id) or {}
+        if _st.get("step") == "phone" and not ua_credentials_available():
+            logging.warning("user account login ruk gaya: TELEGRAM_API_ID / TELEGRAM_API_HASH set nahi hain")
+            await reply_premium_message(
+                msg,
+                f"{pe('⚠️')} <b>Pehle Telegram API credentials setup karo</b>\n\n{TELEGRAM_API_HINT}",
+                parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
+            return
+        if await ua_login_handle_message(msg, user.id):
+            return
 
     if context.user_data.get("waiting_token") and not is_admin(user.id):
         token = msg.text.strip()

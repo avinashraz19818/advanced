@@ -13,13 +13,16 @@
   filter + userbot retry + FORCE_IPV4, leave-recovery DMs, panel routing, app wiring,
   **user account (MTProto) mode** (phone/OTP/2FA login wizard, session save, premium
   emoji + buttons->links adapter, media/album translate, throttle, flood/blocked error
-  translation, start/stop/self-heal, join request + pending list, panel routing)
+  translation, start/stop/self-heal, join request + pending list, panel routing),
+  **admin ADD ACCOUNT wizard** (choose bot/user -> user_id -> token/phone -> OTP,
+  quick subscription, cancel, legacy one-line format) aur **HTML safety net**
+  (Telegram HTML sanitize, hint text safe, welcome ERROR spam band)
 
 ## Chalane ka tarika
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes telethon
-/tmp/v/bin/python tests/verify_advanced.py     # 173 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 228 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:

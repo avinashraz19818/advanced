@@ -302,6 +302,24 @@ class FakeMsg:
         return FakeSent()
 
 
+_ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span",
+                 "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote", "br", "tg-mention"}
+_STRAY_TAG_RE = re.compile(r"<(?!/?(" + "|".join(sorted(_ALLOWED_TAGS)) + r")\b)[^>]*>")
+
+
+class HtmlStrictMsg(FakeMsg):
+    """FakeMsg jo Telegram jaisa HTML check karta hai (unsupported tag -> BadRequest)."""
+
+    async def reply_text(self, text, **kw):
+        if kw.get("parse_mode") == "HTML" or kw.get("parse_mode") == A.ParseMode.HTML:
+            stray = _STRAY_TAG_RE.search(text or "")
+            if stray:
+                raise A.BadRequest(
+                    "Can't parse entities: unsupported start tag "
+                    f"\"{stray.group(0)[1:-1].split()[0]}\" at byte offset {stray.start()}")
+        return await super().reply_text(text, **kw)
+
+
 class FakeDB:
     def __init__(self):
         self.messages = {}
@@ -1755,6 +1773,115 @@ def test_admin_add_account_wizard():
     A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = _saved_creds
 
 
+def test_html_safety_and_welcome_spam():
+    print("\n[14] HTML safety net + welcome ERROR spam")
+
+    # --- sanitize: allowed tags rehne chahiye
+    check("sanitize: tg-emoji safe", '<tg-emoji emoji-id="5000000001">' in
+          A.sanitize_telegram_html('<tg-emoji emoji-id="5000000001">💎</tg-emoji>'))
+    check("sanitize: blockquote/b/code safe", A.sanitize_telegram_html("<blockquote><b>x</b></blockquote>")
+          == "<blockquote><b>x</b></blockquote>")
+    check("sanitize: a href safe",
+          A.sanitize_telegram_html('<a href="https://t.me/x">x</a>')
+          == '<a href="https://t.me/x">x</a>')
+    check("sanitize: plain <id> escape", '&lt;id>' in A.sanitize_telegram_html("printf 'X=<id>'"))
+    check("sanitize: lone < escape", '&lt;' in A.sanitize_telegram_html("5 < 6"))
+    check("sanitize: bina tag wala text untouched (double-escape nahi)",
+          A.sanitize_telegram_html("a & b, 100% ok") == "a & b, 100% ok")
+    check("sanitize: khaali text", A.sanitize_telegram_html("") == "")
+
+    # --- asli bug: TELEGRAM_API_HINT HTML me bhejne par reject nahi hona chahiye
+    for text, label in ((A.TELEGRAM_API_HINT, "hint"), (A.ua_login_error_text_check()
+                                                        if hasattr(A, "ua_login_error_text_check") else
+                                                        A.TELEGRAM_API_HINT, "login error")):
+        prem = A.sanitize_telegram_html(A.premiumize_ui_emojis(text))
+        stray = _STRAY_TAG_RE.search(prem)
+        check(f"telegram-safe: {label}", stray is None, str(stray.group(0) if stray else ""))
+
+    # hint me koi raw <placeholder> nahi (asli wajah)
+    raw = re.findall(r"<[a-zA-Z_][a-zA-Z0-9_]*>", A.TELEGRAM_API_HINT)
+    check("hint me raw <id>/<hash> nahi", not raw, str(raw))
+    check("hint me asli command hai", "TELEGRAM_API_ID=" in A.TELEGRAM_API_HINT)
+
+    # --- strict bot par poora login error path (jaise user ko dikhta hai)
+    ctx = FakeCtx()
+    ctx.user_data.clear()
+    admin = A.ADMIN_USER_ID
+    A._UA_LOGINS.clear()
+    A._admin_add_set(ctx, "user", "user_id")
+    m0 = HtmlStrictMsg(text="987654321")
+    run(A.handle_message(_fake_update(msg=m0, uid=admin), ctx))
+    check("strict: phone step message gaya", any("PHONE NUMBER" in (t or "") for t, _ in m0.replies),
+          str([t[:40] for t, _ in m0.replies]))
+
+    saved_pair = (A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH)
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = "", ""
+    handler, root, old_level = _capture_logs()
+    try:
+        m1 = HtmlStrictMsg(text="+19312837172")
+        run(A.handle_message(_fake_update(msg=m1, uid=admin), ctx))
+    finally:
+        _stop_capture(handler, root, old_level)
+    A.TELEGRAM_API_ID, A.TELEGRAM_API_HASH = saved_pair
+    check("strict: creds missing par reply aaya", bool(m1.replies), str(len(m1.replies)))
+    err_logs = [r for r in handler.records if r.levelno >= logging.ERROR]
+    check("strict: koi ERROR nahi (parse fail nahi hua)", not err_logs,
+          str([r.getMessage()[:70] for r in err_logs]))
+    warns = [r for r in handler.records if r.levelno == logging.WARNING]
+    check("strict: ek saaf warning log hui",
+          any("TELEGRAM_API_ID" in r.getMessage() or "credentials" in r.getMessage().lower() for r in warns),
+          str([r.getMessage()[:70] for r in warns]))
+    check("strict: state phone par hi rahi (dobara try kar sakta hai)",
+          (A._UA_LOGINS.get(admin) or {}).get("step") == "phone", str(A._UA_LOGINS.get(admin)))
+    A._UA_LOGINS.pop(admin, None)
+    A._admin_add_clear(ctx)
+
+    # --- welcome: blocked user par ERROR spam band + permanently mark
+    A.db.gone_calls = []
+    A.db.unreachable_calls = []
+    A.db.join_requests = []
+    A.db.leave = {"messages": []}
+    A.db.subs = {}
+    blocked = FakeBot("blocked")
+
+    async def _boom(*a, **k):
+        raise A.Forbidden("Forbidden: bot was blocked by the user")
+    blocked.send_message = _boom
+    blocked.send_photo = _boom
+    blocked.send_document = _boom
+    requester = SimpleNamespace(id=4242, first_name="Blocked", username="b", last_name="", is_bot=False)
+    handler2, root2, old2 = _capture_logs()
+    try:
+        run(A.process_join_request("b1", 999, requester, -100123, "Test Channel", None,
+                                   sender=blocked, approve=None, auto=True))
+    finally:
+        _stop_capture(handler2, root2, old2)
+    errs = [r for r in handler2.records if r.levelno >= logging.ERROR]
+    wrns = [r for r in handler2.records if r.levelno == logging.WARNING]
+    check("welcome: koi ERROR nahi", not errs, str([r.getMessage()[:70] for r in errs]))
+    check("welcome: ek warning (skip)", len(wrns) == 1, str([r.getMessage()[:70] for r in wrns]))
+    check("welcome: user permanently mark hua", any(c[1] == 4242 for c in A.db.gone_calls),
+          str(A.db.gone_calls))
+    check("welcome: blocked par baar-baar try nahi (1 hi warning)",
+          sum(1 for r in wrns if "welcome DM skip" in r.getMessage()) == 1,
+          str([r.getMessage()[:60] for r in wrns]))
+
+    # --- normal user par welcome phir bhi jata hai
+    A.db.gone_calls = []
+    good = FakeBot("good")
+    handler3, root3, old3 = _capture_logs()
+    try:
+        run(A.process_join_request("b1", 999, SimpleNamespace(id=4343, first_name="Ravi",
+                                                              username="ravi", last_name="", is_bot=False),
+                                   -100123, "Test Channel", None, sender=good, approve=None, auto=True))
+    finally:
+        _stop_capture(handler3, root3, old3)
+    check("welcome: normal user ko message gaya", bool(good.calls), str(good.calls[:1])[:110])
+    check("welcome: normal user ERROR free",
+          not [r for r in handler3.records if r.levelno >= logging.ERROR],
+          str([r.getMessage()[:60] for r in handler3.records if r.levelno >= logging.ERROR]))
+
+
 def main():
     test_premium_button_parsing()
     test_button_wizard()
@@ -1769,6 +1896,7 @@ def main():
     test_app_wiring()
     test_user_account_mode()
     test_admin_add_account_wizard()
+    test_html_safety_and_welcome_spam()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:
