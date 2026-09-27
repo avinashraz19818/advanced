@@ -282,8 +282,10 @@ class FakeQuery:
 
 
 class FakeMsg:
-    def __init__(self, text=None, entities=None, chat_id=999, caption=None):
+    def __init__(self, text=None, entities=None, chat_id=999, caption=None, from_user=None):
         self.text = text
+        self.from_user = from_user if from_user is not None else SimpleNamespace(
+            id=chat_id, first_name="Tester", last_name="", username="tester", is_bot=False)
         self.caption = caption
         self.entities = entities or []
         self.caption_entities = []
@@ -292,6 +294,31 @@ class FakeMsg:
         self.replies = []
         self.media_group_id = None
         self.deleted = False
+        self.reply_to_message = None
+        # PTB Message ke media fields (jab media nahi hota to None hote hain)
+        self.photo = None
+        self.video = None
+        self.document = None
+        self.animation = None
+        self.audio = None
+        self.voice = None
+        self.video_note = None
+        self.sticker = None
+        self.contact = None
+        self.location = None
+        self.poll = None
+        self.forward_origin = None
+        self.forward_from_chat = None
+        self.caption = caption
+        self.caption_entities = []
+        self.chat = SimpleNamespace(id=chat_id, type="private", title=None, username=None)
+
+    def __getattr__(self, item):
+        # PTB Message me har optional field hoti hai (unset = None) - isliye jo field
+        # harness me nahi likhi, uske liye None do (AttributeError nahi).
+        if item.startswith("__"):
+            raise AttributeError(item)
+        return None
 
     async def delete(self):
         self.deleted = True
@@ -425,6 +452,8 @@ class FakeDB:
         return None
 
     def get_bot_channels(self, bot_id):
+        if hasattr(self, "bot_channels"):
+            return list(self.bot_channels)
         return [{"channel_id": -100123, "channel_title": "Test Channel", "auto_approve": 0}]
 
     def get_total_requesters_count(self, bot_id):
@@ -596,6 +625,16 @@ class FakeTLClient:
     async def get_permissions(self, chat_id, user=None):
         return SimpleNamespace(is_admin=True, is_creator=False)
 
+    async def delete_messages(self, chat_id, message_ids):
+        self.deleted_messages = getattr(self, "deleted_messages", [])
+        self.deleted_messages.append((chat_id, list(message_ids)))
+        return True
+
+    async def edit_message(self, chat_id, message_id, text, **kw):
+        self.edited = getattr(self, "edited", [])
+        self.edited.append((chat_id, message_id, text))
+        return SimpleNamespace(id=message_id)
+
     async def __call__(self, request):
         self.raw_calls.append(request)
         return SimpleNamespace(users=[], importers=[])
@@ -606,7 +645,9 @@ A.db = FakeDB()
 
 # ---------------------------------------------------------------- helpers
 def _fake_update(q=None, uid=999, msg=None):
-    return SimpleNamespace(callback_query=q, effective_user=SimpleNamespace(id=uid, first_name="T", username="t"),
+    return SimpleNamespace(callback_query=q,
+                           effective_user=SimpleNamespace(id=uid, first_name="T", last_name="",
+                                                          username="t", is_bot=False),
                            message=msg or FakeMsg(chat_id=uid), effective_chat=SimpleNamespace(id=uid),
                            chat_member=None, chat_join_request=None, inline_query=None)
 
@@ -1996,6 +2037,115 @@ def test_subscription_picker_and_style_memory():
     check("style: reset ke baad on", A.premium_styling_disabled() is False)
 
 
+def test_user_account_owner_flow_adapter():
+    print("\n[16] user account owner flows (main bot ke messages se)")
+    A.reset_premium_styling_state()
+    A.db.user_bots = [{"bot_id": "ua8394878310", "user_id": A.ADMIN_USER_ID, "account_type": "user",
+                       "bot_username": None, "phone": "+19312837172", "bot_token": None,
+                       "session_string": FAKE_SESSION, "api_id": 1, "api_hash": "h"}]
+    A.db.subs = {"ua8394878310": {"subscription_type": "Basic",
+                                  "expiry_date": A.now_aware() + timedelta(days=30), "max_channels": 1}}
+    A.db.gone_calls = []
+    A.db.join_requests = []
+    A.db.leave = {"messages": []}
+    A.db.channels = []
+    A.db.bot_channels = []
+    uid = A.ADMIN_USER_ID
+
+    ctx = FakeCtx()
+    ctx.user_data.clear()
+
+    # --- regression: adapter ke bina "'Message' object has no attribute 'effective_user'"
+    owner = SimpleNamespace(id=uid, first_name="Owner", last_name="", username="owner", is_bot=False)
+    raw = FakeMsg(text="hello", from_user=owner)
+    adapted = A._RouterUpdate(raw, A._RouterUser(uid))
+    check("adapter: effective_user milta hai", adapted.effective_user.id == uid, str(adapted.effective_user))
+    check("adapter: message wahi hai", adapted.message is raw)
+    check("adapter: unknown attr message se aata hai", adapted.chat_id == raw.chat_id)
+    check("adapter: user object me full_name", A._RouterUser(5, "A", "B").full_name == "A B")
+
+    # --- channel add flow (owner channel se message forward karta hai)
+    A.user_account_clients["ua8394878310"] = A.UserAccountSender("ua8394878310", uid, FakeTLClient(),
+                                                                 phone="+19312837172", account_user_id=8394878310)
+    ctx.user_data.clear()
+    ctx.user_data["adding_channel_ua8394878310"] = True
+    forwarded = FakeMsg(text=None, from_user=owner)
+    forwarded.forward_origin = SimpleNamespace(chat=SimpleNamespace(
+        id=-1001234567890, type="channel", title="My Channel", username="mychannel"))
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.handle_message(_fake_update(msg=forwarded, uid=uid), ctx))
+    finally:
+        _stop_capture(handler, root, old_level)
+    errors = [r for r in handler.records if r.levelno >= logging.ERROR]
+    check("channel add: koi ERROR nahi", not errors, str([r.getMessage()[:80] for r in errors]))
+    check("channel add: channel DB me gaya", any(c[1] == -1001234567890 for c in A.db.channels),
+          str(A.db.channels))
+    check("channel add: state clear", not ctx.user_data.get("adding_channel_ua8394878310"),
+          str(ctx.user_data.get("adding_channel_ua8394878310")))
+    replies = [(t or "") for t, _ in forwarded.replies]
+    check("channel add: success reply aaya", any("added successfully" in t or "Channel" in t for t in replies),
+          str([t[:60] for t in replies]))
+    check("channel add: limit/error message nahi", not any("limit" in t.lower() or "admin" in t.lower()
+                                                          for t in replies), str([t[:60] for t in replies]))
+
+    # --- welcome set flow (setting_message_ state)
+    ctx.user_data.clear()
+    ctx.user_data["setting_message_ua8394878310"] = True
+    welcome = FakeMsg(text="Hello {first_name}, welcome!", from_user=owner)
+    handler2, root2, old2 = _capture_logs()
+    try:
+        run(A.handle_message(_fake_update(msg=welcome, uid=uid), ctx))
+    finally:
+        _stop_capture(handler2, root2, old2)
+    errs2 = [r for r in handler2.records if r.levelno >= logging.ERROR]
+    check("welcome set: koi ERROR nahi", not errs2, str([r.getMessage()[:80] for r in errs2]))
+
+    # --- non-owner ka message route nahi hona chahiye
+    ctx.user_data.clear()
+    ctx.user_data["adding_channel_ua8394878310"] = True
+    stranger = SimpleNamespace(id=424242, first_name="Stranger", last_name="", username=None, is_bot=False)
+    msg_stranger = FakeMsg(text="hi", from_user=stranger)
+    check("router: non-owner skip", run(A._route_user_account_owner_message(msg_stranger, ctx, 424242)) is False)
+    ctx.user_data.pop("adding_channel_ua8394878310", None)
+
+    # --- bot account ka flow pehle jaisa (main bot se nahi chalega)
+    ctx.user_data.clear()
+    ctx.user_data["adding_channel_b1"] = True
+    check("router: bot account skip", run(A._route_user_account_owner_message(FakeMsg(), ctx, uid)) is False)
+    ctx.user_data.pop("adding_channel_b1", None)
+
+    # --- account ka apna id bhi owner hai (account se /start par panel aaye)
+    acc_uid = 8394878310
+    check("self-owner: account ka apna id owner", A.is_bot_owner("ua8394878310", acc_uid) is True)
+    check("self-owner: koi aur nahi", A.is_bot_owner("ua8394878310", 555555) is False)
+    check("self-owner: bot account par nahi", A.is_bot_owner("b1", acc_uid) is False)
+    check("self-owner: ua id parse", A.account_self_uid("ua8394878310") == 8394878310
+          and A.account_self_uid("b1") is None)
+
+    labels = _kb_labels(A.main_menu_kb(acc_uid))
+    check("self-owner: main menu me account dikhe",
+          any("8394878310" in l or "19312837172" in l for l in labels), str(labels))
+
+    acc_msg = FakeMsg(text="/start", chat_id=acc_uid, from_user=A._RouterUser(acc_uid, "Acct"))
+    run(A.start_command(_fake_update(msg=acc_msg, uid=acc_uid), FakeCtx()))
+    texts = [t or "" for t, _ in acc_msg.replies]
+    check("self-owner: /start par panel aaya", any("MANAGE USER ACCOUNT" in t for t in texts),
+          str([t[:60] for t in texts]))
+    check("self-owner: panel me channel button",
+          any("Add Channel" in l for l in _kb_labels(acc_msg.replies[-1][1].get("reply_markup"))),
+          str(_kb_labels(acc_msg.replies[-1][1].get("reply_markup"))))
+
+    # --- UserAccountSender ke panel helpers
+    sender = A.user_account_clients["ua8394878310"]
+    check("sender: delete_message hai", callable(getattr(sender, "delete_message", None)))
+    check("sender: edit_message_text hai", callable(getattr(sender, "edit_message_text", None)))
+    check("sender: delete_message chalta hai",
+          run(sender.delete_message(555, 77)) is True)
+    A.user_account_clients.pop("ua8394878310", None)
+    A.db.user_bots = []
+
+
 def main():
     # Har group se pehle styling state saaf (FlakyBot tests disable kar dete hain)
     A.reset_premium_styling_state()
@@ -2028,7 +2178,9 @@ def main():
     A.reset_premium_styling_state()
     test_html_safety_and_welcome_spam()
     A.reset_premium_styling_state()
+    A.reset_premium_styling_state()
     test_subscription_picker_and_style_memory()
+    test_user_account_owner_flow_adapter()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:

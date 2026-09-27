@@ -16,13 +16,13 @@
   translation, start/stop/self-heal, join request + pending list, panel routing),
   **admin ADD ACCOUNT wizard** (choose bot/user -> user_id -> token/phone -> OTP,
   quick subscription, cancel, legacy one-line format) aur **HTML safety net**
-  (Telegram HTML sanitize, hint text safe, welcome ERROR spam band)
+  (Telegram HTML sanitize, hint text safe, welcome ERROR spam band), **user account owner flows** (main-bot message -> userbot handler adapter, channel add / welcome set, account ka apna id owner hone par /start panel)
 
 ## Chalane ka tarika
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes telethon
-/tmp/v/bin/python tests/verify_advanced.py     # 228 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 274 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:

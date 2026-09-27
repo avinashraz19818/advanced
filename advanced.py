@@ -605,6 +605,16 @@ def escape_preserving_premium_emojis(text: Optional[str]) -> str:
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     lines = []
     user_bots = db.get_user_bots_by_owner(uid)
+    # User account: us account ko chalane wala (owner) admin ho sakta hai, par account
+    # khud bhi apne panel tak pahunche - isliye "ua<uid>" row bhi add karte hain.
+    try:
+        self_row = db.get_user_bot(f"ua{uid}")
+    except Exception:
+        self_row = None
+    known_ids = {str(b.get("bot_id")) for b in user_bots}
+    if self_row and str(self_row.get("bot_id")) not in known_ids \
+            and (self_row.get("account_type") or "bot") == "user":
+        user_bots = list(user_bots) + [self_row]
     if user_bots:
         for bot in user_bots:
             bot_id = bot["bot_id"]
@@ -1585,12 +1595,30 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
 
+def account_self_uid(bot_id: str) -> Optional[int]:
+    """User account ka apna Telegram id (`ua8394878310` -> 8394878310)."""
+    if not bot_id or not str(bot_id).startswith("ua"):
+        return None
+    tail = str(bot_id)[2:]
+    return int(tail) if tail.isdigit() else None
+
+
 def is_bot_owner(bot_id: str, user_id: int) -> bool:
-    """Check if user is owner of the bot OR is admin"""
+    """Check if user is owner of the bot/account OR is admin.
+
+    User account ke case me us account ka apna Telegram id bhi owner hai - isliye
+    account se main bot me /start karne par uska panel khul jata hai.
+    """
     if is_admin(user_id):
         return True
     bot_data = db.get_user_bot(bot_id)
-    return bool(bot_data and bot_data.get("user_id") == user_id)
+    if not bot_data:
+        return False
+    if bot_data.get("user_id") == user_id:
+        return True
+    if (bot_data.get("account_type") or "bot") == "user" and account_self_uid(bot_id) == int(user_id):
+        return True
+    return False
 
 
 @retry_async(max_retries=3, delay=1, backoff=2)
@@ -3736,6 +3764,84 @@ async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
                              data.get("chat_id"), ctx, data.get("media_group_id"))
 
 
+class _RouterUser:
+    """Telegram User ka lightweight roop (jab sirf id/naam chahiye)."""
+
+    __slots__ = ("id", "first_name", "last_name", "username", "is_bot", "language_code")
+
+    def __init__(self, user_id, first_name="", last_name="", username=None, is_bot=False):
+        self.id = int(user_id)
+        self.first_name = first_name or ""
+        self.last_name = last_name or ""
+        self.username = username
+        self.is_bot = bool(is_bot)
+        self.language_code = None
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}".strip()
+
+
+class _RouterChat:
+    """Chat ka chhota roop (sirf id chahiye hota hai)."""
+
+    __slots__ = ("id", "type", "title", "username")
+
+    def __init__(self, chat_id, chat_type="private", title=None, username=None):
+        self.id = chat_id
+        self.type = chat_type
+        self.title = title
+        self.username = username
+
+
+class _RouterUpdate:
+    """Main bot ka `Message` -> userbot handlers ke liye `Update` jaisa object.
+
+    User accounts ka koi apna bot chat nahi hota, isliye panel ke flows (channel add,
+    welcome/album set, broadcast) MAIN bot ke messages se chalte hain - par unka logic
+    `handle_user_bot_message` me hai jo `update.effective_user` / `update.message`
+    maangta hai. Ye adapter wahi shape deta hai (isi kami se
+    "'Message' object has no attribute 'effective_user'" aa raha tha).
+    """
+
+    __slots__ = ("message", "effective_user", "effective_chat", "callback_query",
+                 "chat_member", "chat_join_request", "inline_query", "_raw")
+
+    def __init__(self, msg, user=None):
+        self._raw = msg
+        self.message = msg
+        self.callback_query = None
+        self.chat_member = None
+        self.chat_join_request = None
+        self.inline_query = None
+        self.effective_user = user or _message_user(msg)
+        chat = getattr(msg, "chat", None)
+        if chat is not None:
+            self.effective_chat = chat
+        else:
+            chat_id = getattr(msg, "chat_id", None)
+            self.effective_chat = _RouterChat(chat_id) if chat_id is not None else None
+
+    def __getattr__(self, item):
+        return getattr(object.__getattribute__(self, "_raw"), item)
+
+
+def _message_user(msg):
+    """Message se user nikalo: from_user -> chat (private) -> generic (id 0)."""
+    user = getattr(msg, "from_user", None)
+    if user is None:
+        chat = getattr(msg, "chat", None)
+        if chat is not None and getattr(chat, "type", "private") == "private":
+            user = chat
+    if user is None:
+        return _RouterUser(0, "User")
+    return _RouterUser(getattr(user, "id", 0) or 0,
+                       getattr(user, "first_name", "") or "",
+                       getattr(user, "last_name", "") or "",
+                       getattr(user, "username", None),
+                       getattr(user, "is_bot", False))
+
+
 async def _route_user_account_owner_message(msg, context, uid: int) -> bool:
     """Main-bot me user-account owner ke pending flows ko us bot ke handler par bhejo.
 
@@ -3763,10 +3869,12 @@ async def _route_user_account_owner_message(msg, context, uid: int) -> bool:
         if not is_bot_owner(bot_id, uid):
             continue
         try:
-            await handle_user_bot_message(msg, context, bot_id, uid)
+            # raw Message ko Update jaisa banao (warna effective_user nahi milta)
+            await handle_user_bot_message(_RouterUpdate(msg, _RouterUser(uid)), context, bot_id, uid)
             return True
         except Exception as ex:
-            logging.error(f"user account owner flow error ({bot_id}): {mask_secrets(ex)}")
+            logging.error(f"user account owner flow error ({bot_id}): "
+                          f"{type(ex).__name__}: {mask_secrets(ex)}")
             return True
     return False
 
@@ -4988,6 +5096,33 @@ class UserAccountSender:
                                                         parse_mode="html" if album_caption else None))
         return await _ua_wrap(self.client.send_file(int(chat_id), files, caption=album_caption or None,
                                                     parse_mode="html" if album_caption else None))
+
+    async def delete_message(self, chat_id, message_id, **kw):
+        """Panel se message delete karne wale flows ke liye (best effort)."""
+        try:
+            await self.client.delete_messages(int(chat_id), [int(message_id)])
+            return True
+        except Exception as ex:
+            logging.debug(f"user account: message delete nahi hua ({message_id}): {mask_secrets(ex)}")
+            return False
+
+    async def edit_message_text(self, text=None, chat_id=None, message_id=None, **kw):
+        """PTB Bot.edit_message_text jaisa (user account ke liye)."""
+        if chat_id is None or message_id is None:
+            raise BadRequest("chat_id aur message_id chahiye")
+        return await _ua_wrap(self.client.edit_message(
+            int(chat_id), int(message_id), text or "",
+            parse_mode="html" if kw.get("parse_mode") == ParseMode.HTML else None))
+
+    async def delete_webhook(self, **kw):
+        return True
+
+    async def get_chat(self, chat_id, **kw):
+        try:
+            entity = await self.client.get_entity(int(chat_id))
+        except Exception as ex:
+            raise BadRequest(mask_secrets(ex)) from ex
+        return entity
 
     async def get_chat_member(self, chat_id, user_id=None):
         from types import SimpleNamespace
@@ -7542,6 +7677,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Admin gets admin panel directly, no welcome message
     if is_admin(user.id):
         await reply_premium_message(update.message, f"<blockquote>{pp('👑')} <b>ADMIN PANEL</b></blockquote>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        return
+    # User account se /start? -> seedha uska panel (account ka apna koi bot chat nahi hota)
+    try:
+        self_row = db.get_user_bot(f"ua{user.id}")
+    except Exception:
+        self_row = None
+    if self_row and (self_row.get("account_type") or "bot") == "user":
+        await reply_premium_message(
+            update.message,
+            f"<blockquote>{pp('👤')} <b>MANAGE USER ACCOUNT</b></blockquote>\n\n"
+            f"{pp('🆔')} <code>{self_row.get('bot_id')}</code>\n"
+            f"{pe('ℹ️')} Is account se welcome / broadcast messages jayenge.\n"
+            f"{pe('📌')} Channel add karo, welcome set karo, phir broadcast bhejo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bot_management_kb(str(self_row.get("bot_id")), user.id))
         return
     await reply_premium_message(update.message, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(user.id))
 
