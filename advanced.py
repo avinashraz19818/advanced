@@ -110,6 +110,17 @@ SESSION_RE = re.compile(r"[A-Za-z0-9_\-]{150,}")
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
 
+def configured_secrets() -> list:
+    """.env se aaye literal secrets (api_hash jaise) - inhe logs me mask karna hai."""
+    out = []
+    for value in (os.getenv("MAIN_BOT_TOKEN", ""), os.getenv("TELEGRAM_API_HASH", ""),
+                  os.getenv("DATABASE_URL", "")):
+        value = (value or "").strip()
+        if len(value) >= 8 and value not in out:
+            out.append(value)
+    return out
+
+
 def mask_secrets(text) -> str:
     """Bot tokens ko kabhi log/error me mat dikhao.
 
@@ -119,6 +130,9 @@ def mask_secrets(text) -> str:
     if not isinstance(text, str):
         text = str(text)
     text = TOKEN_RE.sub(lambda m: f"{m.group(0).split(':', 1)[0]}:***MASKED***", text)
+    for secret in configured_secrets():
+        if secret in text:
+            text = text.replace(secret, "***MASKED***")
     return SESSION_RE.sub("***SESSION-MASKED***", text)
 
 
@@ -824,6 +838,10 @@ class Database:
             "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS session_string TEXT",
             "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS api_id BIGINT",
             "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS api_hash TEXT",
+            # Purane DB me bot_token par NOT NULL tha -> user account (jisme token nahi hota)
+            # insert hi nahi ho paata tha ("null value in column bot_token violates
+            # not-null constraint"). Ye migration use theek kar deta hai.
+            "ALTER TABLE user_bots ALTER COLUMN bot_token DROP NOT NULL",
         ]
         with self.conn.cursor() as cur:
             for stmt in statements:

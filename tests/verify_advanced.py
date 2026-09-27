@@ -969,7 +969,9 @@ def test_security_and_startup():
     source = open(A.__file__, encoding="utf-8").read()
     check("source: leaked token gone", "AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE" not in source)
     defaults = re.findall(r'os\.getenv\("MAIN_BOT_TOKEN",\s*"([^"]*)"\)', source)
-    check("source: token env default empty", defaults == [""], str(defaults))
+    # (configured_secrets() me bhi wahi getenv hai, isliye saare defaults empty hone chahiye)
+    check("source: token env default empty",
+          len(defaults) >= 1 and all(d == "" for d in defaults), str(defaults))
     check("source: bad token -> clean exit (no restart loop)",
           "raise SystemExit(2)" in source and "MAIN BOT TOKEN reject ho gaya" in source)
     check("source: userbot boot isolated", "async def start_bots_on_boot()" in source)
@@ -1802,6 +1804,21 @@ def test_html_safety_and_welcome_spam():
     raw = re.findall(r"<[a-zA-Z_][a-zA-Z0-9_]*>", A.TELEGRAM_API_HINT)
     check("hint me raw <id>/<hash> nahi", not raw, str(raw))
     check("hint me asli command hai", "TELEGRAM_API_ID=" in A.TELEGRAM_API_HINT)
+
+    # --- purane DB ka NOT NULL constraint (user account insert fail ho jata tha)
+    src_now = open(A.__file__, encoding="utf-8").read()
+    check("migration: bot_token NOT NULL hataya",
+          "ALTER TABLE user_bots ALTER COLUMN bot_token DROP NOT NULL" in src_now)
+    check("migration: insert me bot_token NULL jata hai",
+          "(bot_id, user_id, bot_token, bot_username, is_active," in src_now
+          and "VALUES (%s,%s,NULL,%s,0,'user'" in src_now)
+
+    # --- api_hash jaise literal secrets bhi mask hone chahiye
+    import os as _os
+    _os.environ["TELEGRAM_API_HASH"] = "d927c13beaaf5110f25c505b7c071273"
+    masked = A.mask_secrets("fail: DETAIL: Failing row contains (ua1, 1, null, d927c13beaaf5110f25c505b7c071273)")
+    check("mask: api_hash chhupa", "d927c13beaaf5110f25c505b7c071273" not in masked, masked[:80])
+    _os.environ.pop("TELEGRAM_API_HASH", None)
 
     # --- example/dummy api values par saaf message (Telegram ka asli error)
     fake_status = ("error:The api_id/api_hash combination is invalid "
