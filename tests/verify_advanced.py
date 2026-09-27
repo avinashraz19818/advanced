@@ -547,9 +547,10 @@ FAKE_SESSION = _fake_session_string()
 class FakeTLClient:
     """Telethon client ka chhota jhootha version (koi network nahi)."""
 
-    def __init__(self, authorized=True, me_id=123, me_username="acct", mode="ok"):
+    def __init__(self, authorized=True, me_id=123, me_username="acct", mode="ok", me_premium=None):
         self.authorized = authorized
-        self.me = SimpleNamespace(id=me_id, username=me_username, bot=False)
+        self.me = SimpleNamespace(id=me_id, username=me_username, bot=False, premium=me_premium)
+        self.emoji_rejects = 0   # custom (premium) emoji reject kitni baar hua
         self.mode = mode          # ok | password | bad_code | bad_password | blocked | flood
         self.connected = False
         self.disconnected = False
@@ -601,12 +602,23 @@ class FakeTLClient:
             raise PasswordHashInvalidError(None)
         if self.mode == "bad_code" and code is not None:
             raise PhoneCodeInvalidError(None)
+        if self.mode == "expired_code" and code is not None:
+            raise PhoneCodeExpiredError(None)
         if self.mode == "bad_password" and password is not None:
             raise PasswordHashInvalidError(None)
         return self.me
 
     # --- sending
+    def _maybe_reject_emoji(self, text):
+        """Server log wali error: custom emoji (tg-emoji) bhejne par poora message fail."""
+        if self.mode == "doc_invalid" and "tg-emoji" in (text or ""):
+            self.emoji_rejects += 1
+            raise type("DocumentInvalidError", (Exception,), {})(
+                "The document file was invalid and can't be used in inline mode "
+                "(caused by SendMessageRequest)")
+
     async def send_message(self, chat_id, text, **kw):
+        self._maybe_reject_emoji(text)
         if self.mode == "blocked":
             raise type("UserIsBlockedError", (Exception,), {})("You blocked this user")
         if self.mode == "flood":
@@ -615,6 +627,7 @@ class FakeTLClient:
         return SimpleNamespace(id=len(self.sent_messages))
 
     async def send_file(self, chat_id, file, **kw):
+        self._maybe_reject_emoji(kw.get("caption"))
         if self.mode == "flood":
             raise type("PeerFloodError", (Exception,), {})("Too many requests")
         if self.mode == "blocked":
@@ -2119,6 +2132,99 @@ def test_user_account_dm_start():
     check("dm: same stranger ko dobara nahi (spam band)", fake2.sent_messages == [])
 
 
+def test_user_account_premium_emoji_fallback():
+    print("\n[18] custom emoji reject -> plain emoji fallback (\"DM me panel nahi ja paya\" fix)")
+    A.reset_premium_styling_state()
+    A._UA_PREMIUM_EMOJI_OK.clear()
+    A.db.user_bots = [{"bot_id": "ua8394878310", "user_id": A.ADMIN_USER_ID, "account_type": "user",
+                       "bot_username": None, "phone": "+19312837172", "bot_token": None,
+                       "session_string": FAKE_SESSION, "api_id": 1, "api_hash": "h"}]
+    A.db.subs = {"ua8394878310": {"subscription_type": "Basic",
+                                  "expiry_date": A.now_aware() + timedelta(days=30), "max_channels": 1}}
+    A.db.bot_channels = []
+    A._UA_SUPPORT_GREETED.clear()
+    premium_tag = A.pp("👤")
+    check("setup: pp() premium tag deta hai", "tg-emoji" in premium_tag, premium_tag[:60])
+
+    # --- case 1: account Premium nahi hai -> pehle se plain (koi fail nahi)
+    fake = FakeTLClient(me_id=8394878310, mode="doc_invalid", me_premium=False)
+    sender = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake, phone="+19312837172",
+                                 account_user_id=8394878310, premium=False)
+    check("non-premium: flag set", A._UA_PREMIUM_EMOJI_OK["ua8394878310"] is False)
+    run(sender.send_message(8394878310, f"{A.pp('👤')} <b>Hi</b>", parse_mode="HTML"))
+    check("non-premium: pehli koshish me hi chala", fake.emoji_rejects == 0, str(fake.emoji_rejects))
+    sent = fake.sent_messages[-1]["text"]
+    check("non-premium: tg-emoji hata", "tg-emoji" not in sent, sent[:80])
+    check("non-premium: emoji bacha", "👤" in sent and "<b>Hi</b>" in sent, sent[:80])
+
+    # --- case 2: premium pata nahi -> pehli koshish fail, plain se retry chalta hai
+    A._UA_PREMIUM_EMOJI_OK.clear()
+    fake2 = FakeTLClient(me_id=8394878310, mode="doc_invalid")
+    sender2 = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake2,
+                                  account_user_id=8394878310)
+    check("unknown: flag shuru me True", A._UA_PREMIUM_EMOJI_OK.get("ua8394878310") is None)
+    res = run(sender2.send_message(8394878310, f"{A.pp('🔔')} <b>Welcome</b>", parse_mode="HTML"))
+    check("unknown: retry se message gaya", res is not None and len(fake2.sent_messages) == 1,
+          str(fake2.sent_messages)[:120])
+    check("unknown: ek hi reject (log spam nahi)", fake2.emoji_rejects == 1, str(fake2.emoji_rejects))
+    final = fake2.sent_messages[-1]["text"]
+    check("unknown: plain emoji wala text", "tg-emoji" not in final and "🔔" in final, final[:80])
+    check("unknown: note ek baar log hua", A._UA_PREMIUM_EMOJI_OK["ua8394878310"] is False)
+
+    # agli baar sidha plain - dobara fail nahi
+    fake2.sent_messages.clear()
+    run(sender2.send_message(8394878310, f"{A.pp('🔔')} dobara", parse_mode="HTML"))
+    check("unknown: agli baar bina fail", fake2.emoji_rejects == 1 and len(fake2.sent_messages) == 1,
+          f"rejects={fake2.emoji_rejects} sent={len(fake2.sent_messages)}")
+
+    # --- case 3: /start ka panel DM bhi pahunchta hai (yehi user ki problem thi)
+    A._UA_PREMIUM_EMOJI_OK.clear()
+    fake3 = FakeTLClient(me_id=8394878310, mode="doc_invalid")
+    sender3 = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake3,
+                                  account_user_id=8394878310)
+    handled = run(A._ua_handle_owner_start(sender3, "ua8394878310", A.ADMIN_USER_ID,
+                                           FakeMsg(text="/start"), "/start"))
+    check("dm panel: handled", handled is True)
+    check("dm panel: panel pahunch gaya", any("MANAGE USER ACCOUNT" in m["text"] for m in fake3.sent_messages),
+          str([m["text"][:50] for m in fake3.sent_messages]))
+    check("dm panel: panel me tg-emoji nahi", all("tg-emoji" not in m["text"] for m in fake3.sent_messages))
+    check("dm panel: reply bhi gaya", fake3.sent_messages[-1].get("reply_to") is not None)
+
+    # --- case 4: caption (media) aur album caption me bhi fallback
+    A._UA_PREMIUM_EMOJI_OK.clear()
+    fake4 = FakeTLClient(me_id=8394878310, mode="doc_invalid")
+    sender4 = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake4,
+                                  account_user_id=8394878310)
+    run(sender4.send_photo(8394878310, "/tmp/does-not-exist.jpg",
+                           caption=f"{A.pp('📊')} Report", parse_mode="HTML"))
+    check("caption: fallback se gaya", len(fake4.sent_files) == 1, str(fake4.sent_files)[:100])
+    check("caption: tg-emoji nahi",
+          "tg-emoji" not in (fake4.sent_files[-1].get("caption") or ""),
+          str(fake4.sent_files[-1].get("caption"))[:80])
+
+    # --- case 5: code expire ho jaye to saaf message (PhoneCodeExpiredError -> rasta saaf)
+    A._UA_LOGINS[4242] = {"step": "code", "client": FakeTLClient(mode="expired_code"),
+                          "phone": "+19312837172", "phone_code_hash": "h1", "operator": 4242}
+    status = run(A.ua_login_submit_code(4242, "12345"))
+    check("expired code: status sahi", status == "error:code_expired", str(status))
+    check("expired code: message me kya karna hai",
+          "expire" in A._ua_login_error(status).lower(), A._ua_login_error(status)[:80])
+    A._UA_LOGINS.pop(4242, None)
+
+    # --- case 6: koi aur error (network) ho to waisa hi raise ho (chhupana nahi)
+    A._UA_PREMIUM_EMOJI_OK.clear()
+    fake5 = FakeTLClient(me_id=8394878310, mode="flood")
+    sender5 = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake5,
+                                  account_user_id=8394878310)
+    raised = None
+    try:
+        run(sender5.send_message(8394878310, f"{A.pp('🔔')} x", parse_mode="HTML"))
+    except Exception as ex:
+        raised = ex
+    check("flood: fallback nahi (error raise hua)", raised is not None, str(raised))
+    check("flood: flag waisa hi", A._UA_PREMIUM_EMOJI_OK.get("ua8394878310") is not False)
+
+
 def test_user_account_owner_flow_adapter():
     print("\n[16] user account owner flows (main bot ke messages se)")
     A.reset_premium_styling_state()
@@ -2274,6 +2380,7 @@ def main():
     test_subscription_picker_and_style_memory()
     test_user_account_owner_flow_adapter()
     test_user_account_dm_start()
+    test_user_account_premium_emoji_fallback()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:

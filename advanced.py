@@ -125,6 +125,7 @@ def reset_premium_styling_state():
     """Tests / diagnostics ke liye."""
     _style_state["failures"] = 0
     _style_state["disabled"] = False
+    _UA_PREMIUM_EMOJI_OK.clear()  # user account ka premium-emoji switch bhi reset
 
 
 def note_premium_failure(ex) -> bool:
@@ -4911,6 +4912,39 @@ _UA_GONE_ERRORS = ("UserIsBlockedError", "YouBlockedUserError", "UserPrivacyRest
 _UA_LIMIT_ERRORS = ("PeerFloodError",)
 
 
+# User account se custom (premium) emoji bhejna Telegram reject kar deta hai jab account
+# Premium na ho ya woh emoji set usne install na kiya ho:
+#   "The document file was invalid and can't be used in inline mode (caused by SendMessageRequest)"
+# Isliye reject hone par plain emoji par switch kar jate hain - warna poora message hi fail
+# ho jata tha (jaise /start ka panel DM: "kuch nhi aa rha").
+_UA_PREMIUM_EMOJI_OK: Dict[str, bool] = {}
+_UA_EMOJI_ERROR_HINTS = ("document file was invalid", "document_invalid",
+                         "can't be used in inline mode", "documentinvalid")
+
+
+def _ua_custom_emoji_rejected(ex) -> bool:
+    """Custom emoji/document ki wajah se aaya error? (type + message dono se check)"""
+    if type(ex).__name__ in ("DocumentInvalidError", "DocumentInvalid"):
+        return True
+    text = str(ex or "").lower()
+    return any(hint in text for hint in _UA_EMOJI_ERROR_HINTS)
+
+
+def _ua_premium_emoji_allowed(bot_id: str) -> bool:
+    """Is account se custom emoji jate hain? (default: pata nahi -> haan, try karenge)"""
+    return _UA_PREMIUM_EMOJI_OK.get(bot_id, True)
+
+
+def _ua_note_emoji_reject(bot_id: str, ex) -> bool:
+    """Ek hi baar note (log spam nahi). True = ye naya reject tha."""
+    if _UA_PREMIUM_EMOJI_OK.get(bot_id) is False:
+        return False
+    _UA_PREMIUM_EMOJI_OK[bot_id] = False
+    logging.info(f"{bot_id}: is account se custom (premium) emoji nahi ja rahe "
+                 f"({mask_secrets(ex)}) - ab plain emoji me bhejenge, baaki message waisa hi rahega")
+    return True
+
+
 def translate_ua_error(ex):
     """Telethon exception ko PTB-style exception me badlo (warna caller confuse ho jata hai)."""
     name = type(ex).__name__
@@ -4956,7 +4990,8 @@ class UserAccountSender:
     kind = "user"
 
     def __init__(self, bot_id: str, owner_id: int, client, phone: str = "",
-                 username: Optional[str] = None, account_user_id: int = 0):
+                 username: Optional[str] = None, account_user_id: int = 0,
+                 premium: Optional[bool] = None):
         self.bot_id = bot_id
         self.owner_id = owner_id
         self.client = client
@@ -4964,7 +4999,12 @@ class UserAccountSender:
         self.username = username
         self.id = int(account_user_id or 0)
         self.token = ""  # sendable_media_id / cache keys ise dhoondhte hain
+        self.premium = premium
         self._button_note_logged = False
+        if premium is False:
+            # Non-Premium account custom emoji bhej hi nahi sakta - shuru se plain mode
+            # (warna har message ek baar fail hota aur phir retry)
+            _UA_PREMIUM_EMOJI_OK[bot_id] = False
 
     # ---------- helpers ----------
     def _markup_to_links(self, markup) -> str:
@@ -5029,21 +5069,40 @@ class UserAccountSender:
         """
         if reply_markup is not None:
             text = (text or "") + self._markup_to_links(reply_markup)
+        return await self._send_text(chat_id, text, parse_mode=parse_mode, reply_to=reply_to)
+
+    # ---------- premium emoji fallback ----------
+    def _premium_ok(self) -> bool:
+        return _ua_premium_emoji_allowed(self.bot_id)
+
+    def _downgrade_premium(self, text):
+        """Account custom emoji nahi bhej sakta to tg-emoji tags hata do (plain emoji rehta hai)."""
+        if not text or self._premium_ok():
+            return text
+        return strip_premium_emojis(text)
+
+    async def _send_text(self, chat_id, text, parse_mode=None, reply_to=None):
+        """Text bhejo; custom emoji reject ho to ek hi baar plain emoji se dobara try."""
+        text = self._downgrade_premium(text) or ""
+        html = "html" if parse_mode == ParseMode.HTML else None
         await self._throttle(chat_id)
-        return await _ua_wrap(self.client.send_message(
-            int(chat_id), text or "",
-            parse_mode="html" if parse_mode == ParseMode.HTML else None,
-            link_preview=False, reply_to=reply_to))
+        try:
+            return await _ua_wrap(self.client.send_message(
+                int(chat_id), text, parse_mode=html, link_preview=False, reply_to=reply_to))
+        except Exception as ex:
+            plain = strip_premium_emojis(text)
+            if plain == text or not _ua_custom_emoji_rejected(ex):
+                raise
+            _ua_note_emoji_reject(self.bot_id, ex)
+            await self._throttle(chat_id)
+            return await _ua_wrap(self.client.send_message(
+                int(chat_id), plain, parse_mode=html, link_preview=False, reply_to=reply_to))
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None,
                            disable_web_page_preview=None, **kwargs):
         if reply_markup is not None:
             text = (text or "") + self._markup_to_links(reply_markup)
-        await self._throttle(chat_id)
-        return await _ua_wrap(self.client.send_message(
-            int(chat_id), text or "",
-            parse_mode="html" if parse_mode == ParseMode.HTML else None,
-            link_preview=False))
+        return await self._send_text(chat_id, text, parse_mode=parse_mode)
 
     async def _send_media(self, chat_id, media, caption=None, parse_mode=None,
                           reply_markup=None, force_document=False, voice_note=False,
@@ -5056,11 +5115,23 @@ class UserAccountSender:
                 return await self.send_message(chat_id, caption, parse_mode=ParseMode.HTML)
             return None
         await self._throttle(chat_id)
-        return await _ua_wrap(self.client.send_file(
-            int(chat_id), file, caption=caption or None,
-            parse_mode="html" if caption else None,
-            force_document=force_document,
-            voice_note=voice_note, video_note=video_note))
+
+        async def _do(cap):
+            return await _ua_wrap(self.client.send_file(
+                int(chat_id), file, caption=cap or None,
+                parse_mode="html" if cap else None,
+                force_document=force_document,
+                voice_note=voice_note, video_note=video_note))
+
+        caption = self._downgrade_premium(caption)
+        try:
+            return await _do(caption)
+        except Exception as ex:
+            plain = strip_premium_emojis(caption or "")
+            if plain == (caption or "") or not _ua_custom_emoji_rejected(ex):
+                raise
+            _ua_note_emoji_reject(self.bot_id, ex)
+            return await _do(plain)
 
     async def send_photo(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
         return await self._send_media(chat_id, media, caption, parse_mode, reply_markup, **kw)
@@ -5105,11 +5176,22 @@ class UserAccountSender:
         if reply_markup is not None:
             album_caption = (album_caption or "") + self._markup_to_links(reply_markup)
         await self._throttle(chat_id)
-        if len(files) == 1:
-            return await _ua_wrap(self.client.send_file(int(chat_id), files[0], caption=album_caption or None,
-                                                        parse_mode="html" if album_caption else None))
-        return await _ua_wrap(self.client.send_file(int(chat_id), files, caption=album_caption or None,
-                                                    parse_mode="html" if album_caption else None))
+        target = files[0] if len(files) == 1 else files
+
+        async def _do(cap):
+            return await _ua_wrap(self.client.send_file(
+                int(chat_id), target, caption=cap or None,
+                parse_mode="html" if cap else None))
+
+        album_caption = self._downgrade_premium(album_caption)
+        try:
+            return await _do(album_caption)
+        except Exception as ex:
+            plain = strip_premium_emojis(album_caption or "")
+            if plain == (album_caption or "") or not _ua_custom_emoji_rejected(ex):
+                raise
+            _ua_note_emoji_reject(self.bot_id, ex)
+            return await _do(plain)
 
     async def delete_message(self, chat_id, message_id, **kw):
         """Panel se message delete karne wale flows ke liye (best effort)."""
@@ -5226,10 +5308,12 @@ async def start_user_account(bot_id: str, owner_id: int = 0, row: Optional[dict]
                 await _ua_disconnect(client)
                 return False
             me = await client.get_me()
+            premium_flag = getattr(me, "premium", None)
             sender = UserAccountSender(bot_id, owner_id, client,
                                        phone=row.get("phone") or "",
                                        username=getattr(me, "username", None),
-                                       account_user_id=getattr(me, "id", 0))
+                                       account_user_id=getattr(me, "id", 0),
+                                       premium=premium_flag)
             _register_user_account_handlers(client, sender, bot_id, owner_id)
             user_account_clients[bot_id] = sender
             task = asyncio.create_task(client.run_until_disconnected())
@@ -5243,6 +5327,9 @@ async def start_user_account(bot_id: str, owner_id: int = 0, row: Optional[dict]
             name = f"@{me.username}" if getattr(me, "username", None) else (row.get("phone") or bot_id)
             logging.info(f"{pp('✅')} User account {name} chalu ho gaya ({bot_id}) - panel ke liye isi "
                          f"account se (ya manager account se) main bot me /start karo")
+            if premium_flag is False:
+                logging.info(f"{bot_id}: account Premium nahi hai - custom (premium) emoji ki jagah "
+                             f"plain emoji bhejenge (Telegram inhe reject karta hai)")
             try:
                 for ch in db.get_bot_channels(bot_id) or []:
                     await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], sender)
