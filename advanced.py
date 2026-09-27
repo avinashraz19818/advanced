@@ -126,6 +126,7 @@ def reset_premium_styling_state():
     _style_state["failures"] = 0
     _style_state["disabled"] = False
     _UA_PREMIUM_EMOJI_OK.clear()  # user account ka premium-emoji switch bhi reset
+    _UA_SEND_MODE.clear()         # direct / saved-forward ka yaad-rakha rasta bhi reset
 
 
 def note_premium_failure(ex) -> bool:
@@ -299,7 +300,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-09-27-r14"
+BUILD_TAG = "2026-09-27-r15"
 START_TS = time.time()
 # User account subscription ke bina bhi online rahe? (owner ka apna account hai, DM/panel
 # chalta rehna chahiye). Purana behaviour chahiye to .env me UA_START_WITHOUT_SUBSCRIPTION=0
@@ -775,6 +776,10 @@ def build_diag_text() -> str:
             lines.append(f"   {pe('🛰')} raw updates: {sender.raw_updates}"
                          f" | {mode}"
                          f"{f' | last: {sender.last_dm_text!r}' if sender.last_dm_text else ''}")
+            route = _UA_SEND_MODE.get(bot_id, "direct")
+            lines.append(f"   {pe('📤')} bhejne ka rasta: "
+                         f"{'Saved Messages → forward' if route == 'saved' else 'direct'}"
+                         f"{f' | aakhri error: {sender.last_error}' if getattr(sender, 'last_error', None) else ''}")
         else:
             lines.append(f"   {pe('⚠️')} account band hai - 10 min wala retry job ise chalu karega")
         lines.append(f"   {pe('⭐️')} plan: {plan}")
@@ -805,7 +810,9 @@ def build_diag_text() -> str:
 def diag_kb() -> InlineKeyboardMarkup:
     rows = []
     for bot_id in list(user_account_clients.keys())[:5]:
-        rows.append([btn("Test DM bhejo", f"diag_test_{bot_id}", "success", "🧪")])
+        rows.append([btn("Test DM (auto)", f"diag_test_{bot_id}", "success", "🧪")])
+        rows.append([btn("Test DM (direct)", f"diag_dm_{bot_id}_direct", "primary", "1️⃣"),
+                     btn("Test DM (saved)", f"diag_dm_{bot_id}_saved", "primary", "2️⃣")])
     rows.append([btn("Unreachable reset", "diag_reset_unreachable", "success", "🧹")])
     rows.append([btn("Refresh", "admin_diag", "primary", "🔄")])
     rows.append([btn("Admin Panel", "admin_panel", "primary", "👑")])
@@ -5070,11 +5077,13 @@ def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str, *, ua_available
 
     Return True = caller yahin ruk jaye (aage ke messages bhejne ka fayda nahi).
     """
+    note = dm_error_note(ex)
     if isinstance(ex, (NetworkError, TimedOut)):
         logging.warning(f"{kind} network hiccup (transient): {mask_secrets(ex)}")
         return True
     if isinstance(ex, AccountLimitedError):
-        logging.warning(f"{kind}: account limited (flood) - is session me ruk gaya ({mask_secrets(ex)})")
+        logging.warning(f"{kind}: account limited (flood) - {mask_secrets(ex)}"
+                        f"{' | ' + note if note else ''}")
         return True
     if is_dm_initiate_blocked(ex) and not ua_available:
         # Bot DM shuru nahi kar sakta aur koi user account bhi nahi. Permanent mark NAHI karte:
@@ -5090,9 +5099,12 @@ def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str, *, ua_available
     if is_user_gone_error(ex) or isinstance(ex, Forbidden):
         db.mark_unreachable(bot_id, user_id)
         db.mark_permanently_unreachable(bot_id, user_id, str(ex))
-        logging.warning(f"{kind} skip (user {user_id} reachable nahi): {mask_secrets(ex)}")
+        logging.warning(f"{kind} skip (user {user_id} reachable nahi): "
+                        f"{type(ex).__name__}: {mask_secrets(ex)}"
+                        f"{' | ' + note if note else ''}")
         return True
-    logging.error(f"{kind} error: {mask_secrets(ex)}")
+    logging.error(f"{kind} error: {type(ex).__name__}: {mask_secrets(ex)}"
+                  f"{' | ' + note if note else ''}")
     return False
 
 
@@ -5220,6 +5232,57 @@ def _ua_premium_emoji_allowed(bot_id: str) -> bool:
     return _UA_PREMIUM_EMOJI_OK.get(bot_id, True)
 
 
+_UA_SEND_MODE: Dict[str, str] = {}   # bot_id -> "direct" | "saved" (Saved Messages se forward)
+
+
+def _ua_should_try_other_strategy(ex) -> bool:
+    """Is error ke baad doosra rasta (Saved Messages -> forward) try karein?
+
+    Forbidden (user ne block kiya / user gone) aur flood-limit par nahi - warna account par
+    spam-report lag sakti hai.
+    """
+    if isinstance(ex, (Forbidden, AccountLimitedError)):
+        return False
+    text = str(ex or "").lower()
+    if "flood" in text or "too many requests" in text:
+        return False
+    return True
+
+
+def _ua_note_send_mode(bot_id: str, mode: str):
+    """Kaunsi strategy chali - ek hi baar log karo (log spam nahi)."""
+    prev = _UA_SEND_MODE.get(bot_id)
+    _UA_SEND_MODE[bot_id] = mode
+    if prev == mode:
+        return
+    if mode == "saved":
+        logging.info(f"{bot_id}: direct DM nahi ja rahi - Saved Messages me daal kar forward "
+                     f"kar rahe hain (agli baar bhi isi raste se; Telegram cold-DM rok raha hai)")
+    elif prev == "saved":
+        logging.info(f"{bot_id}: direct DM phir se chal rahi hai - ab seedha bhejenge")
+
+
+def dm_error_note(ex) -> str:
+    """Error ke saath ek line ka rasta (user ko kya karna hai)."""
+    text = str(ex or "").lower()
+    if "flood" in text or "too many requests" in text:
+        return "Telegram ne account par flood-limit lagayi hai - kuch ghante ruk kar dobara try karo"
+    if "mutual contact" in text:
+        return ("Telegram naye/limited account se stranger DM rok raha hai - account ko warm karo "
+                "(us account se khud kuch chats karo) ya Saved-forward rasta use karo")
+    if "could not find the input entity" in text or "peer_id_invalid" in text:
+        return ("Telegram ko us user ki entity nahi mili - join request/leave wale update se milti hai, "
+                "isliye wahi account us channel se DM kar sakta hai")
+    if "blocked" in text:
+        return "user ne is account ko block kiya hai (respect karte hain, spam nahi bhejenge)"
+    if "initiate" in text:
+        return ("bot DM shuru nahi kar sakta (user ne bot ko /start nahi kiya) - "
+                "owner ka user account add karo to DM jaane lagegi")
+    if "document" in text and "invalid" in text:
+        return "custom/premium emoji wala message Telegram ne reject kiya - plain emoji me bhejenge"
+    return ""
+
+
 def _ua_note_emoji_reject(bot_id: str, ex) -> bool:
     """Ek hi baar note (log spam nahi). True = ye naya reject tha."""
     if _UA_PREMIUM_EMOJI_OK.get(bot_id) is False:
@@ -5313,6 +5376,7 @@ class UserAccountSender:
         self._button_note_logged = False
         # diagnostics (/diag) ke liye
         self.connected_at = None
+        self.last_error = None      # /diag ke liye: aakhri send ka error (class name sameth)
         self.raw_updates = 0
         self.dm_count = 0
         self.last_dm_at = None
@@ -5398,23 +5462,67 @@ class UserAccountSender:
             return text
         return strip_premium_emojis(text)
 
+    async def _try_strategies(self, chat_id, payload, strategies, reply_to=None):
+        """Raste ek-ek karke try karo: direct, phir Saved Messages -> forward.
+
+        Jo rasta pehle chal jaye wahi yaad rakh liya jata hai (agli baar wahi pehle).
+        Custom emoji reject ho to usi raste me plain emoji se dobara try hota hai.
+        """
+        mode = _UA_SEND_MODE.get(self.bot_id, "direct")
+        order = ["saved", "direct"] if mode == "saved" else ["direct", "saved"]
+        plain_payload = strip_premium_emojis(payload or "")
+        last_ex = None
+        for name in order:
+            fn = strategies.get(name)
+            if fn is None:
+                continue
+            bodies = [payload] if plain_payload == payload else [payload, plain_payload]
+            for idx, body in enumerate(bodies):
+                try:
+                    res = await fn(body)
+                except Exception as ex:
+                    last_ex = ex
+                    self.last_error = f"{type(ex).__name__}: {mask_secrets(ex)}"
+                    if idx == 0 and _ua_custom_emoji_rejected(ex):
+                        _ua_note_emoji_reject(self.bot_id, ex)
+                        continue
+                    if not _ua_should_try_other_strategy(ex):
+                        raise
+                    note = dm_error_note(ex)
+                    logging.debug(f"{self.bot_id}: {name} strategy se DM nahi gayi "
+                                  f"({mask_secrets(ex)}) - agla rasta try kar rahe hain"
+                                  f"{' | ' + note if note else ''}")
+                    break
+                else:
+                    self.last_error = None
+                    _ua_note_send_mode(self.bot_id, name)
+                    return res
+        if last_ex is not None:
+            raise last_ex
+        return None
+
     async def _send_text(self, chat_id, text, parse_mode=None, reply_to=None):
-        """Text bhejo; custom emoji reject ho to ek hi baar plain emoji se dobara try."""
+        """Text bhejo: seedha, na chale to Saved Messages me daal kar forward."""
         text = self._downgrade_premium(text) or ""
         html = "html" if parse_mode == ParseMode.HTML else None
         await self._throttle(chat_id)
-        try:
+
+        async def _direct(body):
             res = await _ua_wrap(self.client.send_message(
-                int(chat_id), text, parse_mode=html, link_preview=False, reply_to=reply_to))
+                int(chat_id), body, parse_mode=html, link_preview=False, reply_to=reply_to))
             return _UASentMessage(res, chat_id)
-        except Exception as ex:
-            plain = strip_premium_emojis(text)
-            if plain == text or not _ua_custom_emoji_rejected(ex):
-                raise
-            _ua_note_emoji_reject(self.bot_id, ex)
-            await self._throttle(chat_id)
-            return _UASentMessage(await _ua_wrap(self.client.send_message(
-                int(chat_id), plain, parse_mode=html, link_preview=False, reply_to=reply_to)), chat_id)
+
+        async def _saved(body):
+            # pehle apne Saved Messages me, phir wahi message user ko forward (user ka idea)
+            saved = await _ua_wrap(self.client.send_message("me", body, parse_mode=html,
+                                                            link_preview=False))
+            fwd = await _ua_wrap(self.client.forward_messages(int(chat_id), saved, from_peer="me"))
+            if isinstance(fwd, (list, tuple)):
+                fwd = fwd[0] if fwd else saved
+            return _UASentMessage(fwd, chat_id)
+
+        return await self._try_strategies(chat_id, text,
+                                          {"direct": _direct, "saved": _saved}, reply_to=reply_to)
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None,
                            disable_web_page_preview=None, **kwargs):
@@ -5434,7 +5542,7 @@ class UserAccountSender:
             return None
         await self._throttle(chat_id)
 
-        async def _do(cap):
+        async def _direct(cap):
             res = await _ua_wrap(self.client.send_file(
                 int(chat_id), file, caption=cap or None,
                 parse_mode="html" if cap else None,
@@ -5442,15 +5550,19 @@ class UserAccountSender:
                 voice_note=voice_note, video_note=video_note))
             return _UASentMessage(res, chat_id)
 
+        async def _saved(cap):
+            # Saved Messages me daal kar forward - media dobara upload nahi hoti
+            saved = await _ua_wrap(self.client.send_file(
+                "me", file, caption=cap or None, parse_mode="html" if cap else None,
+                force_document=force_document, voice_note=voice_note, video_note=video_note))
+            fwd = await _ua_wrap(self.client.forward_messages(int(chat_id), saved, from_peer="me"))
+            if isinstance(fwd, (list, tuple)):
+                fwd = fwd[0] if fwd else saved
+            return _UASentMessage(fwd, chat_id)
+
         caption = self._downgrade_premium(caption)
-        try:
-            return await _do(caption)
-        except Exception as ex:
-            plain = strip_premium_emojis(caption or "")
-            if plain == (caption or "") or not _ua_custom_emoji_rejected(ex):
-                raise
-            _ua_note_emoji_reject(self.bot_id, ex)
-            return await _do(plain)
+        return await self._try_strategies(chat_id, caption,
+                                          {"direct": _direct, "saved": _saved})
 
     async def send_photo(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
         return await self._send_media(chat_id, media, caption, parse_mode, reply_markup, **kw)
@@ -5497,21 +5609,23 @@ class UserAccountSender:
         await self._throttle(chat_id)
         target = files[0] if len(files) == 1 else files
 
-        async def _do(cap):
+        async def _direct(cap):
             res = await _ua_wrap(self.client.send_file(
                 int(chat_id), target, caption=cap or None,
                 parse_mode="html" if cap else None))
             return _UASentMessage(res, chat_id)
 
+        async def _saved(cap):
+            saved = await _ua_wrap(self.client.send_file(
+                "me", target, caption=cap or None, parse_mode="html" if cap else None))
+            fwd = await _ua_wrap(self.client.forward_messages(int(chat_id), saved, from_peer="me"))
+            if isinstance(fwd, (list, tuple)):
+                fwd = fwd[0] if fwd else saved
+            return _UASentMessage(fwd, chat_id)
+
         album_caption = self._downgrade_premium(album_caption)
-        try:
-            return await _do(album_caption)
-        except Exception as ex:
-            plain = strip_premium_emojis(album_caption or "")
-            if plain == (album_caption or "") or not _ua_custom_emoji_rejected(ex):
-                raise
-            _ua_note_emoji_reject(self.bot_id, ex)
-            return await _do(plain)
+        return await self._try_strategies(chat_id, album_caption,
+                                          {"direct": _direct, "saved": _saved})
 
     async def delete_message(self, chat_id, message_id, **kw):
         """Panel se message delete karne wale flows ke liye (best effort)."""
@@ -7256,6 +7370,52 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          parse_mode=ParseMode.HTML, reply_markup=diag_kb())
             return
 
+        if data.startswith("diag_dm_"):
+            if not is_admin(uid):
+                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
+                return
+            payload = data.replace("diag_dm_", "")
+            mode, test_bot_id = "auto", payload
+            for m in ("direct", "saved"):
+                if payload.endswith("_" + m):
+                    mode, test_bot_id = m, payload[:-(len(m) + 1)]
+                    break
+            sender = user_account_clients.get(test_bot_id)
+            if sender is None:
+                await safe_edit_message_text(
+                    q, f"{pe('❌')} <code>{test_bot_id}</code> chalu nahi hai - pehle connect hone do.",
+                    parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+                return
+            label = "Saved Messages → forward" if mode == "saved" else "direct"
+            prev_mode = _UA_SEND_MODE.get(test_bot_id)
+            _UA_SEND_MODE[test_bot_id] = mode
+            ok, why = True, ""
+            try:
+                await sender.send_to_chat(
+                    uid, f"{pe('🧪')} Test DM ({label}) - <code>{test_bot_id}</code> se.\n"
+                         f"{pe('🕒')} {now_aware().strftime('%Y-%m-%d %H:%M:%S')}",
+                    parse_mode=ParseMode.HTML)
+            except Exception as ex:
+                ok, why = False, f"{type(ex).__name__}: {mask_secrets(ex)}"
+            finally:
+                if prev_mode is None:
+                    _UA_SEND_MODE.pop(test_bot_id, None)
+                else:
+                    _UA_SEND_MODE[test_bot_id] = prev_mode
+            logging.info(f"{test_bot_id}: diag test DM ({label}) -> {uid}: "
+                         f"{'ok' if ok else 'FAIL ' + why}")
+            if ok:
+                note = (f"{pe('✅')} Test DM bhej diya ({label}) - apne DM me dekho. "
+                        f"Ye rasta chal raha hai.")
+            else:
+                hint = dm_error_note(BadRequest(why))
+                note = (f"{pe('❌')} {label} se DM nahi gayi: <code>{why}</code>"
+                        f"{chr(10) + pe('👉') + ' ' + hint if hint else ''}"
+                        f"{chr(10)}{pe('🧪')} Doosra button (dusra rasta) bhi try karo.")
+            await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
+                                         parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+            return
+
         if data.startswith("diag_test_"):
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
@@ -7276,8 +7436,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          f"{pe('🕒')} {now_aware().strftime('%Y-%m-%d %H:%M:%S')}",
                     parse_mode=ParseMode.HTML)
             except Exception as ex:
-                ok, why = False, mask_secrets(ex)
-            logging.info(f"{test_bot_id}: diag test DM -> {uid}: {'ok' if ok else 'FAIL ' + why}")
+                ok, why = False, f"{type(ex).__name__}: {mask_secrets(ex)}"
+            logging.info(f"{test_bot_id}: diag test DM (auto) -> {uid}: {'ok' if ok else 'FAIL ' + why}")
             note = (f"{pe('✅')} Test DM bhej diya <code>{test_bot_id}</code> se - apne DM me dekho "
                     f"(isi chat me aayega jab account aur ye account alag hon)." if ok else
                     f"{pe('❌')} Test DM fail hua: {why}")

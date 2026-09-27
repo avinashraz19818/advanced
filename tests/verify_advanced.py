@@ -586,6 +586,7 @@ class FakeTLClient:
         self.sign_ins = []
         self.sent_messages = []
         self.sent_files = []
+        self.forwards = []       # Saved Messages -> forward
         self.raw_calls = []
         self.handlers = []
         self.session = SimpleNamespace(save=lambda: FAKE_SESSION)
@@ -637,6 +638,20 @@ class FakeTLClient:
         return self.me
 
     # --- sending
+    def _maybe_direct_fail(self, chat_id):
+        """direct send fail (jaise entity nahi mili / Telegram ne rok di) par 'me' allowed."""
+        if self.mode != "direct_fail":
+            return
+        try:
+            int(chat_id)
+        except Exception:
+            return          # "me" = Saved Messages -> allowed
+        raise ValueError(f"Could not find the input entity for PeerUser(user_id={chat_id})")
+
+    async def forward_messages(self, entity, messages, from_peer=None, **kw):
+        self.forwards.append({"to": entity, "msg": messages, "from_peer": from_peer})
+        return SimpleNamespace(id=900 + len(self.forwards))
+
     def _maybe_reject_emoji(self, text):
         """Server log wali error: custom emoji (tg-emoji) bhejne par poora message fail."""
         if self.mode == "doc_invalid" and "tg-emoji" in (text or ""):
@@ -647,6 +662,7 @@ class FakeTLClient:
 
     async def send_message(self, chat_id, text, **kw):
         self._maybe_reject_emoji(text)
+        self._maybe_direct_fail(chat_id)
         if self.mode == "blocked":
             raise type("UserIsBlockedError", (Exception,), {})("You blocked this user")
         if self.mode == "flood":
@@ -656,6 +672,7 @@ class FakeTLClient:
 
     async def send_file(self, chat_id, file, **kw):
         self._maybe_reject_emoji(kw.get("caption"))
+        self._maybe_direct_fail(chat_id)
         if self.mode == "flood":
             raise type("PeerFloodError", (Exception,), {})("Too many requests")
         if self.mode == "blocked":
@@ -2389,7 +2406,7 @@ def test_diagnostics():
     check("test dm: DM gaya", len(fake.sent_messages) == 1, str(fake.sent_messages)[:80])
     check("test dm: test text", "Test DM" in fake.sent_messages[-1]["text"], fake.sent_messages[-1]["text"][:60])
     check("test dm: manager ko gaya", fake.sent_messages[-1]["chat_id"] == A.ADMIN_USER_ID)
-    check("test dm: log me ok", any("test DM -> " in r.getMessage() and "ok" in r.getMessage()
+    check("test dm: log me ok", any("test DM (auto) -> " in r.getMessage() and ": ok" in r.getMessage()
                                     for r in handler.records),
           str([r.getMessage() for r in handler.records if "test DM" in r.getMessage()])[:120])
     check("test dm: reply me confirm", any("Test DM bhej diya" in (t or "") for t, _ in tq.edits),
@@ -2575,6 +2592,141 @@ class AsyncNoop:
         return True
 
 
+def test_saved_messages_forward():
+    print("\n[22] account se DM: direct -> Saved Messages -> forward (user ka idea)")
+    A.reset_premium_styling_state()
+    A._UA_SEND_MODE.clear()
+    uid = 8394878310
+
+    # --- 1. direct chalti hai to Saved Messages use nahi hoti
+    fake = FakeTLClient(me_id=uid)
+    sender = A.UserAccountSender("ua8394878310", 999, fake, account_user_id=uid)
+    res = run(sender.send_message(777001, "Hello direct", parse_mode="HTML"))
+    check("direct: message gaya", res is not None and res.message_id > 0, str(res))
+    check("direct: forward nahi hua", fake.forwards == [], str(fake.forwards))
+    check("direct: rasta yaad rakha", A._UA_SEND_MODE.get("ua8394878310") == "direct",
+          str(A._UA_SEND_MODE))
+
+    # --- 2. direct fail -> Saved Messages me daal kar forward
+    A._UA_SEND_MODE.clear()
+    fake2 = FakeTLClient(me_id=uid, mode="direct_fail")
+    sender2 = A.UserAccountSender("ua8394878310", 999, fake2, account_user_id=uid)
+    handler, root, old_level = _capture_logs()
+    try:
+        res = run(sender2.send_message(777001, "Hello saved", parse_mode="HTML"))
+    finally:
+        _stop_capture(handler, root, old_level)
+    check("saved: message gaya", res is not None, str(res))
+    check("saved: pehle Saved Messages me daala",
+          bool(fake2.sent_messages) and fake2.sent_messages[0]["chat_id"] == "me",
+          str(fake2.sent_messages)[:120])
+    check("saved: phir user ko forward hua",
+          bool(fake2.forwards) and int(fake2.forwards[-1]["to"]) == 777001
+          and fake2.forwards[-1]["from_peer"] == "me", str(fake2.forwards)[:150])
+    check("saved: forward ka message_id PTB jaisa", res.message_id == 901, str(res.message_id))
+    check("saved: rasta yaad rakha (agli baar saved pehle)",
+          A._UA_SEND_MODE.get("ua8394878310") == "saved", str(A._UA_SEND_MODE))
+    infos = [r.getMessage() for r in handler.records if r.levelno == logging.INFO]
+    check("saved: saaf log line", any("Saved Messages me daal kar forward" in m for m in infos),
+          str(infos)[:200])
+
+    # --- 3. agli baar saved pehle try hoti hai (direct dobara fail nahi karti)
+    fake2.sent_messages.clear()
+    fake2.forwards.clear()
+    run(sender2.send_message(777002, "Second", parse_mode="HTML"))
+    check("saved: agli baar bhi forward se", len(fake2.forwards) == 1, str(fake2.forwards)[:120])
+
+    # --- 4. media bhi saved se forward (file dobara upload nahi)
+    A._UA_SEND_MODE.clear()
+    fake3 = FakeTLClient(me_id=uid, mode="direct_fail")
+    sender3 = A.UserAccountSender("ua8394878310", 999, fake3, account_user_id=uid)
+    run(sender3.send_photo(777003, "/tmp/does-not-exist.jpg", caption="Photo caption"))
+    check("media: Saved Messages me file gayi",
+          bool(fake3.sent_files) and fake3.sent_files[0]["chat_id"] == "me",
+          str(fake3.sent_files)[:120])
+    check("media: forward hui", len(fake3.forwards) == 1, str(fake3.forwards)[:120])
+
+    # --- 5. blocked user -> Saved Messages ki koshish bhi nahi (respect + spam se bacha)
+    A._UA_SEND_MODE.clear()
+    fake4 = FakeTLClient(me_id=uid, mode="blocked")
+    sender4 = A.UserAccountSender("ua8394878310", 999, fake4, account_user_id=uid)
+    raised = None
+    try:
+        run(sender4.send_message(777004, "Hi", parse_mode="HTML"))
+    except Exception as ex:
+        raised = ex
+    check("blocked: error aaya", raised is not None, str(raised))
+    check("blocked: forward nahi kiya", fake4.forwards == [], str(fake4.forwards))
+    check("blocked: Saved Messages me bhi nahi daala", fake4.sent_messages == [], str(fake4.sent_messages))
+    check("blocked: strategy switch nahi",
+          A._UA_SEND_MODE.get("ua8394878310") in (None, "direct"), str(A._UA_SEND_MODE))
+
+    # --- 6. flood -> koi doosra rasta nahi
+    A._UA_SEND_MODE.clear()
+    fake5 = FakeTLClient(me_id=uid, mode="flood")
+    sender5 = A.UserAccountSender("ua8394878310", 999, fake5, account_user_id=uid)
+    raised = None
+    try:
+        run(sender5.send_message(777005, "Hi", parse_mode="HTML"))
+    except Exception as ex:
+        raised = ex
+    check("flood: error aaya", raised is not None, str(raised))
+    check("flood: forward nahi", fake5.forwards == [], str(fake5.forwards))
+
+    # --- 7. error ke saath rasta (dm_error_note) + helpers
+    check("note: flood ka rasta", "flood" in A.dm_error_note(A.AccountLimitedError("PEER_FLOOD")).lower(),
+          A.dm_error_note(A.AccountLimitedError("PEER_FLOOD")))
+    check("note: mutual-contact ka rasta",
+          "warm" in A.dm_error_note(A.BadRequest("You can only send messages to mutual contacts")).lower())
+    check("note: entity ka rasta",
+          "join request" in A.dm_error_note(A.BadRequest("Could not find the input entity for PeerUser")).lower())
+    check("switch: Forbidden par nahi",
+          A._ua_should_try_other_strategy(A.Forbidden("Forbidden: bot was blocked by the user")) is False)
+    check("switch: flood par nahi",
+          A._ua_should_try_other_strategy(A.AccountLimitedError("PeerFlood")) is False)
+    check("switch: entity error par haan",
+          A._ua_should_try_other_strategy(A.BadRequest("Could not find the input entity")) is True)
+
+    # --- 8. /diag me dono test button + aakhri error dikhta hai
+    A.user_account_clients["ua8394878310"] = sender2
+    sender2.last_error = "BadRequest: Could not find the input entity for PeerUser(user_id=777001)"
+    mctx = FakeCtx()
+    mq = FakeQuery(mctx, uid=A.ADMIN_USER_ID)
+    mq.data = "admin_diag"
+    run(A.callback_handler(_fake_update(q=mq, uid=A.ADMIN_USER_ID), mctx))
+    datas = [b.get("callback_data") for _t, kw in mq.edits if kw.get("reply_markup")
+             for row in kw["reply_markup"].to_dict()["inline_keyboard"] for b in row]
+    check("diag: direct test button", "diag_dm_ua8394878310_direct" in datas, str(datas)[:200])
+    check("diag: saved test button", "diag_dm_ua8394878310_saved" in datas, str(datas)[:200])
+    txt = A.strip_premium_emojis(A.build_diag_text())
+    check("diag: bhejne ka rasta dikhta hai", "bhejne ka rasta" in txt, txt[:400])
+    check("diag: aakhri error dikhta hai", "aakhri error" in txt and "PeerUser" in txt, txt[:400])
+
+    # --- 9. saved button dabane par saved rasta hi test hota hai
+    A._UA_SEND_MODE["ua8394878310"] = "direct"
+    fake2.sent_messages.clear()
+    fake2.forwards.clear()
+    tq = FakeQuery(FakeCtx(), uid=A.ADMIN_USER_ID)
+    tq.data = "diag_dm_ua8394878310_saved"
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.callback_handler(_fake_update(q=tq, uid=A.ADMIN_USER_ID), FakeCtx()))
+    finally:
+        _stop_capture(handler, root, old_level)
+    check("saved button: Saved Messages rasta use hua",
+          bool(fake2.forwards) and fake2.sent_messages and fake2.sent_messages[0]["chat_id"] == "me",
+          f"fwd={fake2.forwards} sent={fake2.sent_messages}"[:160])
+    check("saved button: rasta wapas direct hi raha (test ne badla nahi)",
+          A._UA_SEND_MODE.get("ua8394878310") == "direct", str(A._UA_SEND_MODE))
+    check("saved button: reply me confirm",
+          any("Test DM bhej diya" in (t or "") for t, _ in tq.edits), str([t[:40] for t, _ in tq.edits]))
+    check("saved button: log me label", any("diag test DM (Saved Messages" in r.getMessage()
+                                            for r in handler.records),
+          str([r.getMessage() for r in handler.records if "diag test" in r.getMessage()])[:160])
+    A.user_account_clients.pop("ua8394878310", None)
+    A._UA_SEND_MODE.clear()
+
+
 def test_user_account_owner_flow_adapter():
     print("\n[16] user account owner flows (main bot ke messages se)")
     A.reset_premium_styling_state()
@@ -2734,6 +2886,7 @@ def main():
     test_diagnostics()
     test_user_account_boot_without_subscription()
     test_dm_user_account_fallback()
+    test_saved_messages_forward()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:
