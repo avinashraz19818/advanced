@@ -110,6 +110,39 @@ SESSION_RE = re.compile(r"[A-Za-z0-9_\-]{150,}")
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
 
+# Agar Telegram premium emoji document reject kar de (Document_invalid), to wo is bot ke
+# liye permanent hota hai - har message par "styled fail -> plain retry" warning likhne ka
+# koi fayda nahi. Do fail ke baad styling band + simple text (log saaf rehta hai).
+STYLE_FAILURE_LIMIT = 2
+_style_state = {"failures": 0, "disabled": False}
+
+
+def premium_styling_disabled() -> bool:
+    return bool(_style_state.get("disabled"))
+
+
+def reset_premium_styling_state():
+    """Tests / diagnostics ke liye."""
+    _style_state["failures"] = 0
+    _style_state["disabled"] = False
+
+
+def note_premium_failure(ex) -> bool:
+    """True = ye styling ka permanent issue hai (premium emoji/html)."""
+    text = str(ex).lower()
+    markers = ("document_invalid", "unsupported start tag", "can't parse entities",
+               "custom emoji", "button user consent required", "not enough rights to send "
+               "text messages")
+    if not any(m in text for m in markers):
+        return False
+    _style_state["failures"] = _style_state.get("failures", 0) + 1
+    if _style_state["failures"] >= STYLE_FAILURE_LIMIT and not _style_state.get("disabled"):
+        _style_state["disabled"] = True
+        logging.info("premium styling is bot ke liye available nahi hai (Document_invalid) - "
+                     "aage se simple text + plain buttons (log saaf rahega)")
+    return True
+
+
 def configured_secrets() -> list:
     """.env se aaye literal secrets (api_hash jaise) - inhe logs me mask karna hai."""
     out = []
@@ -1583,44 +1616,58 @@ async def safe_edit_message_text(q, *args, **kwargs):
         raw_text = kwargs["text"]
         kwargs["text"] = sanitize_telegram_html(premiumize_ui_emojis(raw_text))
 
+    if premium_styling_disabled():
+        # Styling is bot ke liye kaam nahi karti - seedha plain bhejo (logs clean)
+        return await _plain_edit_message_text(q, raw_text, args, kwargs)
+
     try:
         return await q.edit_message_text(*args, **kwargs)
     except BadRequest as ex:
         if "Message is not modified" in str(ex):
             return None
 
-        logging.warning(f"styled edit_message_text failed ({ex}); retrying plain")
-        plain_text = strip_premium_emojis(raw_text) if raw_text else raw_text
-        plain_kwargs = dict(kwargs)
-        if "reply_markup" in plain_kwargs:
-            plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
-        try:
-            if len(args) > 0:
-                plain_args = list(args)
-                plain_args[0] = plain_text
-                return await q.edit_message_text(*plain_args, **plain_kwargs)
-            else:
-                plain_kwargs["text"] = plain_text
-                return await q.edit_message_text(**plain_kwargs)
-        except Exception as ex2:
-            logging.warning(f"plain edit also failed ({ex2}); falling back to delete+resend")
+        if not note_premium_failure(ex):
+            logging.warning(f"styled edit_message_text failed ({ex}); retrying plain")
+        return await _plain_edit_message_text(q, raw_text, args, kwargs)
 
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        try:
-            send_kwargs = {k: v for k, v in plain_kwargs.items() if k != "text"}
-            return await q.message.chat.send_message(plain_text or "", **send_kwargs)
-        except Exception as send_ex:
-            logging.error(f"safe_edit_message_text fallback send also failed: {send_ex}")
+
+async def _plain_edit_message_text(q, raw_text, args, kwargs):
+    """Plain edit -> fail ho to delete + naya plain message (navigation kabhi na toote)."""
+    plain_text = strip_premium_emojis(raw_text) if raw_text else raw_text
+    plain_kwargs = dict(kwargs)
+    if "reply_markup" in plain_kwargs:
+        plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+    try:
+        if len(args) > 0:
+            plain_args = list(args)
+            plain_args[0] = plain_text
+            return await q.edit_message_text(*plain_args, **plain_kwargs)
+        plain_kwargs["text"] = plain_text
+        return await q.edit_message_text(**plain_kwargs)
+    except BadRequest as ex:
+        if "Message is not modified" in str(ex):
             return None
+        logging.debug(f"plain edit failed ({ex}); delete + resend")
+    except Exception as ex:
+        logging.debug(f"plain edit failed ({ex}); delete + resend")
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    try:
+        send_kwargs = {k: v for k, v in plain_kwargs.items() if k != "text"}
+        return await q.message.chat.send_message(plain_text or "", **send_kwargs)
+    except Exception as send_ex:
+        logging.error(f"safe_edit_message_text fallback send also failed: {send_ex}")
+        return None
 
 
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def send_premium_message(bot, chat_id, text, *args, **kwargs):
     """Send message with PREMIUM emojis (for bot UI/admin messages). Falls back to
     a plain (non-premium) version if Telegram rejects the styled one."""
+    if premium_styling_disabled():
+        return await _plain_send_premium_message(bot, chat_id, text, args, kwargs)
     try:
         premium_text = sanitize_telegram_html(premiumize_ui_emojis(text))
         return await bot.send_message(chat_id, premium_text, *args, **kwargs)
@@ -1628,7 +1675,8 @@ async def send_premium_message(bot, chat_id, text, *args, **kwargs):
         logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
         return None
     except BadRequest as ex:
-        logging.warning(f"styled send_premium_message failed for {chat_id} ({ex}); retrying plain")
+        if not note_premium_failure(ex):
+            logging.warning(f"styled send_premium_message failed for {chat_id} ({ex}); retrying plain")
         try:
             plain_kwargs = dict(kwargs)
             if "reply_markup" in plain_kwargs:
@@ -1645,10 +1693,29 @@ async def send_premium_message(bot, chat_id, text, *args, **kwargs):
         return None
 
 
+async def _plain_send_premium_message(bot, chat_id, text, args, kwargs):
+    """Styling band hone par simple text (premium tags hata ke) bhejo."""
+    plain_kwargs = dict(kwargs)
+    if "reply_markup" in plain_kwargs:
+        plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+    try:
+        return await bot.send_message(chat_id, strip_premium_emojis(text), *args, **plain_kwargs)
+    except Forbidden:
+        logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
+        return None
+    except (NetworkError, TimedOut):
+        raise
+    except Exception as ex:
+        logging.error(f"send_premium_message (plain) failed for {chat_id}: {ex}")
+        return None
+
+
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def reply_premium_message(message, text, *args, **kwargs):
     """Reply with PREMIUM emojis (for bot UI/admin messages). Falls back to a
     plain (non-premium) version if Telegram rejects the styled one."""
+    if premium_styling_disabled():
+        return await _plain_reply_premium_message(message, text, args, kwargs)
     try:
         premium_text = sanitize_telegram_html(premiumize_ui_emojis(text))
         return await message.reply_text(premium_text, *args, **kwargs)
@@ -1656,7 +1723,8 @@ async def reply_premium_message(message, text, *args, **kwargs):
         logging.warning(f"Cannot reply to {message.chat_id}: bot blocked")
         return None
     except BadRequest as ex:
-        logging.warning(f"styled reply_premium_message failed for {message.chat_id} ({ex}); retrying plain")
+        if not note_premium_failure(ex):
+            logging.warning(f"styled reply_premium_message failed for {message.chat_id} ({ex}); retrying plain")
         try:
             plain_kwargs = dict(kwargs)
             if "reply_markup" in plain_kwargs:
@@ -1670,6 +1738,23 @@ async def reply_premium_message(message, text, *args, **kwargs):
         raise
     except Exception as ex:
         logging.error(f"reply_premium_message failed: {ex}")
+        return None
+
+
+async def _plain_reply_premium_message(message, text, args, kwargs):
+    """Styling band hone par simple text reply."""
+    plain_kwargs = dict(kwargs)
+    if "reply_markup" in plain_kwargs:
+        plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+    try:
+        return await message.reply_text(strip_premium_emojis(text), *args, **plain_kwargs)
+    except Forbidden:
+        logging.warning(f"Cannot reply to {message.chat_id}: bot blocked")
+        return None
+    except (NetworkError, TimedOut):
+        raise
+    except Exception as ex:
+        logging.error(f"reply_premium_message (plain) failed: {ex}")
         return None
 
 
@@ -5426,11 +5511,13 @@ async def ua_login_handle_message(msg, uid: int) -> bool:
                 await start_user_bot(None, bot_id, owner_id, quiet=True)
         except Exception as ex:
             logging.warning(f"{bot_id}: login ke baad account start nahi hua: {mask_secrets(ex)}")
-        if is_admin(uid) and owner_id != uid:
+        if is_admin(uid):
+            # apne hi account par bhi ye button chahiye (pehle owner==admin par chhup jata tha)
             await reply_premium_message(
                 msg,
                 f"{pe('📌')} Admin: is user account ko <b>subscription</b> do, tabhi ye chalu hoga.\n"
-                f"{pp('🆔')} <code>{bot_id}</code>",
+                f"{pp('🆔')} <code>{bot_id}</code>\n"
+                f"{pe('💡')} Neeche wala button dabao, phir sirf <code>30 Basic</code> bhejna hai.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [btn("💰 Add Subscription (30 days Basic)", f"admin_quick_sub_{bot_id}", "success", "💰")],
@@ -5840,6 +5927,40 @@ def _admin_add_clear(context):
 
 def admin_add_kb(*rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(list(rows) + [[btn("❌ Cancel", "admin_add_cancel", "danger", "❌")]])
+
+
+async def show_admin_sub_picker(q, context=None):
+    """ADD SUBSCRIPTION: pehle account choose (button), phir sirf "30 Basic" bhejna hai."""
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        await safe_edit_message_text(q, f"{pe('❌')} Koi bot/account nahi mila. Pehle ➕ Add Account karo.",
+                                     parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        return
+    rows = []
+    for b in bots:
+        bot_id = str(b.get("bot_id"))
+        sub = None
+        try:
+            sub = db.get_subscription_for_bot(bot_id)
+        except Exception:
+            pass
+        kind = (b.get("account_type") or "bot")
+        icon = "👤" if kind == "user" else "🤖"
+        name = b.get("bot_username") or b.get("phone") or bot_id
+        label = f"{icon} {name}"
+        if sub:
+            label += f" ✅ {sub.get('subscription_type') or 'active'}"
+        rows.append([btn(label[:60], f"admin_quick_sub_{bot_id}", "primary", "⭐️")])
+    rows.append([btn("⌨️ Khud type karo (bot_id days Plan)", "admin_add_sub_manual", "success", "⌨️")])
+    rows.append([btn("Back", "admin_panel", "primary", "🔙")])
+    await safe_edit_message_text(
+        q,
+        f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\n"
+        f"Kis account ko subscription deni hai? Button dabao — phir sirf <b>days aur plan</b> "
+        f"bhejna hoga (jaise <code>30 Basic</code>).\n\n"
+        f"{pe('ℹ️')} ✅ = pehle se active subscription\n"
+        f"{pe('👤')} = user account, {pe('🤖')} = bot",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def admin_add_chooser(q):
@@ -6483,7 +6604,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_add_sub":
             if not is_admin(uid):
                 return
-            await safe_edit_message_text(q, f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\nSend: <code>@bot_username days Plan</code>\nExample: <code>@KALAKAAR_xBOT 30 Basic</code>\n\nOr: <code>bot_id days Plan</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
+            context.user_data.pop("admin_add_sub_bot", None)
+            context.user_data.pop("admin_add_sub", None)
+            await show_admin_sub_picker(q, context)
+            return
+
+        if data == "admin_add_sub_manual":
+            if not is_admin(uid):
+                return
+            await safe_edit_message_text(q,
+                                         f"<blockquote>{pp('⌨️')} <b>ADD SUBSCRIPTION (manual)</b></blockquote>\n\n"
+                                         "Bhejo: <code>@username days Plan</code> ya <code>bot_id days Plan</code>\n"
+                                         "Example: <code>ua8394878310 30 Basic</code>",
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_add_sub", "primary", "🔙")]]))
             context.user_data["admin_add_sub"] = True
             return
 

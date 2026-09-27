@@ -1909,21 +1909,126 @@ def test_html_safety_and_welcome_spam():
           str([r.getMessage()[:60] for r in handler3.records if r.levelno >= logging.ERROR]))
 
 
+def test_subscription_picker_and_style_memory():
+    print("\n[15] subscription picker + premium styling memory")
+    A.reset_premium_styling_state()
+
+    # --- picker list: sab accounts buttons me
+    A.db.user_bots = [
+        {"bot_id": "b1", "bot_username": "one", "bot_token": "t1", "user_id": 1, "account_type": "bot"},
+        {"bot_id": "ua777", "bot_username": None, "phone": "+919876543210", "user_id": 2,
+         "account_type": "user", "bot_token": None},
+    ]
+    A.db.subs = {"b1": {"subscription_type": "Pro", "expiry_date": A.now_aware() + timedelta(days=5)}}
+    ctx = FakeCtx()
+    q = FakeQuery(ctx, uid=A.ADMIN_USER_ID)
+    q.data = "admin_add_sub"
+    run(A.callback_handler(_fake_update(q=q, uid=A.ADMIN_USER_ID), ctx))
+    labels = _kb_labels(q.edits[-1][1].get("reply_markup"))
+    check("picker: dono account dikhe", any("one" in l for l in labels) and any("919876543210"[-10:] in l for l in labels),
+          str(labels))
+    check("picker: active plan dikhe", any("Pro" in l for l in labels), str(labels))
+    check("picker: manual option", any("Khud type" in l for l in labels), str(labels))
+    check("picker: text me days/plan hint", "30 Basic" in q.edits[-1][0], q.edits[-1][0][:80])
+
+    # --- choose karke sirf "30 Basic" bhejna
+    q2 = FakeQuery(ctx, uid=A.ADMIN_USER_ID)
+    q2.data = "admin_quick_sub_ua777"
+    run(A.callback_handler(_fake_update(q=q2, uid=A.ADMIN_USER_ID), ctx))
+    check("picker: bot prefill set", ctx.user_data.get("admin_add_sub_bot") == "ua777",
+          str(ctx.user_data.get("admin_add_sub_bot")))
+    real_start_bot = A.start_user_bot
+    started = []
+
+    async def _fake_start(bot_token, bot_id, owner_id, quiet=False):
+        started.append(bot_id)
+        return True
+    A.start_user_bot = _fake_start
+    msg = FakeMsg(text="30 Basic")
+    try:
+        run(A.handle_message(_fake_update(msg=msg, uid=A.ADMIN_USER_ID), ctx))
+    finally:
+        A.start_user_bot = real_start_bot
+    check("picker: user account ko subscription lag gayi", A.db.subs.get("ua777") is not None, str(A.db.subs))
+    check("picker: account auto-start hua", started == ["ua777"], str(started))
+    check("picker: prefill clear", ctx.user_data.get("admin_add_sub_bot") is None)
+
+    # --- manual option purana format bacha rahe
+    q3 = FakeQuery(ctx, uid=A.ADMIN_USER_ID)
+    q3.data = "admin_add_sub_manual"
+    run(A.callback_handler(_fake_update(q=q3, uid=A.ADMIN_USER_ID), ctx))
+    check("manual: state set + hint", ctx.user_data.get("admin_add_sub") is True
+          and "bot_id days Plan" in q3.edits[-1][0], q3.edits[-1][0][:70])
+    ctx.user_data.clear()
+
+    # --- login ke baad admin ko subscription button (apne hi account par bhi)
+    A._UA_LOGINS.clear()
+    A.db.user_bots = []
+    A.db.user_account_calls = []
+    ctx2 = FakeCtx()
+    ctx2.user_data.clear()
+    A.db.add_subscription_for_bot = A.db.add_subscription_for_bot  # (no-op)
+    A.db.subs = {}
+    st = run(A.ua_login_start(777, "+919000000000", client_factory=lambda: FakeTLClient()))
+    run(A.ua_login_submit_code(777, "55555"))
+    check("login: account add hua", st == "code" and A.db.get_user_bot("ua123") is not None)
+
+    # --- premium styling: 2 fail ke baad disabled + no warning spam
+    A.reset_premium_styling_state()
+    check("style: default on", A.premium_styling_disabled() is False)
+    check("style: document_invalid note", A.note_premium_failure(A.BadRequest("Document_invalid")) is True)
+    check("style: 1 fail par abhi on", A.premium_styling_disabled() is False)
+    A.note_premium_failure(A.BadRequest("Document_invalid"))
+    check("style: 2 fail ke baad disabled", A.premium_styling_disabled() is True)
+    check("style: unrelated error note nahi", A.note_premium_failure(A.BadRequest("chat not found")) is False)
+
+    # disabled state me warning log nahi aani chahiye (sirf plain send)
+    handler, root, old_level = _capture_logs()
+    try:
+        sent = run(A.send_premium_message(FakeBot("style"), 555, "Hello 💎 premium"))
+    finally:
+        _stop_capture(handler, root, old_level)
+    warns = [r for r in handler.records if r.levelno >= logging.WARNING]
+    check("style: disabled par koi styled warning nahi", not warns,
+          str([r.getMessage()[:60] for r in warns]))
+    check("style: plain message chala gaya", sent is not None)
+    A.reset_premium_styling_state()
+    check("style: reset ke baad on", A.premium_styling_disabled() is False)
+
+
 def main():
+    # Har group se pehle styling state saaf (FlakyBot tests disable kar dete hain)
+    A.reset_premium_styling_state()
     test_premium_button_parsing()
+    A.reset_premium_styling_state()
     test_button_wizard()
+    A.reset_premium_styling_state()
     test_album_layout()
+    A.reset_premium_styling_state()
     test_album_flush_real_jobqueue()
+    A.reset_premium_styling_state()
     test_admin_multiselect()
+    A.reset_premium_styling_state()
     test_delivery_robustness()
+    A.reset_premium_styling_state()
     test_security_and_startup()
+    A.reset_premium_styling_state()
     test_network_noise_and_retry()
+    A.reset_premium_styling_state()
     test_leave_recovery()
+    A.reset_premium_styling_state()
     test_panel_routing()
+    A.reset_premium_styling_state()
     test_app_wiring()
+    A.reset_premium_styling_state()
     test_user_account_mode()
+    A.reset_premium_styling_state()
     test_admin_add_account_wizard()
+    A.reset_premium_styling_state()
+    A.reset_premium_styling_state()
     test_html_safety_and_welcome_spam()
+    A.reset_premium_styling_state()
+    test_subscription_picker_and_style_memory()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:
