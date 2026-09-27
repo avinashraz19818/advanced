@@ -2037,6 +2037,88 @@ def test_subscription_picker_and_style_memory():
     check("style: reset ke baad on", A.premium_styling_disabled() is False)
 
 
+def test_user_account_dm_start():
+    print("\n[17] user account ke DM me /start -> panel wapas (\"kuch nhi aa rha\" fix)")
+    A.reset_premium_styling_state()
+    A.db.user_bots = [{"bot_id": "ua8394878310", "user_id": A.ADMIN_USER_ID, "account_type": "user",
+                       "bot_username": None, "phone": "+19312837172", "bot_token": None,
+                       "session_string": FAKE_SESSION, "api_id": 1, "api_hash": "h"}]
+    A.db.subs = {"ua8394878310": {"subscription_type": "Basic",
+                                  "expiry_date": A.now_aware() + timedelta(days=30), "max_channels": 1}}
+    A.db.bot_channels = []
+    A._UA_SUPPORT_GREETED.clear()
+
+    fake = FakeTLClient(me_id=8394878310)
+    sender = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake,
+                                 phone="+19312837172", account_user_id=8394878310)
+
+    handled = run(A._ua_handle_owner_start(sender, "ua8394878310", A.ADMIN_USER_ID,
+                                          FakeMsg(text="/start"), "/start"))
+    check("dm start: handled", handled is True)
+    texts = [m["text"] for m in fake.sent_messages]
+    check("dm start: panel DM gaya", any("MANAGE USER ACCOUNT" in t for t in texts), str(texts)[:180])
+    check("dm start: panel me account id", any("ua8394878310" in t for t in texts))
+    check("dm start: plan dikhaya", any("Basic" in t for t in texts))
+    check("dm start: panel manager ke DM me", fake.sent_messages[0]["chat_id"] == 8394878310)
+    check("dm start: /start wale message par reply", fake.sent_messages[-1].get("reply_to") is not None)
+    check("dm start: page ke baad hint", any("Panel upar bhej diya" in t for t in texts))
+
+    fake.sent_messages.clear()
+    check("dm: normal text ignore", run(A._ua_handle_owner_start(
+        sender, "ua8394878310", A.ADMIN_USER_ID, FakeMsg(text="hello"), "hello")) is False)
+    check("dm: normal text par koi message nahi", fake.sent_messages == [], str(fake.sent_messages))
+
+    if A.tl_events is None:
+        print("  skip telethon events (telethon install nahi)")
+        return
+    fake2 = FakeTLClient(me_id=8394878310)
+    sender2 = A.UserAccountSender("ua8394878310", A.ADMIN_USER_ID, fake2,
+                                  phone="+19312837172", account_user_id=8394878310)
+    A._register_user_account_handlers(fake2, sender2, "ua8394878310", A.ADMIN_USER_ID)
+    check("dm: handlers register hue (action + DM + raw)", len(fake2.handlers) >= 3, str(len(fake2.handlers)))
+
+    class _DMEvent:
+        is_private = True
+        raw_text = "/start"
+        sender_id = A.ADMIN_USER_ID
+        message = FakeMsg(text="/start")
+
+        async def get_chat(self):
+            return None
+
+        async def get_user(self):
+            return None
+
+    handler, root, old_level = _capture_logs()
+    try:
+        for h in fake2.handlers:
+            run(h(_DMEvent()))
+    finally:
+        _stop_capture(handler, root, old_level)
+    errors = [r for r in handler.records if r.levelno >= logging.ERROR]
+    check("dm: handler chain me koi ERROR nahi", not errors,
+          str([r.getMessage() for r in errors])[:200])
+    check("dm: /start par panel gaya", any("MANAGE USER ACCOUNT" in m["text"] for m in fake2.sent_messages),
+          str([m["text"][:50] for m in fake2.sent_messages]))
+    check("dm: /start log me dikha",
+          any("DM me /start aaya" in r.getMessage() for r in handler.records),
+          str([r.getMessage() for r in handler.records if "DM" in r.getMessage()])[:160])
+
+    class _StrangerEvent(_DMEvent):
+        sender_id = 999888777
+
+    fake2.sent_messages.clear()
+    for h in fake2.handlers:
+        run(h(_StrangerEvent()))
+    check("dm: stranger ko ek support reply",
+          any("support account" in m["text"] for m in fake2.sent_messages),
+          str([m["text"][:60] for m in fake2.sent_messages]))
+    fake2.sent_messages.clear()
+    for h in fake2.handlers:
+        run(h(_StrangerEvent()))
+    check("dm: same stranger ko dobara nahi (spam band)", fake2.sent_messages == [])
+
+
 def test_user_account_owner_flow_adapter():
     print("\n[16] user account owner flows (main bot ke messages se)")
     A.reset_premium_styling_state()
@@ -2191,6 +2273,7 @@ def main():
     A.reset_premium_styling_state()
     test_subscription_picker_and_style_memory()
     test_user_account_owner_flow_adapter()
+    test_user_account_dm_start()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:

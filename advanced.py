@@ -5021,6 +5021,20 @@ class UserAccountSender:
     async def get_me(self):
         return await self.client.get_me()
 
+    async def send_to_chat(self, chat_id, text, parse_mode=None, reply_to=None, reply_markup=None):
+        """Seedha Telethon se bhejo - panel DM / /start ka reply (PTB kwargs ke bina).
+
+        User account buttons nahi bhej sakta, isliye reply_markup ke URL buttons links
+        ban ke text me hi chale jate hain (callback buttons sirf label dikhate hain).
+        """
+        if reply_markup is not None:
+            text = (text or "") + self._markup_to_links(reply_markup)
+        await self._throttle(chat_id)
+        return await _ua_wrap(self.client.send_message(
+            int(chat_id), text or "",
+            parse_mode="html" if parse_mode == ParseMode.HTML else None,
+            link_preview=False, reply_to=reply_to))
+
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None,
                            disable_web_page_preview=None, **kwargs):
         if reply_markup is not None:
@@ -5227,7 +5241,8 @@ async def start_user_account(bot_id: str, owner_id: int = 0, row: Optional[dict]
             except Exception:
                 pass
             name = f"@{me.username}" if getattr(me, "username", None) else (row.get("phone") or bot_id)
-            logging.info(f"{pp('✅')} User account {name} chalu ho gaya ({bot_id})")
+            logging.info(f"{pp('✅')} User account {name} chalu ho gaya ({bot_id}) - panel ke liye isi "
+                         f"account se (ya manager account se) main bot me /start karo")
             try:
                 for ch in db.get_bot_channels(bot_id) or []:
                     await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], sender)
@@ -5320,8 +5335,142 @@ async def _notify_account_owner(owner_id: int, bot_id: str, text: str):
         logging.debug(f"owner notify fail ({bot_id}): {mask_secrets(ex)}")
 
 
+UA_ACCOUNT_COMMANDS = ("/start", "/menu", "/panel", "/help")
+_UA_SUPPORT_GREETED: set = set()
+
+
+def _main_bot_ref_name() -> str:
+    """Main bot ka @username (jo bhi ho chale) - user account ke DM me batane ke liye."""
+    ref = MAIN_BOT_REF
+    if ref is None:
+        return ""
+    try:
+        username = getattr(ref, "username", None)
+    except Exception:
+        username = None
+    return f"@{username}" if username else ""
+
+
+def _ua_panel_text(bot_id: str, manager_uid: int = 0) -> str:
+    """User account ka panel text (buttons user account bhej nahi sakta, isliye text + links)."""
+    row = db.get_user_bot(bot_id) or {}
+    sub = db.get_subscription_for_bot(bot_id)
+    plan = "No active plan"
+    if sub:
+        try:
+            expiry = sub.get("expiry_date")
+            expiry = make_aware(expiry) if isinstance(expiry, datetime) else expiry
+            if isinstance(expiry, str):
+                expiry = datetime.fromisoformat(expiry.replace("+00:00", "").strip())
+            plan = f"{sub.get('subscription_type') or 'Active'} (expiry {str(expiry)[:10]})"
+        except Exception:
+            plan = str(sub.get("subscription_type") or "Active")
+    main_bot = _main_bot_ref_name()
+    link = (f'<a href="https://t.me/{main_bot[1:]}">{main_bot}</a>' if main_bot else "main bot")
+    lines = [
+        f"<blockquote>{pp('👤')} <b>MANAGE USER ACCOUNT</b></blockquote>",
+        "",
+        f"{pp('🆔')} <code>{bot_id}</code>",
+        f"{pp('📱')} {account_display_name(row, bot_id)}",
+        f"{pp('⭐️')} Plan: {plan}",
+        "",
+        f"{pe('📋')} Is panel me kya-kya hai:",
+        f"{pe('➕')} Add Channel (channel ka message forward karo)",
+        f"{pe('📝')} Welcome / Leave message set karo",
+        f"{pe('🖼')} Album + buttons, aur broadcast",
+        "",
+        f"{pe('📌')} Panel ke buttons {link} me chalte hain - wahan se",
+        "<code>/start</code> karo to yehi panel clickable buttons ke saath milega.",
+        f"{pe('ℹ️')} (Telegram user account ko buttons bhejne ki ijazat nahi deta,",
+        "isliye yahan buttons ki jagah ye list hai.)",
+    ]
+    if manager_uid:
+        lines.insert(5, f"{pp('👑')} Manager: <a href=\"tg://user?id={manager_uid}\">owner account</a>")
+    return "\n".join(lines)
+
+
+async def _ua_handle_owner_start(sender: "UserAccountSender", bot_id: str, owner_id: int,
+                                 msg=None, text: str = "") -> bool:
+    """DM me /start (ya /menu, /panel, /help) aaye to us chat me panel wapas bhejo.
+
+    Return True agar handle ho gaya (caller ko aur kuch nahi karna).
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    head = stripped.split()[0].split("@")[0].lower()
+    if head not in UA_ACCOUNT_COMMANDS:
+        return False
+
+    chat_id = int(getattr(sender, "id", 0) or 0)
+    manager_uid = int(owner_id or 0)
+    if not manager_uid:
+        try:
+            manager_uid = int(next(iter(sorted(ADMIN_USER_IDS)), 0) or 0)
+        except Exception:
+            manager_uid = 0
+    if not chat_id:
+        return False
+
+    sent = False
+    try:
+        # Keyboard attach nahi karte: user account buttons bhej nahi sakta, warna
+        # 14 button sirf plain label ban ke dikhte hain (confusing).
+        await sender.send_to_chat(chat_id, _ua_panel_text(bot_id, manager_uid),
+                                  parse_mode=ParseMode.HTML)
+        sent = True
+    except Exception as ex:
+        logging.warning(f"{bot_id}: DM me panel nahi ja paya: {mask_secrets(ex)}")
+
+    if sent and msg is not None:
+        try:
+            await sender.send_to_chat(
+                chat_id,
+                f"{pe('✅')} Panel upar bhej diya hai - channel add / welcome / broadcast "
+                f"sab isi panel se chalta hai.\n"
+                f"{pe('📌')} Dobara chahiye to kabhi bhi <code>/start</code> bhej do.",
+                parse_mode=ParseMode.HTML, reply_to=msg)
+        except Exception:
+            pass
+    if sent:
+        logging.info(f"{bot_id}: DM me /start aaya - account ke chat me panel bhej diya")
+    return sent
+
+
 def _register_user_account_handlers(client, sender: "UserAccountSender", bot_id: str, owner_id: int):
     """Telethon events -> wahi shared logic jo PTB bot use karta hai."""
+
+    @client.on(tl_events.NewMessage(incoming=True))
+    async def _on_dm(event):  # pragma: no cover - live network path
+        """Account ko aaya DM: /start wali command par panel, warna chup-chaap."""
+        try:
+            if not getattr(event, "is_private", False):
+                return
+            text = getattr(event, "raw_text", None) or ""
+            sender_id = int(getattr(event, "sender_id", 0) or 0)
+            head = text.strip().split()[0].split("@")[0].lower() if text.strip() else ""
+            is_manager = bool(sender_id) and (sender_id == owner_id or sender_id in ADMIN_USER_IDS)
+            if head in UA_ACCOUNT_COMMANDS:
+                logging.info(f"{bot_id}: DM me {head} aaya ({'manager' if is_manager else 'user'} {sender_id})")
+            else:
+                logging.debug(f"{bot_id}: DM ({'manager' if is_manager else 'user'} {sender_id}): {text[:40]}")
+            if is_manager and await _ua_handle_owner_start(sender, bot_id, owner_id,
+                                                           getattr(event, "message", None), text):
+                return
+            if head in UA_ACCOUNT_COMMANDS and not is_manager and sender_id:
+                # support account: ek hi baar chhota jawab (spam-limit se bachne ke liye)
+                if sender_id not in _UA_SUPPORT_GREETED:
+                    _UA_SUPPORT_GREETED.add(sender_id)
+                    try:
+                        await sender.send_to_chat(
+                            sender_id,
+                            f"{pe('👋')} Hi! Ye ek automated support account hai.\n"
+                            f"{pe('📞')} Madad ke liye {ADMIN_USERNAME} se contact karo.",
+                            parse_mode=ParseMode.HTML)
+                    except Exception as ex:
+                        logging.debug(f"{bot_id}: support greeting fail: {mask_secrets(ex)}")
+        except Exception as ex:
+            logging.error(f"user account DM error ({bot_id}): {type(ex).__name__}: {mask_secrets(ex)}")
 
     @client.on(tl_events.ChatAction)
     async def _on_chat_action(event):  # pragma: no cover - live network path
