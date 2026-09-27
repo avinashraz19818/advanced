@@ -19,7 +19,6 @@ from telegram import (
     InputMediaVideo,
     InputMediaDocument,
     InputMediaAudio,
-    MessageEntity,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -121,12 +120,59 @@ def premium_styling_disabled() -> bool:
     return bool(_style_state.get("disabled"))
 
 
+def _tl_input_peer_user(user_id, access_hash):
+    from telethon.tl import types as tl_types
+    return tl_types.InputPeerUser(int(user_id), int(access_hash or 0))
+
+
+def _tl_input_user_empty():
+    from telethon.tl import types as tl_types
+    return tl_types.InputUserEmpty()
+
+
+def ua_remember_entities(bot_id: str, users) -> int:
+    """User objects ke access_hash memory + DB me daalo (idempotent)."""
+    saved = 0
+    for u in users or []:
+        uid = int(getattr(u, "id", 0) or 0)
+        ah = getattr(u, "access_hash", None)
+        if not uid or ah is None:
+            continue
+        _UA_ENTITY_MEM.setdefault(bot_id, {})[uid] = int(ah)
+        saved += 1
+    if saved and users:
+        try:
+            db.remember_user_entities(bot_id, users)
+        except Exception:
+            pass
+    return saved
+
+
+def ua_cached_access_hash(bot_id: str, user_id):
+    """Memory, phir DB - user ka access_hash (na mile to None)."""
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    ah = (_UA_ENTITY_MEM.get(bot_id) or {}).get(uid)
+    if ah is not None:
+        return ah
+    try:
+        ah = db.get_user_access_hash(bot_id, uid)
+    except Exception:
+        ah = None
+    if ah is not None:
+        _UA_ENTITY_MEM.setdefault(bot_id, {})[uid] = ah
+    return ah
+
+
 def reset_premium_styling_state():
     """Tests / diagnostics ke liye."""
     _style_state["failures"] = 0
     _style_state["disabled"] = False
     _UA_PREMIUM_EMOJI_OK.clear()  # user account ka premium-emoji switch bhi reset
     _UA_SEND_MODE.clear()         # direct / saved-forward ka yaad-rakha rasta bhi reset
+    _UA_ENTITY_MEM.clear()        # user entity (access_hash) cache bhi reset
 
 
 def note_premium_failure(ex) -> bool:
@@ -300,7 +346,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-09-27-r15"
+BUILD_TAG = "2026-09-27-r16"
 START_TS = time.time()
 # User account subscription ke bina bhi online rahe? (owner ka apna account hai, DM/panel
 # chalta rehna chahiye). Purana behaviour chahiye to .env me UA_START_WITHOUT_SUBSCRIPTION=0
@@ -997,6 +1043,9 @@ class Database:
             """CREATE TABLE IF NOT EXISTS user_emoji_maps (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                msg_id BIGINT, emoji_map JSONB DEFAULT '{}',\n                updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (bot_id, msg_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS system_settings (\n                key TEXT PRIMARY KEY, value_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS leave_recovery_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT, user_id BIGINT,\n                source_channel_id BIGINT, target_channel_id BIGINT, message_id BIGINT,\n                sent_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ\n            )""",
+            # User account se DM ke liye user_id ke saath access_hash chahiye (MTProto).
+            # Join-request list / updates se milte hi save kar lete hain.
+            """CREATE TABLE IF NOT EXISTS user_entity_cache (\n                bot_id TEXT, user_id BIGINT, access_hash BIGINT,\n                updated_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, user_id)\n            )""",
             "CREATE INDEX IF NOT EXISTS idx_bot_subscriptions ON bot_subscriptions(bot_id, expiry_date)",
             "CREATE INDEX IF NOT EXISTS idx_join_requests ON join_requests(bot_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_user_bots_user ON user_bots(user_id)",
@@ -1027,6 +1076,48 @@ class Database:
 
     def get_user(self, user_id):
         return self._fetchone("SELECT * FROM users WHERE user_id=%s", (user_id,)) or {}
+
+    # ---------------- user entity (access_hash) cache ----------------
+    def remember_user_entity(self, bot_id: str, user_id, access_hash) -> bool:
+        """Ek user ka access_hash yaad rakho (user account DM ke liye)."""
+        try:
+            uid, ah = int(user_id), int(access_hash)
+        except Exception:
+            return False
+        if not uid or ah is None:
+            return False
+        try:
+            self._execute("""INSERT INTO user_entity_cache (bot_id, user_id, access_hash)
+                   VALUES (%s,%s,%s)
+                   ON CONFLICT (bot_id, user_id) DO UPDATE
+                   SET access_hash=EXCLUDED.access_hash, updated_at=now()""", (bot_id, uid, ah))
+            return True
+        except Exception:
+            return False
+
+    def remember_user_entities(self, bot_id: str, users) -> int:
+        """Telethon User objects ke access_hash save karo. Return: kitne save hue."""
+        saved = 0
+        for u in users or []:
+            uid = int(getattr(u, "id", 0) or 0)
+            ah = getattr(u, "access_hash", None)
+            if not uid or ah is None:
+                continue
+            if self.remember_user_entity(bot_id, uid, ah):
+                saved += 1
+        return saved
+
+    def get_user_access_hash(self, bot_id: str, user_id):
+        try:
+            row = self._fetchone("SELECT access_hash FROM user_entity_cache "
+                                 "WHERE bot_id=%s AND user_id=%s", (bot_id, int(user_id))) or {}
+        except Exception:
+            return None
+        ah = row.get("access_hash")
+        try:
+            return int(ah) if ah is not None else None
+        except Exception:
+            return None
 
     def mark_user_verified(self, user_id: int):
         self._execute("UPDATE users SET verified=TRUE WHERE user_id=%s", (user_id,))
@@ -1954,6 +2045,14 @@ async def send_user_message(bot, chat_id, text, *args, **kwargs):
     except BadRequest as ex:
         if is_user_gone_error(ex):
             raise
+        if not _should_plain_retry(ex):
+            # entity-nahi-mila / file_id ghalat - plain text se dobara try karne ka fayda
+            # nahi (pehle 3 line warning aati thi, ab ek).
+            logging.warning(f"send_user_message skip (user {chat_id}): "
+                            f"{type(ex).__name__}: {mask_secrets(ex)}")
+            if raise_on_failure:
+                raise
+            return None
         logging.warning(f"send_user_message BadRequest for {chat_id}: {ex}; retrying plainly")
         plain_kwargs = dict(kwargs)
         if plain_kwargs.get("reply_markup") is not None:
@@ -4472,7 +4571,7 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
         ok, err, _used_ua = await send_dm_fallback(
             bot_id, requester.id,
             lambda snd: send_user_message(snd, requester.id, default_msg_text, parse_mode=ParseMode.HTML),
-            primary=sender, owner_id=owner_id, kind="Default first message")
+            primary=sender, owner_id=owner_id, kind="Default first message", channel_id=chat_id)
         if not ok:
             stop = dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM",
                                            ua_available=bool(owner_user_account_senders(owner_id)))
@@ -4502,7 +4601,8 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
                 await send_user_message(snd, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     ok, err, _used_ua = await send_dm_fallback(
-        bot_id, requester.id, _send_welcome, primary=sender, owner_id=owner_id, kind="Welcome DM")
+        bot_id, requester.id, _send_welcome, primary=sender, owner_id=owner_id,
+        kind="Welcome DM", channel_id=chat_id)
     if ok:
         db.mark_reachable(bot_id, requester.id)
     else:
@@ -4526,7 +4626,8 @@ async def _send_leave_message(bot_id: str, user_id, owner_id, primary, do_send):
         box["sent"] = await do_send(snd)
 
     ok, err, used_ua = await send_dm_fallback(bot_id, user_id, _wrapped, primary=primary,
-                                              owner_id=owner_id, kind="leave recovery DM")
+                                              owner_id=owner_id, kind="leave recovery DM",
+                                              channel_id=_UA_CHANNEL_HINT.get())
     return ok, box["sent"], err, used_ua
 
 
@@ -4940,6 +5041,8 @@ MAIN_BOT_REF: Optional[Bot] = None
 user_account_clients: Dict[str, "UserAccountSender"] = {}
 user_account_tasks: Dict[str, Any] = {}
 _UA_MEDIA_CACHE: Dict[tuple, str] = {}
+# bot_id -> {user_id: access_hash} - bar-bar DB hit na ho
+_UA_ENTITY_MEM: Dict[str, Dict[int, int]] = {}
 _UA_LAST_SEND: Dict[str, float] = {}
 UA_MEDIA_CACHE_MAX = 200
 
@@ -4965,6 +5068,22 @@ def account_type_from_row(row) -> str:
 
 # Telegram bot us user ko DM nahi kar sakta jisne bot ko kabhi /start nahi kiya. Isi error ke
 # liye user-account fallback chalta hai (user account MTProto se DM bhej sakta hai).
+try:  # contextvars hamesha available hai (py3.7+), phir bhi safe import
+    from contextvars import ContextVar
+except Exception:  # pragma: no cover
+    def ContextVar(name, default=None):  # type: ignore
+        class _Var:
+            def __init__(self, d):
+                self._v = d
+
+            def get(self):
+                return self._v
+
+            def set(self, v):
+                self._v = v
+        return _Var(default)
+
+
 DM_INITIATE_MARKERS = ("can't initiate conversation", "cant initiate conversation",
                        "initiate conversation with a user", "bot can't initiate")
 _DM_INITIATE_WARNED: set = set()
@@ -5024,7 +5143,7 @@ def dm_sender_candidates(bot_id: str, primary=None, owner_id=None) -> list:
 
 
 async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, owner_id=None,
-                           kind: str = "DM"):
+                           kind: str = "DM", channel_id=None):
     """`do_send(sender)` ko sender chain par try karo.
 
     Return: (ok, error, used_user_account)
@@ -5035,6 +5154,18 @@ async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, owner
     chain = dm_sender_candidates(bot_id, primary=primary, owner_id=owner_id)
     if not chain:
         return False, BadRequest("koi sender available nahi (bot band / account add nahi)"), False
+    # user account ko ye hints chahiye: user kis channel se aaya (entity resolve) aur media
+    # kis bot ki hai (file_id download) - warna "input entity"/"wrong file_id" error aata hai.
+    chan_token = _UA_CHANNEL_HINT.set(channel_id)
+    media_token = _UA_MEDIA_BOT_HINT.set(bot_id)
+    try:
+        return await _send_dm_fallback_chain(bot_id, user_id, do_send, chain, kind=kind)
+    finally:
+        _UA_CHANNEL_HINT.reset(chan_token)
+        _UA_MEDIA_BOT_HINT.reset(media_token)
+
+
+async def _send_dm_fallback_chain(bot_id, user_id, do_send, chain, *, kind="DM"):
     last_ex: Optional[Exception] = None
     for idx, sender in enumerate(chain):
         try:
@@ -5140,16 +5271,64 @@ def account_icon(row) -> str:
     return "👤" if account_type_from_row(row) == "user" else "🤖"
 
 
-async def materialize_media(media, source_bot=None, source_token: Optional[str] = None):
+async def bot_api_download_file(file_id: str, tokens) -> Optional[str]:
+    """Bot API se `file_id` download karke local path do.
+
+    file_id sirf usi bot ke liye valid hota hai jisne file dekhi thi, isliye har diya gaya
+    token try karte hain (channel wala bot, phir main bot) - warna
+    "Wrong file_id or the file is temporarily unavailable" milta hai.
+    """
+    for token in tokens or []:
+        if not token:
+            continue
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
+                resp = await client.get(f"https://api.telegram.org/bot{token}/getFile",
+                                        params={"file_id": file_id})
+                data = resp.json() if hasattr(resp, "json") else {}
+                path = ((data.get("result") or {}).get("file_path")) if data.get("ok") else None
+                if not path:
+                    continue
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix="ua_media_", suffix=os.path.splitext(path)[1] or ".bin")
+                os.close(fd)
+                async with client.stream(
+                        "GET", f"https://api.telegram.org/file/bot{token}/{path}") as dl:
+                    dl.raise_for_status()
+                    with open(tmp_path, "wb") as fh:
+                        async for chunk in dl.aiter_bytes(65536):
+                            fh.write(chunk)
+                return tmp_path
+        except Exception as ex:
+            logging.debug(f"file_id download fail (token ...{str(token)[-4:]}): {mask_secrets(ex)}")
+            continue
+    return None
+
+
+async def materialize_media(media, source_bot=None, source_token: Optional[str] = None,
+                            extra_tokens: Optional[list] = None):
     """file_id ko aisi cheez me badlo jo dusra account bhej sake (local file / http url).
 
     Bot ka file_id sirf usi bot ke liye valid hota hai. User account se bhejne ke liye
     file pehle download karni padti hai (warna Telegram "wrong file identifier" deta hai).
+    `extra_tokens` me wo bots hote hain jinke file_id hone ke chance hain (channel wala bot).
     """
     if not isinstance(media, str) or not media:
         return media
     if media.startswith("http") or os.path.exists(media):
         return media
+    # Pehle extra tokens (channel wala bot) try karo - file_id aksar usi bot ka hota hai
+    for token in (extra_tokens or []):
+        cached = _UA_MEDIA_CACHE.get((token, media))
+        if cached and os.path.exists(cached):
+            return cached
+    if extra_tokens:
+        path = await bot_api_download_file(media, extra_tokens)
+        if path:
+            _UA_MEDIA_CACHE[(extra_tokens[0], media)] = path
+            _ua_trim_media_cache()
+            return path
     source_bot = source_bot or MAIN_BOT_REF
     token = source_token or (getattr(source_bot, "token", "") if source_bot is not None else "") or MAIN_BOT_TOKEN
     cache_key = (token, media)
@@ -5185,6 +5364,11 @@ async def materialize_media(media, source_bot=None, source_token: Optional[str] 
             pass
         return media
     _UA_MEDIA_CACHE[cache_key] = tmp_path
+    _ua_trim_media_cache()
+    return tmp_path
+
+
+def _ua_trim_media_cache():
     if len(_UA_MEDIA_CACHE) > UA_MEDIA_CACHE_MAX:
         for key in list(_UA_MEDIA_CACHE.keys())[:50]:
             old = _UA_MEDIA_CACHE.pop(key, None)
@@ -5193,7 +5377,6 @@ async def materialize_media(media, source_bot=None, source_token: Optional[str] 
                     os.unlink(old)
                 except Exception:
                     pass
-    return tmp_path
 
 
 class AccountLimitedError(Exception):
@@ -5233,6 +5416,9 @@ def _ua_premium_emoji_allowed(bot_id: str) -> bool:
 
 
 _UA_SEND_MODE: Dict[str, str] = {}   # bot_id -> "direct" | "saved" (Saved Messages se forward)
+_WARN_ONCE_KEYS: set = set()         # ek hi warning baar-baar na aaye
+_UA_CHANNEL_HINT = ContextVar("ua_channel_hint", default=None)      # user kis channel se aaya
+_UA_MEDIA_BOT_HINT = ContextVar("ua_media_bot_hint", default=None)  # media kis bot ki hai
 
 
 def _ua_should_try_other_strategy(ex) -> bool:
@@ -5247,6 +5433,32 @@ def _ua_should_try_other_strategy(ex) -> bool:
     if "flood" in text or "too many requests" in text:
         return False
     return True
+
+
+PLAIN_RETRY_SKIP_MARKERS = (
+    "could not find the input entity",
+    "failed to convert",
+    "wrong file_id",
+    "not an existing file",
+    "file is temporarily unavailable",
+)
+
+
+def _should_plain_retry(ex) -> bool:
+    """Plain text se retry karne se kaam banega? (entity/file ki galti me nahi)"""
+    text = str(ex or "").lower()
+    if any(m in text for m in PLAIN_RETRY_SKIP_MARKERS):
+        return False
+    return True
+
+
+def _warn_once(key: str, message: str):
+    """Wahi warning baar-baar log me na aaye (ek baar, phir debug)."""
+    if key in _WARN_ONCE_KEYS:
+        logging.debug(message)
+        return
+    _WARN_ONCE_KEYS.add(key)
+    logging.warning(message)
 
 
 def _ua_note_send_mode(bot_id: str, mode: str):
@@ -5435,8 +5647,74 @@ class UserAccountSender:
 
     async def _prepare_media(self, media):
         if isinstance(media, str) and media and not media.startswith("http") and not os.path.exists(media):
-            return await materialize_media(media, MAIN_BOT_REF)
+            # file_id usi bot ka hota hai jisne file dekhi thi - pehle usi bot ka token try
+            return await materialize_media(media, MAIN_BOT_REF, extra_tokens=self._media_tokens())
         return media
+
+    def _media_tokens(self):
+        """Media download ke liye kaunse bot tokens try karne hain (channel wala pehle)."""
+        tokens = []
+        bot_id = _UA_MEDIA_BOT_HINT.get() or self.bot_id
+        if bot_id:
+            try:
+                tok = (db.get_user_bot(bot_id) or {}).get("bot_token")
+            except Exception:
+                tok = None
+            if tok:
+                tokens.append(tok)
+        if MAIN_BOT_TOKEN and MAIN_BOT_TOKEN not in tokens:
+            tokens.append(MAIN_BOT_TOKEN)
+        return tokens
+
+    async def _resolve_peer(self, chat_id, channel_id=None):
+        """Telethon ko user ka peer chahiye: user_id + access_hash (warna "input entity" error).
+
+        Koshish ka order:
+          1) memory/DB cache (join-request list ya pichle DM se mila access_hash)
+          2) client.get_input_entity (session cache / dialogs me ho to)
+          3) channel ke pending-requester/importer list se (wo full User dete hain)
+          4) aakhiri koshish: access_hash=0 (kabhi-kabhi Telegram maan leta hai)
+        """
+        try:
+            uid = int(chat_id)
+        except Exception:
+            return chat_id
+        if uid < 0:      # channel/group - Telethon khud resolve kar leta hai
+            return chat_id
+        ah = ua_cached_access_hash(self.bot_id, uid)
+        if ah:
+            return _tl_input_peer_user(uid, ah)
+        try:
+            peer = await self.client.get_input_entity(uid)
+        except Exception:
+            peer = None
+        if peer is not None:
+            try:
+                got = int(getattr(peer, "access_hash", 0) or 0)
+            except Exception:
+                got = 0
+            if got:
+                _UA_ENTITY_MEM.setdefault(self.bot_id, {})[uid] = got
+                try:
+                    db.remember_user_entity(self.bot_id, uid, got)
+                except Exception:
+                    pass
+            return peer
+        # channel se nikalne ki koshish (join-request wale users yahin milte hain)
+        for hint in (channel_id, _UA_CHANNEL_HINT.get()):
+            if not hint:
+                continue
+            try:
+                users = await self.list_pending_join_requesters(hint, remember=False)
+            except Exception:
+                users = []
+            for u in users or []:
+                if int(getattr(u, "id", 0) or 0) == uid:
+                    ua_remember_entities(self.bot_id, [u])
+                    return _tl_input_peer_user(uid, int(getattr(u, "access_hash", 0) or 0))
+        logging.debug(f"{self.bot_id}: user {uid} ka access_hash nahi mila - "
+                      f"aakhiri koshish (access_hash=0) kar rahe hain")
+        return _tl_input_peer_user(uid, 0)
 
     # ---------- PTB-Bot-compatible API ----------
     async def get_me(self):
@@ -5506,17 +5784,18 @@ class UserAccountSender:
         text = self._downgrade_premium(text) or ""
         html = "html" if parse_mode == ParseMode.HTML else None
         await self._throttle(chat_id)
+        peer = await self._resolve_peer(chat_id)
 
         async def _direct(body):
             res = await _ua_wrap(self.client.send_message(
-                int(chat_id), body, parse_mode=html, link_preview=False, reply_to=reply_to))
+                peer, body, parse_mode=html, link_preview=False, reply_to=reply_to))
             return _UASentMessage(res, chat_id)
 
         async def _saved(body):
             # pehle apne Saved Messages me, phir wahi message user ko forward (user ka idea)
             saved = await _ua_wrap(self.client.send_message("me", body, parse_mode=html,
                                                             link_preview=False))
-            fwd = await _ua_wrap(self.client.forward_messages(int(chat_id), saved, from_peer="me"))
+            fwd = await _ua_wrap(self.client.forward_messages(peer, saved, from_peer="me"))
             if isinstance(fwd, (list, tuple)):
                 fwd = fwd[0] if fwd else saved
             return _UASentMessage(fwd, chat_id)
@@ -5541,10 +5820,11 @@ class UserAccountSender:
                 return await self.send_message(chat_id, caption, parse_mode=ParseMode.HTML)
             return None
         await self._throttle(chat_id)
+        peer = await self._resolve_peer(chat_id)
 
         async def _direct(cap):
             res = await _ua_wrap(self.client.send_file(
-                int(chat_id), file, caption=cap or None,
+                peer, file, caption=cap or None,
                 parse_mode="html" if cap else None,
                 force_document=force_document,
                 voice_note=voice_note, video_note=video_note))
@@ -5555,7 +5835,7 @@ class UserAccountSender:
             saved = await _ua_wrap(self.client.send_file(
                 "me", file, caption=cap or None, parse_mode="html" if cap else None,
                 force_document=force_document, voice_note=voice_note, video_note=video_note))
-            fwd = await _ua_wrap(self.client.forward_messages(int(chat_id), saved, from_peer="me"))
+            fwd = await _ua_wrap(self.client.forward_messages(peer, saved, from_peer="me"))
             if isinstance(fwd, (list, tuple)):
                 fwd = fwd[0] if fwd else saved
             return _UASentMessage(fwd, chat_id)
@@ -5607,18 +5887,19 @@ class UserAccountSender:
         if reply_markup is not None:
             album_caption = (album_caption or "") + self._markup_to_links(reply_markup)
         await self._throttle(chat_id)
+        peer = await self._resolve_peer(chat_id)
         target = files[0] if len(files) == 1 else files
 
         async def _direct(cap):
             res = await _ua_wrap(self.client.send_file(
-                int(chat_id), target, caption=cap or None,
+                peer, target, caption=cap or None,
                 parse_mode="html" if cap else None))
             return _UASentMessage(res, chat_id)
 
         async def _saved(cap):
             saved = await _ua_wrap(self.client.send_file(
                 "me", target, caption=cap or None, parse_mode="html" if cap else None))
-            fwd = await _ua_wrap(self.client.forward_messages(int(chat_id), saved, from_peer="me"))
+            fwd = await _ua_wrap(self.client.forward_messages(peer, saved, from_peer="me"))
             if isinstance(fwd, (list, tuple)):
                 fwd = fwd[0] if fwd else saved
             return _UASentMessage(fwd, chat_id)
@@ -5671,13 +5952,20 @@ class UserAccountSender:
         return await self.client(tl_functions.messages.HideChatJoinRequestRequest(
             peer=chat_id, user_id=user_id, approved=False))
 
-    async def list_pending_join_requesters(self, chat_id) -> List[Any]:
-        """Admin user accounts ko `UpdatePendingJoinRequests` milta hai; list isse nikalte hain."""
+    async def list_pending_join_requesters(self, chat_id, remember: bool = True) -> List[Any]:
+        """Admin user accounts ko `UpdatePendingJoinRequests` milta hai; list isse nikalte hain.
+
+        `offset_user=0` nahi bhejna - Telethon use PeerUser(0) bana deta hai aur
+        "Could not find the input entity for PeerUser(user_id=0)" milta tha. Pehle page ke
+        liye `InputUserEmpty()` sahi value hai.
+        """
         try:
             res = await self.client(tl_functions.messages.GetChatInviteImportersRequest(
-                peer=chat_id, offset_date=None, offset_user=0, limit=100, requested=True))
+                peer=chat_id, offset_date=None, offset_user=_tl_input_user_empty(),
+                limit=100, requested=True))
         except Exception as ex:
-            logging.warning(f"pending join requests laane me error: {mask_secrets(ex)}")
+            _warn_once(f"ua:pending:{self.bot_id}",
+                       f"pending join requests laane me error: {mask_secrets(ex)}")
             return []
         users = {getattr(u, "id", 0): u for u in (getattr(res, "users", None) or [])}
         out = []
@@ -5685,6 +5973,9 @@ class UserAccountSender:
             user = users.get(getattr(imp, "user_id", 0))
             if user is not None:
                 out.append(user)
+        if remember and out:
+            # in users ke access_hash mil gaye - aage DM bhejne ke liye kaam aayenge
+            ua_remember_entities(self.bot_id, out)
         return out
 
 

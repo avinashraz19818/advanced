@@ -454,6 +454,28 @@ class FakeDB:
     def add_user(self, *a, **k):
         pass
 
+    def remember_user_entity(self, bot_id, user_id, access_hash):
+        self.entity_cache = getattr(self, "entity_cache", {})
+        self.entity_cache[(bot_id, int(user_id))] = int(access_hash)
+        return True
+
+    def remember_user_entities(self, bot_id, users):
+        saved = 0
+        for u in users or []:
+            uid = int(getattr(u, "id", 0) or 0)
+            ah = getattr(u, "access_hash", None)
+            if not uid or ah is None:
+                continue
+            self.remember_user_entity(bot_id, uid, ah)
+            saved += 1
+        return saved
+
+    def get_user_access_hash(self, bot_id, user_id):
+        try:
+            return (getattr(self, "entity_cache", {}) or {}).get((bot_id, int(user_id)))
+        except Exception:
+            return None
+
     def add_user_bot(self, owner_id, token, username):
         bot_id = f"b{len(self.user_bots) + 1}"
         self.user_bots = self.user_bots + [{"bot_id": bot_id, "user_id": owner_id,
@@ -588,6 +610,9 @@ class FakeTLClient:
         self.sent_files = []
         self.forwards = []       # Saved Messages -> forward
         self.raw_calls = []
+        self.known_entities = {}  # user_id -> access_hash (Telethon session jaisa)
+        self.invite_users = []    # GetChatInviteImporters ka jhootha jawab
+        self.input_entity_calls = []
         self.handlers = []
         self.session = SimpleNamespace(save=lambda: FAKE_SESSION)
         self._stop = asyncio.Event()
@@ -642,11 +667,29 @@ class FakeTLClient:
         """direct send fail (jaise entity nahi mili / Telegram ne rok di) par 'me' allowed."""
         if self.mode != "direct_fail":
             return
+        uid = getattr(chat_id, "user_id", None)
+        if uid is None:
+            try:
+                int(chat_id)
+            except Exception:
+                return          # "me" = Saved Messages -> allowed
+        raise ValueError("Could not find the input entity for "
+                         f"PeerUser(user_id={uid if uid is not None else chat_id})")
+
+    async def get_input_entity(self, chat_id):
+        """Telethon jaisa entity resolve: session me ho to peer, warna error."""
+        self.input_entity_calls.append(chat_id)
         try:
-            int(chat_id)
+            uid = int(chat_id)
         except Exception:
-            return          # "me" = Saved Messages -> allowed
-        raise ValueError(f"Could not find the input entity for PeerUser(user_id={chat_id})")
+            return chat_id   # "me" vagera
+        if uid in self.known_entities:
+            return SimpleNamespace(user_id=uid, access_hash=self.known_entities[uid])
+        if self.mode == "strict_entity":
+            # server log wali asli error: account ne user ko kabhi dekha hi nahi
+            raise ValueError(f"Could not find the input entity for PeerUser(user_id={uid})")
+        # default: Telethon session/dialogs se khud resolve kar leta hai
+        return SimpleNamespace(user_id=uid, access_hash=900000 + (uid % 1000))
 
     async def forward_messages(self, entity, messages, from_peer=None, **kw):
         self.forwards.append({"to": entity, "msg": messages, "from_peer": from_peer})
@@ -695,6 +738,10 @@ class FakeTLClient:
 
     async def __call__(self, request):
         self.raw_calls.append(request)
+        if type(request).__name__ == "GetChatInviteImportersRequest":
+            users = list(self.invite_users)
+            importers = [SimpleNamespace(user_id=int(getattr(u, "id", 0) or 0)) for u in users]
+            return SimpleNamespace(users=users, importers=importers)
         return SimpleNamespace(users=[], importers=[])
 
 
@@ -713,6 +760,11 @@ def _fake_update(q=None, uid=999, msg=None):
 def _kb_labels(markup):
     data = markup.to_dict() if hasattr(markup, "to_dict") else markup
     return [b.get("text", "") for row in data.get("inline_keyboard", []) for b in row]
+
+
+def _peer_uid(x):
+    """Telethon peer (InputPeerUser) ho ya seedha int - user_id nikaalo."""
+    return int(getattr(x, "user_id", x))
 
 
 class _LogCapture(logging.Handler):
@@ -1597,7 +1649,7 @@ def test_user_account_mode():
     good_sender = A.UserAccountSender("ua123", 999, good_client, account_user_id=123)
     member2 = SimpleNamespace(id=889, first_name="Sita", username="sita", is_bot=False, last_name="")
     run(A.process_member_left("ua123", member2, -100123, "Test Channel", sender=good_sender))
-    check("leave: reachable ko DM gaya", any(m["chat_id"] == 889 for m in good_client.sent_messages),
+    check("leave: reachable ko DM gaya", any(_peer_uid(m["chat_id"]) == 889 for m in good_client.sent_messages),
           str(good_client.sent_messages)[:140])
 
     # --- panel + routing
@@ -2117,7 +2169,7 @@ def test_user_account_dm_start():
     check("dm start: panel DM gaya", any("MANAGE USER ACCOUNT" in t for t in texts), str(texts)[:180])
     check("dm start: panel me account id", any("ua8394878310" in t for t in texts))
     check("dm start: plan dikhaya", any("Basic" in t for t in texts))
-    check("dm start: panel manager ke DM me", fake.sent_messages[0]["chat_id"] == 8394878310)
+    check("dm start: panel manager ke DM me", _peer_uid(fake.sent_messages[0]["chat_id"]) == 8394878310)
     check("dm start: /start wale message par reply", fake.sent_messages[-1].get("reply_to") is not None)
     check("dm start: page ke baad hint", any("Panel upar bhej diya" in t for t in texts))
 
@@ -2405,7 +2457,7 @@ def test_diagnostics():
         _stop_capture(handler, root, old_level)
     check("test dm: DM gaya", len(fake.sent_messages) == 1, str(fake.sent_messages)[:80])
     check("test dm: test text", "Test DM" in fake.sent_messages[-1]["text"], fake.sent_messages[-1]["text"][:60])
-    check("test dm: manager ko gaya", fake.sent_messages[-1]["chat_id"] == A.ADMIN_USER_ID)
+    check("test dm: manager ko gaya", _peer_uid(fake.sent_messages[-1]["chat_id"]) == A.ADMIN_USER_ID)
     check("test dm: log me ok", any("test DM (auto) -> " in r.getMessage() and ": ok" in r.getMessage()
                                     for r in handler.records),
           str([r.getMessage() for r in handler.records if "test DM" in r.getMessage()])[:120])
@@ -2621,7 +2673,7 @@ def test_saved_messages_forward():
           bool(fake2.sent_messages) and fake2.sent_messages[0]["chat_id"] == "me",
           str(fake2.sent_messages)[:120])
     check("saved: phir user ko forward hua",
-          bool(fake2.forwards) and int(fake2.forwards[-1]["to"]) == 777001
+          bool(fake2.forwards) and _peer_uid(fake2.forwards[-1]["to"]) == 777001
           and fake2.forwards[-1]["from_peer"] == "me", str(fake2.forwards)[:150])
     check("saved: forward ka message_id PTB jaisa", res.message_id == 901, str(res.message_id))
     check("saved: rasta yaad rakha (agli baar saved pehle)",
@@ -2725,6 +2777,154 @@ def test_saved_messages_forward():
           str([r.getMessage() for r in handler.records if "diag test" in r.getMessage()])[:160])
     A.user_account_clients.pop("ua8394878310", None)
     A._UA_SEND_MODE.clear()
+
+
+def test_entity_and_media_fixes():
+    print("\n[23] entity (access_hash) + media file_id + PeerUser(0) fix (server log)")
+    A.reset_premium_styling_state()
+    A._UA_SEND_MODE.clear()
+    A._WARN_ONCE_KEYS.clear()
+    A.db.entity_cache = {}
+    uid = 8394878310
+
+    # --- 1. pending requesters: offset_user=0 nahi, InputUserEmpty (PeerUser(0) fix)
+    fake = FakeTLClient(me_id=uid)
+    fake.invite_users = [SimpleNamespace(id=777001, access_hash=111001),
+                         SimpleNamespace(id=777002, access_hash=111002)]
+    sender = A.UserAccountSender("ua8394878310", 999, fake, account_user_id=uid)
+    reqs = run(sender.list_pending_join_requesters(-100123))
+    check("pending: requesters mile", [u.id for u in reqs] == [777001, 777002], str(reqs))
+    last_req = fake.raw_calls[-1]
+    check("pending: offset_user InputUserEmpty (0 nahi)",
+          type(getattr(last_req, "offset_user", None)).__name__ == "InputUserEmpty",
+          str(type(getattr(last_req, "offset_user", None)))[:120])
+    check("pending: access_hash memory me yaad",
+          A._UA_ENTITY_MEM.get("ua8394878310", {}).get(777001) == 111001,
+          str(A._UA_ENTITY_MEM)[:120])
+    check("pending: access_hash DB me yaad",
+          A.db.get_user_access_hash("ua8394878310", 777002) == 111002)
+
+    # --- 2. _resolve_peer: cache hit -> sahi access_hash wala peer, dobara lookup nahi
+    peer = run(sender._resolve_peer(777001))
+    check("resolve: cache se peer",
+          _peer_uid(peer) == 777001 and int(peer.access_hash) == 111001, str(peer)[:120])
+    check("resolve: get_input_entity call nahi (cache hit)", fake.input_entity_calls == [],
+          str(fake.input_entity_calls))
+
+    # --- 3. DM me peer jata hai (Telethon ko access_hash milta hai)
+    fake.sent_messages.clear()
+    res = run(sender.send_message(777001, "Hello peer", parse_mode="HTML"))
+    got = fake.sent_messages[-1]["chat_id"]
+    check("send: peer object gaya",
+          _peer_uid(got) == 777001 and int(got.access_hash) == 111001, str(got)[:120])
+    check("send: message_id mila", res is not None and res.message_id > 0, str(res))
+
+    # --- 4. cache miss + strict entity: channel hint se join-request list se resolve
+    A._UA_ENTITY_MEM.clear()
+    A.db.entity_cache = {}
+    fake2 = FakeTLClient(me_id=uid, mode="strict_entity")
+    fake2.invite_users = [SimpleNamespace(id=777010, access_hash=222010)]
+    sender2 = A.UserAccountSender("ua8394878310", 999, fake2, account_user_id=uid)
+    tok = A._UA_CHANNEL_HINT.set(-100123)
+    try:
+        peer2 = run(sender2._resolve_peer(777010))
+    finally:
+        A._UA_CHANNEL_HINT.reset(tok)
+    check("hint: channel list se resolve",
+          _peer_uid(peer2) == 777010 and int(peer2.access_hash) == 222010, str(peer2)[:120])
+    check("hint: yaad ho gaya (agli baar seedha)",
+          A._UA_ENTITY_MEM.get("ua8394878310", {}).get(777010) == 222010)
+
+    # --- 4b. send_dm_fallback hints do_send tak pahunchata hai
+    seen = {}
+
+    async def _do_send2(snd):
+        seen["chan"] = A._UA_CHANNEL_HINT.get()
+        seen["mediabot"] = A._UA_MEDIA_BOT_HINT.get()
+
+    ok, err, _used = run(A.send_dm_fallback("ua8394878310", 777010, _do_send2, primary=sender2,
+                                            owner_id=999, channel_id=-100123))
+    check("hint: channel hint do_send tak pahuncha", seen.get("chan") == -100123, str(seen))
+    check("hint: media bot hint do_send tak pahuncha",
+          seen.get("mediabot") == "ua8394878310", str(seen))
+    check("hint: ok", ok is True and err is None, str((ok, err)))
+
+    # --- 5. media: channel wale bot ka token pehle, phir main bot
+    A.db.user_bots = [{"bot_id": "b1", "user_id": 999, "account_type": "bot",
+                       "bot_username": "chanbot", "bot_token": "CHAN-TOKEN", "is_active": 1}]
+    tried = []
+
+    async def _fake_dl(file_id, tokens):
+        tried.extend(tokens or [])
+        return "/tmp/ua_chan_media.bin" if "CHAN-TOKEN" in (tokens or []) else None
+
+    real_dl = A.bot_api_download_file
+    A.bot_api_download_file = _fake_dl
+    try:
+        got_path = run(A.materialize_media("SOME-FILE-ID", None,
+                                           extra_tokens=["CHAN-TOKEN", "MAIN-TOKEN"]))
+    finally:
+        A.bot_api_download_file = real_dl
+    check("media: channel token se download hua", got_path == "/tmp/ua_chan_media.bin", str(got_path))
+    check("media: dono token try hue", tried == ["CHAN-TOKEN", "MAIN-TOKEN"], str(tried))
+
+    mtok = A._UA_MEDIA_BOT_HINT.set("b1")
+    try:
+        mt = sender._media_tokens()
+    finally:
+        A._UA_MEDIA_BOT_HINT.reset(mtok)
+    check("media: channel token pehle", mt and mt[0] == "CHAN-TOKEN", str(mt))
+
+    # cache hit par download dobara nahi
+    fd, tmpp = tempfile.mkstemp(prefix="ua_cache_")
+    os.close(fd)
+    A._UA_MEDIA_CACHE[("CHAN-TOKEN", "CACHED-ID")] = tmpp
+    dl_calls = []
+
+    async def _fake_dl2(file_id, tokens):
+        dl_calls.append(file_id)
+        return None
+
+    A.bot_api_download_file = _fake_dl2
+    try:
+        hit = run(A.materialize_media("CACHED-ID", None, extra_tokens=["CHAN-TOKEN", "MAIN"]))
+    finally:
+        A.bot_api_download_file = real_dl
+        os.unlink(tmpp)
+    check("media: cache hit par download nahi", hit == tmpp and dl_calls == [],
+          f"{hit} {dl_calls}")
+
+    # --- 6. log shor band: entity/file error par "retrying plainly" nahi, ek line
+    check("retry: entity par plain retry nahi",
+          A._should_plain_retry(A.BadRequest("Could not find the input entity for PeerUser")) is False)
+    check("retry: file error par plain retry nahi",
+          A._should_plain_retry(A.BadRequest("Failed to convert BAACxxx to media")) is False)
+    check("retry: html error par plain retry haan",
+          A._should_plain_retry(A.BadRequest("Can't parse entities: end of tag")) is True)
+
+    class _EntityFailBot:
+        async def send_message(self, chat_id, text, *a, **k):
+            raise A.BadRequest("Could not find the input entity for PeerUser(user_id=1)")
+
+    handler, root, old_level = _capture_logs()
+    try:
+        res_none = run(A.send_user_message(_EntityFailBot(), 777020, "Hi"))
+    finally:
+        _stop_capture(handler, root, old_level)
+    warns = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+    check("retry: entity par sirf 1 warning", len(warns) == 1, str(warns)[:200])
+    check("retry: 'retrying plainly' nahi", not any("retrying plainly" in w for w in warns),
+          str(warns)[:200])
+    check("retry: None wapas (raise nahi)", res_none is None)
+
+    handler2, root2, old2 = _capture_logs()
+    try:
+        A._warn_once("test:key", "pehli warning")
+        A._warn_once("test:key", "pehli warning")
+    finally:
+        _stop_capture(handler2, root2, old2)
+    w2 = [r.getMessage() for r in handler2.records if r.levelno == logging.WARNING]
+    check("warn-once: ek hi baar", w2 == ["pehli warning"], str(w2))
 
 
 def test_user_account_owner_flow_adapter():
@@ -2887,6 +3087,7 @@ def main():
     test_user_account_boot_without_subscription()
     test_dm_user_account_fallback()
     test_saved_messages_forward()
+    test_entity_and_media_fixes()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:
