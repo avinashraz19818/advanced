@@ -2136,6 +2136,16 @@ def test_user_account_owner_flow_adapter():
           any("Add Channel" in l for l in _kb_labels(acc_msg.replies[-1][1].get("reply_markup"))),
           str(_kb_labels(acc_msg.replies[-1][1].get("reply_markup"))))
 
+    # --- account se manage button dabane par permission mile
+    mctx = FakeCtx()
+    mq = FakeQuery(mctx, uid=acc_uid)
+    mq.data = "manage_bot_ua8394878310"
+    run(A.callback_handler(_fake_update(q=mq, uid=acc_uid), mctx))
+    qtexts = [t or "" for t, _ in mq.edits]
+    check("self-owner: manage_bot_ panel khula", any("MANAGE USER ACCOUNT" in t for t in qtexts),
+          str([t[:70] for t in qtexts]))
+    check("self-owner: permission error nahi", not any("permission" in t.lower() for t in qtexts))
+
     # --- UserAccountSender ke panel helpers
     sender = A.user_account_clients["ua8394878310"]
     check("sender: delete_message hai", callable(getattr(sender, "delete_message", None)))

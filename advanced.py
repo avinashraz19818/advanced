@@ -6618,8 +6618,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not bot_data:
                 await safe_edit_message_text(q, f"{pe('❌')} Bot not found!", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
-            # Check if user is owner OR admin
-            if bot_data.get("user_id") != uid and not is_admin(uid):
+            # Check if user is owner OR admin (user account ka apna id bhi owner hai)
+            if not is_bot_owner(bot_id, uid):
                 await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
             _icon = "👤" if (bot_data.get("account_type") or "bot") == "user" else "🤖"
