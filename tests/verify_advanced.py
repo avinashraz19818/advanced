@@ -1803,6 +1803,16 @@ def test_html_safety_and_welcome_spam():
     check("hint me raw <id>/<hash> nahi", not raw, str(raw))
     check("hint me asli command hai", "TELEGRAM_API_ID=" in A.TELEGRAM_API_HINT)
 
+    # --- example/dummy api values par saaf message (Telegram ka asli error)
+    fake_status = ("error:The api_id/api_hash combination is invalid "
+                   "(caused by SendCodeRequest)")
+    friendly = A._ua_login_error(fake_status)
+    check("api invalid: asli values ka rasta batata hai", "my.telegram.org" in friendly and "asli" in friendly,
+          friendly[:90])
+    check("api invalid: HTML safe", _STRAY_TAG_RE.search(A.sanitize_telegram_html(friendly)) is None,
+          str(_STRAY_TAG_RE.search(A.sanitize_telegram_html(friendly))))
+    check("api invalid: example values ka zikr", "example/dummy" in friendly, friendly[:90])
+
     # --- strict bot par poora login error path (jaise user ko dikhta hai)
     ctx = FakeCtx()
     ctx.user_data.clear()

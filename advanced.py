@@ -5244,6 +5244,12 @@ def _ua_login_error(status: str) -> str:
         "code_expired": "Code expire ho gaya. Login dobara shuru karo (➕ Add Account → 👤 User Account).",
         "password_invalid": "Password galat hai. Dobara bhejo (ya Cancel karke naya login shuru karo).",
     }
+    if "api_id/api_hash combination is invalid" in code.lower() or "api_id_invalid" in code.lower():
+        # Aksar yahan example/dummy values hoti hain (my.telegram.org se asli lena padta hai)
+        return ("Telegram ne ye api_id/api_hash reject kar diye.\n\n"
+                "Zaroori nahi ki galat ho - ho sakta hai ye <b>example/dummy values</b> hon. "
+                "my.telegram.org se <b>asli</b> api_id + api_hash lo aur `.env` me daalo:\n\n"
+                + TELEGRAM_API_HINT)
     if status and status.startswith("flood:"):
         secs = status.split(":", 1)[1]
         return f"Telegram ne flood-limit laga di hai ({secs}s). Thodi der baad dobara try karo."
