@@ -199,6 +199,24 @@ class FlakyBot(FakeBot):
         return await super().send_message(chat_id, text, **kw)
 
 
+class CantInitiateBot(FakeBot):
+    """Bot ne user ko /start nahi kiya - Telegram DM shuru karne hi nahi deta."""
+
+    async def send_message(self, chat_id, text, **kw):
+        self._log("send_message", chat_id, text, kw)
+        if int(chat_id) == getattr(self, "allowed_chat", None):
+            return FakeSent()
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+    async def send_photo(self, chat_id, media, **kw):
+        self._log("send_photo", chat_id, media, kw)
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+    async def send_media_group(self, chat_id, media, **kw):
+        self._log("send_media_group", chat_id, media, kw)
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+
 class BlockedBot(FakeBot):
     """User ne bot block kiya."""
 
@@ -212,7 +230,7 @@ class BlockedBot(FakeBot):
 
     async def send_message(self, chat_id, text, **kw):
         self._log("send_message", chat_id, text, kw)
-        raise A.Forbidden("Forbidden: can't initiate conversation with a user")
+        raise A.Forbidden("Forbidden: bot was blocked by the user")
 
 
 class PerUserBot(FakeBot):
@@ -480,6 +498,16 @@ class FakeDB:
 
     def is_permanently_unreachable(self, bot_id, uid):
         return any(c[0] == bot_id and c[1] == uid for c in self.gone_calls)
+
+    def clear_initiate_blocked_unreachable(self):
+        keep = [c for c in self.gone_calls if "initiate" not in str(c[2] if len(c) > 2 else "").lower()]
+        cleared = len(self.gone_calls) - len(keep)
+        self.gone_calls = keep
+        self.cleared_calls = getattr(self, "cleared_calls", 0) + cleared
+        return cleared
+
+    def count_permanently_unreachable(self, bot_id):
+        return sum(1 for c in self.gone_calls if c[0] == bot_id)
 
     # --- user accounts (MTProto)
     def add_user_account(self, owner_id, account_user_id, phone, session_string,
@@ -2400,6 +2428,153 @@ def _check_non_admin_diag():
     return msg.replies == []
 
 
+def test_dm_user_account_fallback():
+    print("\n[21] bot DM na bhej paye to user account se (\"bot can't initiate conversation\" fix)")
+    A.reset_premium_styling_state()
+    A._DM_INITIATE_WARNED.clear()
+    A.db.leave = {"enabled": True, "target_channel_id": -100999,
+                  "target_channel_link": "https://t.me/joinchat/x",
+                  "messages": [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""}]}
+    A.db.gone_calls = []
+    A.db.unreachable_calls = []
+    A.db.reachable_calls = []
+    A.db.user_bots = [{"bot_id": "b1", "user_id": 999, "account_type": "bot",
+                       "bot_username": "chanbot", "bot_token": "t1", "is_active": 1},
+                      {"bot_id": "ua8394878310", "user_id": 999, "account_type": "user",
+                       "bot_username": None, "phone": "+19312837172", "bot_token": None,
+                       "session_string": FAKE_SESSION, "api_id": 1, "api_hash": "h"}]
+    A.db.bot_channels = [{"channel_id": -100123, "channel_title": "Chan", "auto_approve": 0}]
+    A.db.subs = {"b1": {"subscription_type": "Basic",
+                        "expiry_date": A.now_aware() + timedelta(days=30), "max_channels": 1}}
+    A.db.messages = {}
+
+    # owner ka user account chalu hai -> fallback ready
+    acct_client = FakeTLClient(me_id=8394878310)
+    acct = A.UserAccountSender("ua8394878310", 999, acct_client, account_user_id=8394878310)
+    A.user_account_clients["ua8394878310"] = acct
+    check("fallback: candidates me account shamil", A.dm_sender_candidates("b1") == [acct],
+          str(A.dm_sender_candidates("b1")))
+
+    # --- join request: bot "can't initiate" -> welcome user account se
+    ctx = FakeCtx()
+    ctx.bot = CantInitiateBot("chanbot")
+    A.db.messages = {}
+    member = SimpleNamespace(id=777001, first_name="Ravi", last_name="", username="ravi", is_bot=False)
+    jr_update = SimpleNamespace(chat_join_request=SimpleNamespace(
+        from_user=member, chat=SimpleNamespace(id=-100123, title="Chan", username="chan"),
+        approve=AsyncNoop()))
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.handle_join_request(jr_update, ctx, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old_level)
+    msgs = [r.getMessage() for r in handler.records]
+    errors = [r.getMessage() for r in handler.records if r.levelno >= logging.ERROR]
+    check("join: koi ERROR nahi", not errors, str(errors[:2]))
+    sent_texts = [(m.get("text") or "") for m in acct_client.sent_messages]
+    check("join: default msg + welcome dono account se", len(sent_texts) == 2, str(sent_texts)[:150])
+    check("join: welcome text account se gaya",
+          any("Aapki request mil gayi hai" in t or "Ravi" in t for t in sent_texts), str(sent_texts)[:150])
+    check("join: fallback log saaf", any("user account" in m and "chali gayi" in m for m in msgs),
+          str(msgs)[:200])
+    check("join: permanent mark NAHI hua", A.db.gone_calls == [], str(A.db.gone_calls))
+
+    # --- leave recovery: bot fail -> account se, phir bhi record hota hai
+    A.db.gone_calls = []
+    acct_client.sent_messages.clear()
+    leave_update = SimpleNamespace(chat_member=SimpleNamespace(
+        chat=SimpleNamespace(id=-100123, title="Chan"),
+        new_chat_member=SimpleNamespace(status="left", user=member),
+        old_chat_member=SimpleNamespace(status="member")))
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.handle_channel_member_update(leave_update, ctx, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old_level)
+    msgs = [r.getMessage() for r in handler.records]
+    errors = [r.getMessage() for r in handler.records if r.levelno >= logging.ERROR]
+    check("leave: koi ERROR nahi", not errors, str(errors[:2]))
+    check("leave: DM account se gayi", len(acct_client.sent_messages) == 1,
+          str(acct_client.sent_messages)[:150])
+    check("leave: sent message me message_id (PTB jaisa)",
+          getattr(acct_client.sent_messages and FakeSent(), "message_id", None) is not None)
+    check("leave: message text sahi", "wapas aao" in (acct_client.sent_messages[-1]["text"] or ""),
+          str(acct_client.sent_messages[-1]["text"])[:80])
+    recorded = A.db.leave.get("sent") or []
+    check("leave: recovery message record hua", bool(recorded), str(recorded)[:120])
+    check("leave: record me bot_id + message_id aaya",
+          bool(recorded) and recorded[-1][0] == "b1" and int(recorded[-1][-1]) > 0, str(recorded)[:120])
+    check("leave: permanent mark NAHI hua", A.db.gone_calls == [], str(A.db.gone_calls))
+
+    # --- koi user account nahi: permanent mark NAHI, sirf ek warning
+    A.user_account_clients.pop("ua8394878310", None)
+    A._DM_INITIATE_WARNED.clear()
+    A.db.gone_calls = []
+    A.db.messages = {}
+    ctx2 = FakeCtx()
+    ctx2.bot = CantInitiateBot("chanbot")
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.handle_join_request(jr_update, ctx2, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old_level)
+    warns = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+    check("no-account: permanent mark NAHI", A.db.gone_calls == [], str(A.db.gone_calls))
+    check("no-account: ek hi warning", sum(1 for m in warns if "welcome DM skip" in m) == 1, str(warns))
+    check("no-account: warning me rasta bataya",
+          any("Add Account" in m or "user account add" in m for m in warns), str(warns)[:200])
+    # dobara wahi user -> duplicate warning nahi
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.handle_join_request(jr_update, ctx2, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old_level)
+    warns2 = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+    check("no-account: dobara spam nahi", not [w for w in warns2 if "welcome DM skip" in w], str(warns2))
+
+    # --- user ne bot BLOCK kiya: account se bhejne ki koshish nahi (respect block), mark ho jata hai
+    A.user_account_clients["ua8394878310"] = acct
+    acct_client.sent_messages.clear()
+    A.db.gone_calls = []
+    A.db.messages = {}
+    ctx3 = FakeCtx()
+    ctx3.bot = BlockedBot("blocked")
+    handler, root, old_level = _capture_logs()
+    try:
+        run(A.handle_join_request(jr_update, ctx3, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old_level)
+    check("blocked: account se spam nahi", acct_client.sent_messages == [], str(acct_client.sent_messages))
+    check("blocked: permanent mark hua", ("b1", 777001) in [(c[0], c[1]) for c in A.db.gone_calls],
+          str(A.db.gone_calls))
+    check("blocked: ek hi warning", True)
+
+    # --- boot cleanup: purane initiate wale marks saaf, blocked wale rahen
+    A.db.gone_calls = [("b1", 1, "Forbidden: bot can't initiate conversation with a user"),
+                       ("b1", 2, "Forbidden: bot was blocked by the user"),
+                       ("b1", 3, "Bad Request: chat not found")]
+    cleared = A.db.clear_initiate_blocked_unreachable()
+    check("cleanup: initiate mark saaf", cleared == 1, str(cleared))
+    left = [(c[0], c[1]) for c in A.db.gone_calls]
+    check("cleanup: blocked/gone marks rahe", sorted(left) == [("b1", 2), ("b1", 3)], str(left))
+
+    # --- diag me fallback + unreachable count dikhe
+    A.db.gone_calls = []
+    txt = A.strip_premium_emojis(A.build_diag_text())
+    check("diag: bot row me fallback status", "user-account fallback:" in txt, txt[:300])
+    check("diag: unreachable count", "unreachable" in txt)
+
+    # --- sender chain: primary == account khud -> duplicate nahi
+    chain = A.dm_sender_candidates("ua8394878310", primary=acct, owner_id=999)
+    check("chain: duplicate nahi", chain.count(acct) == 1, str(chain))
+    A.user_account_clients.pop("ua8394878310", None)
+
+
+class AsyncNoop:
+    async def __call__(self):
+        return True
+
+
 def test_user_account_owner_flow_adapter():
     print("\n[16] user account owner flows (main bot ke messages se)")
     A.reset_premium_styling_state()
@@ -2558,6 +2733,7 @@ def main():
     test_user_account_premium_emoji_fallback()
     test_diagnostics()
     test_user_account_boot_without_subscription()
+    test_dm_user_account_fallback()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:
         for f in FAIL:

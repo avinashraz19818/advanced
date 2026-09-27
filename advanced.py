@@ -299,7 +299,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-09-27-r13f"
+BUILD_TAG = "2026-09-27-r14"
 START_TS = time.time()
 # User account subscription ke bina bhi online rahe? (owner ka apna account hai, DM/panel
 # chalta rehna chahiye). Purana behaviour chahiye to .env me UA_START_WITHOUT_SUBSCRIPTION=0
@@ -759,9 +759,14 @@ def build_diag_text() -> str:
             chans = len(db.get_bot_channels(bot_id) or [])
         except Exception:
             chans = "?"
+        try:
+            gone = db.count_permanently_unreachable(bot_id)
+        except Exception:
+            gone = "?"
         lines.append(f"{pe('🆔')} <code>{bot_id}</code> | {account_display_name(row, bot_id)}")
         lines.append(f"   {pe('▶️')} chalu: {'🟢 haan' if running else '🔴 NAHI'}"
-                     f" | connected: {connected} | channels: {chans}")
+                     f" | connected: {connected} | channels: {chans}"
+                     f" | unreachable users: {gone}")
         if running:
             mode = "custom emoji OK" if _ua_premium_emoji_allowed(bot_id) else "plain emoji (fallback)"
             lines.append(f"   {pe('📨')} DM mile: {sender.dm_count}"
@@ -782,8 +787,14 @@ def build_diag_text() -> str:
         lines.append(f"{pe('ℹ️')} koi bot account add nahi hai")
     for row in bots[:5]:
         bot_id = row.get("bot_id") or "?"
+        try:
+            gone = db.count_permanently_unreachable(bot_id)
+        except Exception:
+            gone = "?"
+        fallback_ready = "haan" if dm_sender_candidates(bot_id)[1:] else "NAHI"
         lines.append(f"   {pe('▶️')} <code>{bot_id}</code> | "
-                     f"{'🟢 chalu' if bot_id in user_bot_applications else '🔴 band'}")
+                     f"{'🟢 chalu' if bot_id in user_bot_applications else '🔴 band'}"
+                     f" | unreachable: {gone} | user-account fallback: {fallback_ready}")
     lines.append("")
     lines.append(f"{pe('📌')} DM test: account chat me <code>/start</code> bhejo, phir yahi /diag "
                  f"- 'DM mile' aur 'aakhri' bad jana chahiye.")
@@ -795,6 +806,7 @@ def diag_kb() -> InlineKeyboardMarkup:
     rows = []
     for bot_id in list(user_account_clients.keys())[:5]:
         rows.append([btn("Test DM bhejo", f"diag_test_{bot_id}", "success", "🧪")])
+    rows.append([btn("Unreachable reset", "diag_reset_unreachable", "success", "🧹")])
     rows.append([btn("Refresh", "admin_diag", "primary", "🔄")])
     rows.append([btn("Admin Panel", "admin_panel", "primary", "👑")])
     return InlineKeyboardMarkup(rows)
@@ -1321,6 +1333,25 @@ class Database:
                VALUES (%s,%s,%s,now()) ON CONFLICT (bot_id, requester_id)
                DO UPDATE SET reason=EXCLUDED.reason, failed_at=now()""",
             (bot_id, requester_id, (reason or "")[:200]))
+
+    def clear_initiate_blocked_unreachable(self) -> int:
+        """Sirf wo marks hatao jinka reason "bot can't initiate conversation" tha.
+
+        Ye marks sach me permanent nahi the: user account se DM ja sakti hai, ya user baad me
+        bot ko /start kar de to bhi. Blocked/deactivated users ke marks waise hi rahenge.
+        """
+        try:
+            rows = self._fetchall("""DELETE FROM unreachable_users
+                   WHERE reason ILIKE %s OR reason ILIKE %s RETURNING requester_id""",
+                                  ("%initiate conversation%", "%can't initiate%"))
+            return len(rows or [])
+        except Exception as ex:
+            logging.warning(f"unreachable marks clear nahi hua: {mask_secrets(ex)}")
+            return 0
+
+    def count_permanently_unreachable(self, bot_id: str) -> int:
+        row = self._fetchone("SELECT COUNT(*) AS c FROM unreachable_users WHERE bot_id=%s", (bot_id,))
+        return int(row["c"]) if row else 0
 
     def get_requesters_for_bot(self, bot_id: str):
         """Broadcast audience: reachable users + approved join requests (ek id ek baar).
@@ -4424,39 +4455,34 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
     if auto is None:
         auto = int(channel_row.get("auto_approve", 0) or 0) == 1
 
+    default_msg_text = None
     try:
         default_msg_text = render_dynamic_text(db.get_default_first_message(), requester)
-        if default_msg_text:
-            await send_user_message(sender, requester.id, default_msg_text, parse_mode=ParseMode.HTML)
-    except Forbidden as ex:
-        # User ne bot block kiya / DM shuru nahi ho sakti -> aage ke welcome messages bhi
-        # fail honge. Ek hi WARNING + yaad rakho (pehle yahan ERROR spam hota tha).
-        db.mark_unreachable(bot_id, requester.id)
-        db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
-        logging.warning(f"welcome DM skip (user {requester.id} reachable nahi): {mask_secrets(ex)}")
-        if approve is not None and auto:
-            try:
-                await approve()
-            except Exception:
-                pass
-        return
-    except BadRequest as ex:
-        if is_user_gone_error(ex):
-            db.mark_unreachable(bot_id, requester.id)
-            db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
-            logging.warning(f"welcome DM skip (user {requester.id}): {mask_secrets(ex)}")
-            return
-        logging.error(f"Default first message send error: {mask_secrets(ex)}")
-    except (NetworkError, TimedOut) as ex:
-        logging.warning(f"welcome DM network hiccup (transient): {mask_secrets(ex)}")
-        return
     except Exception as ex:
-        logging.error(f"Default first message send error: {mask_secrets(ex)}")
+        logging.error(f"Default first message render error: {mask_secrets(ex)}")
+    if default_msg_text:
+        # Bot DM na bhej paye to owner ka user account (fallback) - dekho send_dm_fallback
+        ok, err, _used_ua = await send_dm_fallback(
+            bot_id, requester.id,
+            lambda snd: send_user_message(snd, requester.id, default_msg_text, parse_mode=ParseMode.HTML),
+            primary=sender, owner_id=owner_id, kind="Default first message")
+        if not ok:
+            stop = dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM",
+                                           ua_available=bool(owner_user_account_senders(owner_id)))
+            if stop and isinstance(err, (Forbidden, BadRequest)) and is_user_gone_error(err) \
+                    and approve is not None and auto:
+                try:
+                    await approve()
+                except Exception:
+                    pass
+            if stop or isinstance(err, (NetworkError, TimedOut, AccountLimitedError)):
+                return
 
     msgs = db.get_messages(chat_id, bot_id)
-    try:
+
+    async def _send_welcome(snd):
         if msgs:
-            await _send_messages_with_media_groups(requester.id, msgs, sender, bot_id=bot_id,
+            await _send_messages_with_media_groups(requester.id, msgs, snd, bot_id=bot_id,
                                                    attach_start_button=True, placeholder_user=requester)
         else:
             wm = render_dynamic_text(channel_row.get("welcome_message") or DEFAULT_WELCOME_MESSAGE, requester)
@@ -4464,25 +4490,17 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
             wtype = channel_row.get("welcome_media_type")
             markup = buttons_to_markup(buttons_json_from_text(wm) or None)
             if wid and wtype:
-                await send_media(sender, requester.id, wid, wtype, wm, markup)
+                await send_media(snd, requester.id, wid, wtype, wm, markup)
             elif wm:
-                await send_user_message(sender, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await send_user_message(snd, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    ok, err, _used_ua = await send_dm_fallback(
+        bot_id, requester.id, _send_welcome, primary=sender, owner_id=owner_id, kind="Welcome DM")
+    if ok:
         db.mark_reachable(bot_id, requester.id)
-    except Forbidden as ex:
-        db.mark_unreachable(bot_id, requester.id)
-        db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
-        logging.warning(f"welcome DM skip (user {requester.id} reachable nahi): {mask_secrets(ex)}")
-    except BadRequest as ex:
-        if is_user_gone_error(ex):
-            db.mark_unreachable(bot_id, requester.id)
-            db.mark_permanently_unreachable(bot_id, requester.id, str(ex))
-            logging.warning(f"welcome DM skip (user {requester.id}): {mask_secrets(ex)}")
-        else:
-            logging.error(f"Send welcome error: {mask_secrets(ex)}")
-    except (NetworkError, TimedOut) as ex:
-        logging.warning(f"welcome DM network hiccup (transient): {mask_secrets(ex)}")
-    except Exception as ex:
-        logging.error(f"Send welcome error: {mask_secrets(ex)}")
+    else:
+        dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM",
+                                ua_available=bool(owner_user_account_senders(owner_id)))
 
     db.add_join_request(bot_id, requester.id, chat_id, 'approved' if auto else 'pending')
     if auto and approve is not None:
@@ -4491,6 +4509,18 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
         except Exception as ex:
             if 'User_already_participant' not in str(ex) and 'USER_ALREADY_PARTICIPANT' not in str(ex):
                 logging.error(f"Approve error: {mask_secrets(ex)}")
+
+
+async def _send_leave_message(bot_id: str, user_id, owner_id, primary, do_send):
+    """Leave-recovery DM: sender chain par bhejo. Return (ok, sent_message, error, used_ua)."""
+    box = {"sent": None}
+
+    async def _wrapped(snd):
+        box["sent"] = await do_send(snd)
+
+    ok, err, used_ua = await send_dm_fallback(bot_id, user_id, _wrapped, primary=primary,
+                                              owner_id=owner_id, kind="leave recovery DM")
+    return ok, box["sent"], err, used_ua
 
 
 async def process_member_left(bot_id: str, member_user, chat_id: int,
@@ -4534,27 +4564,20 @@ async def process_member_left(bot_id: str, member_user, chat_id: int,
                 leave_markup = buttons_to_markup(lm_buttons)
             else:
                 leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
+            owner_id = (db.get_user_bot(bot_id) or {}).get("user_id") or 0
             try:
-                sent = await send_user_message(sender, member_user.id, text,
-                                               parse_mode=ParseMode.HTML, reply_markup=leave_markup)
-            except Forbidden as ex:
-                db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
-                logging.warning(f"leave recovery DM skip (user {member_user.id} reachable nahi): "
-                                f"{mask_secrets(ex)}")
-                break
-            except BadRequest as ex:
-                if is_user_gone_error(ex):
-                    db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
-                    logging.warning(f"leave recovery DM skip (user {member_user.id}): {mask_secrets(ex)}")
-                else:
-                    logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
-                break
-            except (NetworkError, TimedOut) as ex:
-                logging.warning(f"leave recovery DM network hiccup (transient): {mask_secrets(ex)}")
-                break
-            except AccountLimitedError as ex:
-                logging.warning(f"leave recovery DM: account limited (flood) - is session me ruk gaya "
-                                f"({mask_secrets(ex)})")
+                # Bot DM na bhej paye to owner ke user account se (Telegram bot ko
+                # "can't initiate conversation" rok deta hai jab tak user /start na kare).
+                sent_ok, sent, err, _used_ua2 = await _send_leave_message(
+                    bot_id, member_user.id, owner_id, sender,
+                    lambda snd: send_user_message(snd, member_user.id, text,
+                                                  parse_mode=ParseMode.HTML, reply_markup=leave_markup))
+                if not sent_ok:
+                    dm_failure_log_and_mark(bot_id, member_user.id, err, "leave recovery DM",
+                                            ua_available=bool(owner_user_account_senders(owner_id)))
+                    break
+            except Exception as ex:
+                logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
                 break
             if sent:
                 db.add_leave_recovery_message(bot_id, member_user.id, chat_id, int(target_channel_id), sent.message_id)
@@ -4933,6 +4956,146 @@ def account_type_from_row(row) -> str:
     return "bot"
 
 
+# Telegram bot us user ko DM nahi kar sakta jisne bot ko kabhi /start nahi kiya. Isi error ke
+# liye user-account fallback chalta hai (user account MTProto se DM bhej sakta hai).
+DM_INITIATE_MARKERS = ("can't initiate conversation", "cant initiate conversation",
+                       "initiate conversation with a user", "bot can't initiate")
+_DM_INITIATE_WARNED: set = set()
+
+
+def is_dm_initiate_blocked(ex) -> bool:
+    """Bot ne DM shuru nahi kar paya (user ne bot ko start nahi kiya) - fallback wala case."""
+    text = str(ex or "").lower()
+    return any(m in text for m in DM_INITIATE_MARKERS)
+
+
+def owner_user_account_senders(owner_id) -> list:
+    """Owner ke chalu user accounts (welcome/leave DM ke liye)."""
+    if not owner_id:
+        return []
+    out = []
+    try:
+        rows = db.get_user_bots_by_owner(int(owner_id)) or []
+    except Exception:
+        rows = []
+    for row in rows:
+        if (row.get("account_type") or "bot") != "user":
+            continue
+        sender = user_account_clients.get(row.get("bot_id"))
+        if sender is not None:
+            out.append(sender)
+    return out
+
+
+def dm_sender_candidates(bot_id: str, primary=None, owner_id=None) -> list:
+    """DM ke liye sender chain: pehle apna sender, phir owner ke user accounts.
+
+    Ek hi account ho aur wahi owner ka ho to wahi use hota hai. Owner ke paas ek bhi chalu
+    user account na ho par poore system me sirf ek user account chalu ho, to wahi fallback
+    banta hai (single-operator setup me bot kisi aur owner ka bhi ho sakta hai) - ek baar
+    log kar dete hain taaki pata rahe.
+    """
+    chain = []
+    if primary is not None:
+        chain.append(primary)
+    owner_senders = owner_user_account_senders(owner_id)
+    for sender in owner_senders:
+        if sender not in chain:
+            chain.append(sender)
+    if not owner_senders:
+        all_accounts = [x for x in user_account_clients.values()]
+        if len(all_accounts) == 1:
+            only = all_accounts[0]
+            if only not in chain:
+                chain.append(only)
+                key = ("only-account", bot_id, getattr(only, "bot_id", ""))
+                if key not in _DM_INITIATE_WARNED:
+                    _DM_INITIATE_WARNED.add(key)
+                    logging.info(f"{bot_id}: owner ka koi user account nahi mila - DM fallback ke liye "
+                                 f"available account {getattr(only, 'bot_id', '?')} use karenge")
+    return chain
+
+
+async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, owner_id=None,
+                           kind: str = "DM"):
+    """`do_send(sender)` ko sender chain par try karo.
+
+    Return: (ok, error, used_user_account)
+      * ok=True  -> message chala gaya (used_user_account=True matlab bot se nahi, account se gaya)
+      * ok=False -> sab senders fail; error me aakhri exception
+    Network/flood errors par agla sender try nahi karte (warna do jagah se spam ho sakta hai).
+    """
+    chain = dm_sender_candidates(bot_id, primary=primary, owner_id=owner_id)
+    if not chain:
+        return False, BadRequest("koi sender available nahi (bot band / account add nahi)"), False
+    last_ex: Optional[Exception] = None
+    for idx, sender in enumerate(chain):
+        try:
+            await do_send(sender)
+        except (NetworkError, TimedOut) as ex:
+            return False, ex, False
+        except AccountLimitedError as ex:
+            return False, ex, False
+        except (Forbidden, BadRequest) as ex:
+            last_ex = ex
+            if isinstance(ex, Forbidden) and not is_dm_initiate_blocked(ex):
+                # Bot block / user gone: user ne khud block kiya hai - account se bhej kar
+                # spam nahi karte (account report/ban se bachana zaroori hai).
+                return False, ex, False
+            if idx < len(chain) - 1:
+                logging.info(f"{kind}: {bot_id} ke sender ({_sender_label(sender)}) se nahi gayi "
+                             f"({mask_secrets(ex)}) - agla sender try kar rahe hain")
+                continue
+            return False, ex, False
+        except Exception as ex:
+            return False, ex, False
+        if idx > 0:
+            logging.info(f"{kind}: user {user_id} ko DM user account "
+                         f"({_sender_label(sender)}) se chali gayi - bot se mumkin nahi thi "
+                         f"(user ne bot ko /start nahi kiya)")
+            return True, None, True
+        return True, None, False
+    return False, last_ex, False
+
+
+def _sender_label(sender) -> str:
+    bot_id = getattr(sender, "bot_id", None)
+    if bot_id:
+        return str(bot_id)
+    return getattr(sender, "name", None) or type(sender).__name__
+
+
+def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str, *, ua_available: bool) -> bool:
+    """Ek jagah DM failure ka faisla: log + (permanent) unreachable marking.
+
+    Return True = caller yahin ruk jaye (aage ke messages bhejne ka fayda nahi).
+    """
+    if isinstance(ex, (NetworkError, TimedOut)):
+        logging.warning(f"{kind} network hiccup (transient): {mask_secrets(ex)}")
+        return True
+    if isinstance(ex, AccountLimitedError):
+        logging.warning(f"{kind}: account limited (flood) - is session me ruk gaya ({mask_secrets(ex)})")
+        return True
+    if is_dm_initiate_blocked(ex) and not ua_available:
+        # Bot DM shuru nahi kar sakta aur koi user account bhi nahi. Permanent mark NAHI karte:
+        # account add karte hi (ya user /start karte hi) ye DM ja sakti hai.
+        db.mark_unreachable(bot_id, user_id)
+        key = (bot_id, user_id, "initiate")
+        if key not in _DM_INITIATE_WARNED:
+            _DM_INITIATE_WARNED.add(key)
+            logging.warning(f"{kind} skip (user {user_id}): {mask_secrets(ex)} - "
+                            f"owner ka user account add karo to ye DM jaane lagegi "
+                            f"(Add Account → 👤 User Account)")
+        return True
+    if is_user_gone_error(ex) or isinstance(ex, Forbidden):
+        db.mark_unreachable(bot_id, user_id)
+        db.mark_permanently_unreachable(bot_id, user_id, str(ex))
+        logging.warning(f"{kind} skip (user {user_id} reachable nahi): {mask_secrets(ex)}")
+        return True
+    logging.error(f"{kind} error: {mask_secrets(ex)}")
+    return False
+
+
 def is_account_running(bot_id: str) -> bool:
     return bot_id in user_bot_applications or bot_id in user_account_clients
 
@@ -5097,6 +5260,31 @@ def _ua_wrap(coro):
     return _runner()
 
 
+class _UASentMessage:
+    """PTB `Message` jaisa halka wrapper (message_id / chat_id / delete()).
+
+    Telethon ka return object `.id` deta hai, par hamara poora code PTB style `.message_id`
+    maangta hai (jaise leave-recovery ko sent message yaad rakhna hota hai) - isliye wrap.
+    """
+
+    def __init__(self, raw, chat_id=None):
+        self.raw = raw
+        self.message_id = int(getattr(raw, "id", 0) or 0)
+        self.id = self.message_id
+        self.chat_id = chat_id if chat_id is not None else getattr(raw, "chat_id", None)
+
+    async def delete(self):
+        try:
+            return await self.raw.delete()
+        except Exception:
+            return None
+
+    def __getattr__(self, item):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        return getattr(self.raw, item, None)
+
+
 class UserAccountSender:
     """Telethon client ko PTB `Bot` jaisa interface deta hai.
 
@@ -5216,16 +5404,17 @@ class UserAccountSender:
         html = "html" if parse_mode == ParseMode.HTML else None
         await self._throttle(chat_id)
         try:
-            return await _ua_wrap(self.client.send_message(
+            res = await _ua_wrap(self.client.send_message(
                 int(chat_id), text, parse_mode=html, link_preview=False, reply_to=reply_to))
+            return _UASentMessage(res, chat_id)
         except Exception as ex:
             plain = strip_premium_emojis(text)
             if plain == text or not _ua_custom_emoji_rejected(ex):
                 raise
             _ua_note_emoji_reject(self.bot_id, ex)
             await self._throttle(chat_id)
-            return await _ua_wrap(self.client.send_message(
-                int(chat_id), plain, parse_mode=html, link_preview=False, reply_to=reply_to))
+            return _UASentMessage(await _ua_wrap(self.client.send_message(
+                int(chat_id), plain, parse_mode=html, link_preview=False, reply_to=reply_to)), chat_id)
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None,
                            disable_web_page_preview=None, **kwargs):
@@ -5246,11 +5435,12 @@ class UserAccountSender:
         await self._throttle(chat_id)
 
         async def _do(cap):
-            return await _ua_wrap(self.client.send_file(
+            res = await _ua_wrap(self.client.send_file(
                 int(chat_id), file, caption=cap or None,
                 parse_mode="html" if cap else None,
                 force_document=force_document,
                 voice_note=voice_note, video_note=video_note))
+            return _UASentMessage(res, chat_id)
 
         caption = self._downgrade_premium(caption)
         try:
@@ -5308,9 +5498,10 @@ class UserAccountSender:
         target = files[0] if len(files) == 1 else files
 
         async def _do(cap):
-            return await _ua_wrap(self.client.send_file(
+            res = await _ua_wrap(self.client.send_file(
                 int(chat_id), target, caption=cap or None,
                 parse_mode="html" if cap else None))
+            return _UASentMessage(res, chat_id)
 
         album_caption = self._downgrade_premium(album_caption)
         try:
@@ -7047,6 +7238,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=diag_kb())
             return
 
+        if data == "diag_reset_unreachable":
+            if not is_admin(uid):
+                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
+                return
+            try:
+                cleared = db.clear_initiate_blocked_unreachable()
+                note = (f"{pe('🧹')} {cleared} users ke purane \"bot can't initiate conversation\" "
+                        f"marks saaf kiye - ab unhe user account se DM ja sakti hai."
+                        if cleared else
+                        f"{pe('ℹ️')} Koi purana initiate-blocked mark nahi mila - kuch karne ki "
+                        f"zarurat nahi thi.")
+            except Exception as ex:
+                note = f"{pe('❌')} Reset fail hua: {mask_secrets(ex)}"
+            logging.info(f"diag reset unreachable ({uid}): {strip_premium_emojis(note)}")
+            await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
+                                         parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+            return
+
         if data.startswith("diag_test_"):
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
@@ -8190,6 +8399,16 @@ async def main():
     else:
         logging.info(f"{pp('👤')} user account mode OFF: TELEGRAM_API_ID / TELEGRAM_API_HASH .env me nahi hain\n"
                      f"{TELEGRAM_API_HINT}")
+
+    # Purane "bot can't initiate conversation" wale unreachable marks saaf karo: wo sach me
+    # permanent nahi the (user account se ya user ke /start karne par DM ja sakti hai).
+    try:
+        cleared = db.clear_initiate_blocked_unreachable()
+        if cleared:
+            logging.info(f"{pp('🧹')} {cleared} users ke purane \"bot can't initiate conversation\" "
+                         f"marks saaf kiye - ab inhe user account se DM ja sakti hai")
+    except Exception as ex:
+        logging.warning(f"unreachable cleanup skip: {mask_secrets(ex)}")
 
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:
