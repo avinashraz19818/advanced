@@ -5,7 +5,6 @@ import time
 import os
 import re
 import inspect
-import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from functools import wraps
@@ -32,25 +31,8 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TimedOut
 
-# MTProto user-account mode (Telethon). Library na ho to bhi poora bot chalta rahega -
-# sirf "user account" wala setup option band rahega.
-try:
-    from telethon import TelegramClient, events as tl_events, functions as tl_functions
-    from telethon.sessions import StringSession
-    from telethon.errors import (
-        SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
-        PasswordHashInvalidError, FloodWaitError,
-    )
-    TELETHON_AVAILABLE = True
-except Exception:  # pragma: no cover - environment me telethon nahi hai
-    TelegramClient = None  # type: ignore
-    tl_events = tl_functions = None  # type: ignore
-    StringSession = None  # type: ignore
-    SessionPasswordNeededError = PhoneCodeInvalidError = PhoneCodeExpiredError = None  # type: ignore
-    PasswordHashInvalidError = FloodWaitError = None  # type: ignore
-    TELETHON_AVAILABLE = False
 
 # ================= RETRY DECORATOR =================
 def retry_async(max_retries=3, delay=1, backoff=2):
@@ -103,8 +85,7 @@ def make_aware(dt):
 
 # ================= LOG SECURITY (secret masking) =================
 TOKEN_RE = re.compile(r"\d{6,12}:[A-Za-z0-9_\-]{30,}")
-# Telethon StringSession ~350 char ka base64 hota hai aur wo poora account login hai -
-# kabhi log me na jaye.
+# Bahut lambi base64-ish strings (sessions/keys) kabhi log me na jayein.
 SESSION_RE = re.compile(r"[A-Za-z0-9_\-]{150,}")
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
@@ -120,59 +101,10 @@ def premium_styling_disabled() -> bool:
     return bool(_style_state.get("disabled"))
 
 
-def _tl_input_peer_user(user_id, access_hash):
-    from telethon.tl import types as tl_types
-    return tl_types.InputPeerUser(int(user_id), int(access_hash or 0))
-
-
-def _tl_input_user_empty():
-    from telethon.tl import types as tl_types
-    return tl_types.InputUserEmpty()
-
-
-def ua_remember_entities(bot_id: str, users) -> int:
-    """User objects ke access_hash memory + DB me daalo (idempotent)."""
-    saved = 0
-    for u in users or []:
-        uid = int(getattr(u, "id", 0) or 0)
-        ah = getattr(u, "access_hash", None)
-        if not uid or ah is None:
-            continue
-        _UA_ENTITY_MEM.setdefault(bot_id, {})[uid] = int(ah)
-        saved += 1
-    if saved and users:
-        try:
-            db.remember_user_entities(bot_id, users)
-        except Exception:
-            pass
-    return saved
-
-
-def ua_cached_access_hash(bot_id: str, user_id):
-    """Memory, phir DB - user ka access_hash (na mile to None)."""
-    try:
-        uid = int(user_id)
-    except Exception:
-        return None
-    ah = (_UA_ENTITY_MEM.get(bot_id) or {}).get(uid)
-    if ah is not None:
-        return ah
-    try:
-        ah = db.get_user_access_hash(bot_id, uid)
-    except Exception:
-        ah = None
-    if ah is not None:
-        _UA_ENTITY_MEM.setdefault(bot_id, {})[uid] = ah
-    return ah
-
-
 def reset_premium_styling_state():
     """Tests / diagnostics ke liye."""
     _style_state["failures"] = 0
     _style_state["disabled"] = False
-    _UA_PREMIUM_EMOJI_OK.clear()  # user account ka premium-emoji switch bhi reset
-    _UA_SEND_MODE.clear()         # direct / saved-forward ka yaad-rakha rasta bhi reset
-    _UA_ENTITY_MEM.clear()        # user entity (access_hash) cache bhi reset
 
 
 def note_premium_failure(ex) -> bool:
@@ -192,10 +124,9 @@ def note_premium_failure(ex) -> bool:
 
 
 def configured_secrets() -> list:
-    """.env se aaye literal secrets (api_hash jaise) - inhe logs me mask karna hai."""
+    """.env se aaye literal secrets - inhe logs me mask karna hai."""
     out = []
-    for value in (os.getenv("MAIN_BOT_TOKEN", ""), os.getenv("TELEGRAM_API_HASH", ""),
-                  os.getenv("DATABASE_URL", "")):
+    for value in (os.getenv("MAIN_BOT_TOKEN", ""), os.getenv("DATABASE_URL", "")):
         value = (value or "").strip()
         if len(value) >= 8 and value not in out:
             out.append(value)
@@ -346,12 +277,8 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-09-27-r16"
+BUILD_TAG = "2026-09-27-r17"
 START_TS = time.time()
-# User account subscription ke bina bhi online rahe? (owner ka apna account hai, DM/panel
-# chalta rehna chahiye). Purana behaviour chahiye to .env me UA_START_WITHOUT_SUBSCRIPTION=0
-UA_START_WITHOUT_SUBSCRIPTION = os.getenv("UA_START_WITHOUT_SUBSCRIPTION", "1").strip().lower() \
-    not in ("0", "false", "no", "off")
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
 if _ADMIN_IDS_RAW:
@@ -360,22 +287,6 @@ if _ADMIN_IDS_RAW:
         if _x.isdigit():
             ADMIN_USER_IDS.add(int(_x))
 
-# ================= USER ACCOUNT (MTPROTO) CONFIG =================
-TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
-try:
-    USER_ACCOUNT_SEND_DELAY = float(os.getenv("USER_ACCOUNT_SEND_DELAY", "2.0") or 2.0)
-except Exception:
-    USER_ACCOUNT_SEND_DELAY = 2.0
-USER_ACCOUNT_ATTEMPTS = 2
-TELEGRAM_API_HINT = (
-    "User account mode ke liye ek baar my.telegram.org se API credentials chahiye:\n"
-    "1. https://my.telegram.org kholo -> login (phone + OTP)\n"
-    "2. 'API development tools' -> app banao -> api_id + api_hash copy karo\n"
-    "3. Server par:  cd ~/advanced && printf 'TELEGRAM_API_ID=1234567\\nTELEGRAM_API_HASH=abcdef123456\\n' "
-    ">> .env && ./start\n"
-    "    (1234567 aur abcdef123456 ki jagah apni asli values daalo)\n"
-    "(Ye credentials account ka password nahi hai, sirf app registration hai.)")
 
 SUPPORT_REPLY_MAP: Dict[int, Dict] = {}
 USERBOT_SUPPORT_REPLY_MAP: Dict[str, Dict] = {}
@@ -661,16 +572,6 @@ def escape_preserving_premium_emojis(text: Optional[str]) -> str:
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     lines = []
     user_bots = db.get_user_bots_by_owner(uid)
-    # User account: us account ko chalane wala (owner) admin ho sakta hai, par account
-    # khud bhi apne panel tak pahunche - isliye "ua<uid>" row bhi add karte hain.
-    try:
-        self_row = db.get_user_bot(f"ua{uid}")
-    except Exception:
-        self_row = None
-    known_ids = {str(b.get("bot_id")) for b in user_bots}
-    if self_row and str(self_row.get("bot_id")) not in known_ids \
-            and (self_row.get("account_type") or "bot") == "user":
-        user_bots = list(user_bots) + [self_row]
     if user_bots:
         for bot in user_bots:
             bot_id = bot["bot_id"]
@@ -687,12 +588,12 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
                         expiry = now_aware()
                 is_active = expiry > now_aware()
             status = "🟢" if is_active else "🔴"
-            icon = "🤖" if (bot.get("account_type") or "bot") == "bot" else "👤"
-            shown = f"@{bot_username}" if bot_username else (bot.get("phone") or bot_id)
+            icon = "🤖"
+            shown = f"@{bot_username}" if bot_username else bot_id
             lines.append([btn(f"{status} {shown}", f"manage_bot_{bot_id}", "primary", icon)])
-        lines.append([btn("Add Bot / User Account", "add_new_bot", "success", "➕")])
+        lines.append([btn("Add Bot", "add_new_bot", "success", "➕")])
     else:
-        lines.append([btn("Create Bot / User Account", "add_new_bot", "success", "➕")])
+        lines.append([btn("Create Bot", "add_new_bot", "success", "➕")])
     lines.append([btn_url("Contact Admin", f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", "primary", "📞")])
     if is_admin(uid):
         lines.append([btn("Admin Panel", "admin_panel", "danger", "👑")])
@@ -737,14 +638,8 @@ def bot_management_kb(bot_id: str, user_id: int) -> InlineKeyboardMarkup:
         ])
         lines.append([btn("Broadcast to Users", f"ub_broadcast_{bot_id}", "success", "✈️")])
         lines.append([btn(f"Subscription — {days_left}d left", f"ub_subscription_{bot_id}", "primary", "📅")])
-        _bm_row = db.get_user_bot(bot_id)
-        if _bm_row and (_bm_row.get("account_type") or "bot") == "user":
-            lines.append([btn("🔑 Account Info / Login status", f"ua_info_{bot_id}", "primary", "🔑")])
     else:
         lines.append([btn("Get Subscription", f"sub_for_bot_{bot_id}", "danger", "⚠️")])
-        _bm_row2 = db.get_user_bot(bot_id)
-        if _bm_row2 and (_bm_row2.get("account_type") or "bot") == "user":
-            lines.append([btn("🔑 Account Info / Login status", f"ua_info_{bot_id}", "primary", "🔑")])
     lines.append([btn_url("Contact Admin", f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", "primary", "📞")])
     lines.append([btn("Back to Main", "main_menu", "primary", "🔙")])
     return InlineKeyboardMarkup(lines)
@@ -769,7 +664,7 @@ def _fmt_ago(ts: Optional[float]) -> str:
 
 
 def build_diag_text() -> str:
-    """Ek message me poora status: build, main bot, har user account, DM counters."""
+    """Ek message me poora status: build, main bot, bot accounts."""
     lines = [f"<blockquote>{pp('🩺')} <b>DIAGNOSTICS</b></blockquote>", ""]
     lines.append(f"{pp('🏷')} Build: <code>{BUILD_TAG}</code>")
     lines.append(f"{pe('⏱')} Bot chalu: {_fmt_ago(START_TS).replace(' pehle', '')}")
@@ -781,27 +676,13 @@ def build_diag_text() -> str:
     lines.append(f"{pe('🔑')} Main bot token: {'haan' if MAIN_BOT_TOKEN else 'NAHI'} "
                  f"| admins: {len(ADMIN_USER_IDS)}")
     lines.append("")
-    accounts = [b for b in (db.get_all_user_bots() or [])
-                if (b.get("account_type") or "bot") == "user"]
-    bots = [b for b in (db.get_all_user_bots() or [])
-            if (b.get("account_type") or "bot") != "user"]
-    lines.append(f"{pp('👤')} <b>User accounts ({len(accounts)})</b>")
-    if not accounts:
-        lines.append(f"{pe('ℹ️')} ek bhi user account add nahi hai")
-    for row in accounts:
+    bots = [b for b in (db.get_all_user_bots() or [])]
+    lines.append(f"{pp('🤖')} <b>Bot accounts ({len(bots)})</b>")
+    if not bots:
+        lines.append(f"{pe('ℹ️')} koi bot account add nahi hai")
+    for row in bots[:10]:
         bot_id = row.get("bot_id") or "?"
-        sender = user_account_clients.get(bot_id)
-        running = sender is not None
-        connected = "-"
-        if running:
-            try:
-                connected = "🟢 haan" if sender.client.is_connected() else "🔴 nahi"
-            except Exception:
-                connected = "?"
-        sub = db.get_subscription_for_bot(bot_id)
-        plan = "no plan"
-        if sub:
-            plan = f"{sub.get('subscription_type')} ({str(sub.get('expiry_date'))[:10]})"
+        running = bot_id in user_bot_applications
         try:
             chans = len(db.get_bot_channels(bot_id) or [])
         except Exception:
@@ -810,56 +691,20 @@ def build_diag_text() -> str:
             gone = db.count_permanently_unreachable(bot_id)
         except Exception:
             gone = "?"
+        sub = db.get_subscription_for_bot(bot_id)
+        plan = "no plan"
+        if sub:
+            plan = f"{sub.get('subscription_type')} ({str(sub.get('expiry_date'))[:10]})"
         lines.append(f"{pe('🆔')} <code>{bot_id}</code> | {account_display_name(row, bot_id)}")
         lines.append(f"   {pe('▶️')} chalu: {'🟢 haan' if running else '🔴 NAHI'}"
-                     f" | connected: {connected} | channels: {chans}"
-                     f" | unreachable users: {gone}")
-        if running:
-            mode = "custom emoji OK" if _ua_premium_emoji_allowed(bot_id) else "plain emoji (fallback)"
-            lines.append(f"   {pe('📨')} DM mile: {sender.dm_count}"
-                         f" | aakhri: {_fmt_ago(sender.last_dm_at)}"
-                         f"{f' (user {sender.last_dm_from})' if sender.last_dm_from else ''}")
-            lines.append(f"   {pe('🛰')} raw updates: {sender.raw_updates}"
-                         f" | {mode}"
-                         f"{f' | last: {sender.last_dm_text!r}' if sender.last_dm_text else ''}")
-            route = _UA_SEND_MODE.get(bot_id, "direct")
-            lines.append(f"   {pe('📤')} bhejne ka rasta: "
-                         f"{'Saved Messages → forward' if route == 'saved' else 'direct'}"
-                         f"{f' | aakhri error: {sender.last_error}' if getattr(sender, 'last_error', None) else ''}")
-        else:
-            lines.append(f"   {pe('⚠️')} account band hai - 10 min wala retry job ise chalu karega")
-        lines.append(f"   {pe('⭐️')} plan: {plan}")
-        pending = 1 if bot_id in _UA_LOGINS else 0
-        if pending:
-            lines.append(f"   {pe('⏳')} login adhoora pada hai (OTP/2FA wait)")
-        lines.append("")
-    lines.append(f"{pp('🤖')} <b>Bot accounts ({len(bots)})</b>")
-    if not bots:
-        lines.append(f"{pe('ℹ️')} koi bot account add nahi hai")
-    for row in bots[:5]:
-        bot_id = row.get("bot_id") or "?"
-        try:
-            gone = db.count_permanently_unreachable(bot_id)
-        except Exception:
-            gone = "?"
-        fallback_ready = "haan" if dm_sender_candidates(bot_id)[1:] else "NAHI"
-        lines.append(f"   {pe('▶️')} <code>{bot_id}</code> | "
-                     f"{'🟢 chalu' if bot_id in user_bot_applications else '🔴 band'}"
-                     f" | unreachable: {gone} | user-account fallback: {fallback_ready}")
+                     f" | channels: {chans} | unreachable users: {gone} | plan: {plan}")
     lines.append("")
-    lines.append(f"{pe('📌')} DM test: account chat me <code>/start</code> bhejo, phir yahi /diag "
-                 f"- 'DM mile' aur 'aakhri' bad jana chahiye.")
-    lines.append(f"{pe('🧪')} Account se khud test DM bhejne ke liye niche button dabao.")
+    lines.append(f"{pe('📌')} Kisi bot ko DM me <code>/start</code> bhejo - welcome panel aana chahiye.")
     return "\n".join(lines)
 
 
 def diag_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for bot_id in list(user_account_clients.keys())[:5]:
-        rows.append([btn("Test DM (auto)", f"diag_test_{bot_id}", "success", "🧪")])
-        rows.append([btn("Test DM (direct)", f"diag_dm_{bot_id}_direct", "primary", "1️⃣"),
-                     btn("Test DM (saved)", f"diag_dm_{bot_id}_saved", "primary", "2️⃣")])
-    rows.append([btn("Unreachable reset", "diag_reset_unreachable", "success", "🧹")])
+    rows = [[btn("Unreachable reset", "diag_reset_unreachable", "success", "🧹")]]
     rows.append([btn("Refresh", "admin_diag", "primary", "🔄")])
     rows.append([btn("Admin Panel", "admin_panel", "primary", "👑")])
     return InlineKeyboardMarkup(rows)
@@ -1043,9 +888,8 @@ class Database:
             """CREATE TABLE IF NOT EXISTS user_emoji_maps (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                msg_id BIGINT, emoji_map JSONB DEFAULT '{}',\n                updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (bot_id, msg_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS system_settings (\n                key TEXT PRIMARY KEY, value_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS leave_recovery_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT, user_id BIGINT,\n                source_channel_id BIGINT, target_channel_id BIGINT, message_id BIGINT,\n                sent_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ\n            )""",
-            # User account se DM ke liye user_id ke saath access_hash chahiye (MTProto).
-            # Join-request list / updates se milte hi save kar lete hain.
-            """CREATE TABLE IF NOT EXISTS user_entity_cache (\n                bot_id TEXT, user_id BIGINT, access_hash BIGINT,\n                updated_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, user_id)\n            )""",
+            # user-account system hata diya - purani entity-cache table ho to saaf karo
+            "DROP TABLE IF EXISTS user_entity_cache",
             "CREATE INDEX IF NOT EXISTS idx_bot_subscriptions ON bot_subscriptions(bot_id, expiry_date)",
             "CREATE INDEX IF NOT EXISTS idx_join_requests ON join_requests(bot_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_user_bots_user ON user_bots(user_id)",
@@ -1078,47 +922,6 @@ class Database:
         return self._fetchone("SELECT * FROM users WHERE user_id=%s", (user_id,)) or {}
 
     # ---------------- user entity (access_hash) cache ----------------
-    def remember_user_entity(self, bot_id: str, user_id, access_hash) -> bool:
-        """Ek user ka access_hash yaad rakho (user account DM ke liye)."""
-        try:
-            uid, ah = int(user_id), int(access_hash)
-        except Exception:
-            return False
-        if not uid or ah is None:
-            return False
-        try:
-            self._execute("""INSERT INTO user_entity_cache (bot_id, user_id, access_hash)
-                   VALUES (%s,%s,%s)
-                   ON CONFLICT (bot_id, user_id) DO UPDATE
-                   SET access_hash=EXCLUDED.access_hash, updated_at=now()""", (bot_id, uid, ah))
-            return True
-        except Exception:
-            return False
-
-    def remember_user_entities(self, bot_id: str, users) -> int:
-        """Telethon User objects ke access_hash save karo. Return: kitne save hue."""
-        saved = 0
-        for u in users or []:
-            uid = int(getattr(u, "id", 0) or 0)
-            ah = getattr(u, "access_hash", None)
-            if not uid or ah is None:
-                continue
-            if self.remember_user_entity(bot_id, uid, ah):
-                saved += 1
-        return saved
-
-    def get_user_access_hash(self, bot_id: str, user_id):
-        try:
-            row = self._fetchone("SELECT access_hash FROM user_entity_cache "
-                                 "WHERE bot_id=%s AND user_id=%s", (bot_id, int(user_id))) or {}
-        except Exception:
-            return None
-        ah = row.get("access_hash")
-        try:
-            return int(ah) if ah is not None else None
-        except Exception:
-            return None
-
     def mark_user_verified(self, user_id: int):
         self._execute("UPDATE users SET verified=TRUE WHERE user_id=%s", (user_id,))
 
@@ -1147,49 +950,25 @@ class Database:
             (bot_id, user_id, token, username))
         return bot_id
 
-    def add_user_account(self, owner_id, account_user_id, phone, session_string,
-                         username=None, api_id=None, api_hash=None):
-        """MTProto user account ko usi user_bots table me rakho (account_type='user').
-
-        bot_id = "ua<account_user_id>" - stable rehta hai, isliye subscription/channels/
-        messages sab kuch bot wale code se hi chalta hai.
-        """
-        bot_id = f"ua{account_user_id}"
-        self.add_user(owner_id, None, f"User{owner_id}", None)
-        self._execute(
-            """INSERT INTO user_bots (bot_id, user_id, bot_token, bot_username, is_active,
-                                     account_type, phone, session_string, api_id, api_hash)
-               VALUES (%s,%s,NULL,%s,0,'user',%s,%s,%s,%s)
-               ON CONFLICT (bot_id) DO UPDATE
-               SET user_id=EXCLUDED.user_id, bot_username=EXCLUDED.bot_username,
-                   phone=EXCLUDED.phone, session_string=EXCLUDED.session_string,
-                   api_id=EXCLUDED.api_id, api_hash=EXCLUDED.api_hash,
-                   account_type='user'""",
-            (bot_id, owner_id, username, phone, session_string, api_id, api_hash))
-        return bot_id
-
-    def set_user_account_session(self, bot_id: str, session_string: str, phone: Optional[str] = None):
-        if phone:
-            self._execute("UPDATE user_bots SET session_string=%s, phone=%s, account_type='user' WHERE bot_id=%s",
-                          (session_string, phone, bot_id))
-        else:
-            self._execute("UPDATE user_bots SET session_string=%s, account_type='user' WHERE bot_id=%s",
-                          (session_string, bot_id))
-
     def get_user_bot(self, bot_id: str):
-        b = self._fetchone("SELECT * FROM user_bots WHERE bot_id=%s", (bot_id,))
+        # Sirf bot rows: user-account system hata diya (purani 'user' rows invisible).
+        b = self._fetchone("SELECT * FROM user_bots WHERE bot_id=%s "
+                           "AND COALESCE(account_type,'bot')='bot'", (bot_id,))
         return dict(b) if b else None
 
     def get_user_bots_by_owner(self, user_id: int):
-        rows = self._fetchall("SELECT * FROM user_bots WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
+        rows = self._fetchall("SELECT * FROM user_bots WHERE user_id=%s "
+                              "AND COALESCE(account_type,'bot')='bot' ORDER BY created_at DESC", (user_id,))
         return [dict(r) for r in rows]
 
     def get_all_user_bots(self):
-        rows = self._fetchall("SELECT * FROM user_bots ORDER BY user_id, created_at")
+        rows = self._fetchall("SELECT * FROM user_bots WHERE COALESCE(account_type,'bot')='bot' "
+                              "ORDER BY user_id, created_at")
         return [dict(r) for r in rows]
 
     def get_bot_by_username(self, username: str):
-        return self._fetchone("SELECT * FROM user_bots WHERE bot_username=%s", (username,))
+        return self._fetchone("SELECT * FROM user_bots WHERE bot_username=%s "
+                              "AND COALESCE(account_type,'bot')='bot'", (username,))
 
     def set_user_bot_active(self, bot_id: str, active):
         self._execute("UPDATE user_bots SET is_active=%s WHERE bot_id=%s", (1 if active else 0, bot_id))
@@ -1435,8 +1214,8 @@ class Database:
     def clear_initiate_blocked_unreachable(self) -> int:
         """Sirf wo marks hatao jinka reason "bot can't initiate conversation" tha.
 
-        Ye marks sach me permanent nahi the: user account se DM ja sakti hai, ya user baad me
-        bot ko /start kar de to bhi. Blocked/deactivated users ke marks waise hi rahenge.
+        Ye marks sach me permanent nahi hain: user baad me bot ko /start kar de to DM ja
+        sakti hai. Blocked/deactivated users ke marks waise hi rahenge.
         """
         try:
             rows = self._fetchall("""DELETE FROM unreachable_users
@@ -1833,28 +1612,14 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
 
-def account_self_uid(bot_id: str) -> Optional[int]:
-    """User account ka apna Telegram id (`ua8394878310` -> 8394878310)."""
-    if not bot_id or not str(bot_id).startswith("ua"):
-        return None
-    tail = str(bot_id)[2:]
-    return int(tail) if tail.isdigit() else None
-
-
 def is_bot_owner(bot_id: str, user_id: int) -> bool:
-    """Check if user is owner of the bot/account OR is admin.
-
-    User account ke case me us account ka apna Telegram id bhi owner hai - isliye
-    account se main bot me /start karne par uska panel khul jata hai.
-    """
+    """Check if user is owner of the bot OR is admin."""
     if is_admin(user_id):
         return True
     bot_data = db.get_user_bot(bot_id)
     if not bot_data:
         return False
     if bot_data.get("user_id") == user_id:
-        return True
-    if (bot_data.get("account_type") or "bot") == "user" and account_self_uid(bot_id) == int(user_id):
         return True
     return False
 
@@ -3014,26 +2779,9 @@ async def sendable_media_id(dest_bot, media_id, source_bot):
 
 
 async def translate_draft_for_bot(draft: Optional[dict], dest_bot, source_bot) -> dict:
-    """Draft ki copy jo `dest_bot` actually bhej sakta hai.
-
-    User account (MTProto) ke liye file_id bilkul kaam nahi karta - file pehle local
-    temp file me download hoti hai, tab bheji jati hai (token wali URL ki zaroorat nahi).
-    """
+    """Draft ki copy jo `dest_bot` actually bhej sakta hai (cross-bot media fix)."""
     draft = dict(draft or {})
     if not source_bot or dest_bot is source_bot:
-        return draft
-    if getattr(dest_bot, "kind", "") == "user":
-        album = draft.get("album")
-        if isinstance(album, list) and album:
-            new_album = []
-            for it in album:
-                if isinstance(it, dict) and it.get("media"):
-                    it = dict(it)
-                    it["media"] = await materialize_media(it.get("media"), source_bot)
-                new_album.append(it)
-            draft["album"] = new_album
-        if draft.get("media"):
-            draft["media"] = await materialize_media(draft.get("media"), source_bot)
         return draft
     album = draft.get("album")
     if isinstance(album, list) and album:
@@ -3279,8 +3027,6 @@ async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
     for bot_id in expired_bots:
         bot_data = db.get_user_bot(bot_id)
         if bot_data and bot_data["is_active"] == 1:
-            if bot_id in user_account_clients:
-                await stop_user_account(bot_id)
             if bot_id in user_bot_applications:
                 try:
                     app = user_bot_applications[bot_id]
@@ -3300,10 +3046,6 @@ async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
 async def retry_inactive_userbots_job(context: ContextTypes.DEFAULT_TYPE):
     """Har 10 min: jo userbot network hiccup ki wajah se start nahi ho paya use dobara
     chalu karo (pehle wo agle manual restart tak band pada rehta tha)."""
-    try:
-        await ua_login_gc()
-    except Exception:
-        pass
     bots = db.get_all_user_bots() or []
     if not bots:
         return
@@ -3311,26 +3053,15 @@ async def retry_inactive_userbots_job(context: ContextTypes.DEFAULT_TYPE):
     started = 0
     for bot in bots:
         bot_id = bot["bot_id"]
-        # active dikh raha hai par client disconnect ho gaya? turant registry saaf karo
-        # taaki neeche wala start dobara connect kar le (warna account chup-chaap so jata hai).
-        _sender = user_account_clients.get(bot_id)
-        if _sender is not None:
-            try:
-                if not _sender.client.is_connected():
-                    logging.warning(f"{bot_id}: account client disconnect mila - dobara connect "
-                                    f"kar rahe hain (isse pehle DM/updates sunne band the)")
-                    user_account_clients.pop(bot_id, None)
-                    user_account_tasks.pop(bot_id, None)
-            except Exception:
-                pass
         if is_account_running(bot_id):
             continue
-        is_ua = (bot.get("account_type") or "bot") == "user"
+        if not bot.get("bot_token"):
+            continue  # bina token wali purani rows skip (user-account system hata diya)
         try:
             has_sub = bool(db.get_active_subscription(bot_id))
         except Exception:
             has_sub = False
-        if not has_sub and not (is_ua and UA_START_WITHOUT_SUBSCRIPTION):
+        if not has_sub:
             continue
         attempted += 1
         if await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0, quiet=True):
@@ -3521,14 +3252,6 @@ def _runtime_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict:
 
 async def sync_pending_join_requests_for_channel(bot_id: str, channel_id: int, bot):
     try:
-        if isinstance(bot, UserAccountSender):
-            # user account ko pending list raw API se milti hai
-            requesters = await bot.list_pending_join_requesters(channel_id)
-            for user in requesters:
-                db.add_join_request(bot_id, user.id, channel_id, "pending")
-            if requesters:
-                logging.info(f"Synced {len(requesters)} pending join requests for channel {channel_id}")
-            return
         if not hasattr(bot, 'get_chat_join_requests'):
             logging.info("get_chat_join_requests not available in this PTB version. Skipping sync.")
             return
@@ -3554,10 +3277,10 @@ async def user_bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot
     # is_bot_owner() correctly covers "is admin OR is the owner of this bot_id".
     if is_bot_owner(bot_id, user.id):
         bot_data = db.get_user_bot(bot_id) or {}
-        _icon = "👤" if (bot_data.get("account_type") or "bot") == "user" else "🤖"
+        _icon = "🤖"
         title = account_display_name(bot_data, bot_id)
         await send_premium_message(context.bot, user.id,
-            f"<blockquote>{pp(_icon)} <b>MANAGE {'USER ACCOUNT' if _icon == '👤' else 'BOT'}</b></blockquote>\n\n"
+            f"<blockquote>{pp(_icon)} <b>MANAGE BOT</b></blockquote>\n\n"
             f"{_icon} {title}\nID: <code>{bot_id}</code>",
             parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, user.id))
         return
@@ -4024,121 +3747,6 @@ async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
                              data.get("chat_id"), ctx, data.get("media_group_id"))
 
 
-class _RouterUser:
-    """Telegram User ka lightweight roop (jab sirf id/naam chahiye)."""
-
-    __slots__ = ("id", "first_name", "last_name", "username", "is_bot", "language_code")
-
-    def __init__(self, user_id, first_name="", last_name="", username=None, is_bot=False):
-        self.id = int(user_id)
-        self.first_name = first_name or ""
-        self.last_name = last_name or ""
-        self.username = username
-        self.is_bot = bool(is_bot)
-        self.language_code = None
-
-    @property
-    def full_name(self) -> str:
-        return f"{self.first_name} {self.last_name}".strip()
-
-
-class _RouterChat:
-    """Chat ka chhota roop (sirf id chahiye hota hai)."""
-
-    __slots__ = ("id", "type", "title", "username")
-
-    def __init__(self, chat_id, chat_type="private", title=None, username=None):
-        self.id = chat_id
-        self.type = chat_type
-        self.title = title
-        self.username = username
-
-
-class _RouterUpdate:
-    """Main bot ka `Message` -> userbot handlers ke liye `Update` jaisa object.
-
-    User accounts ka koi apna bot chat nahi hota, isliye panel ke flows (channel add,
-    welcome/album set, broadcast) MAIN bot ke messages se chalte hain - par unka logic
-    `handle_user_bot_message` me hai jo `update.effective_user` / `update.message`
-    maangta hai. Ye adapter wahi shape deta hai (isi kami se
-    "'Message' object has no attribute 'effective_user'" aa raha tha).
-    """
-
-    __slots__ = ("message", "effective_user", "effective_chat", "callback_query",
-                 "chat_member", "chat_join_request", "inline_query", "_raw")
-
-    def __init__(self, msg, user=None):
-        self._raw = msg
-        self.message = msg
-        self.callback_query = None
-        self.chat_member = None
-        self.chat_join_request = None
-        self.inline_query = None
-        self.effective_user = user or _message_user(msg)
-        chat = getattr(msg, "chat", None)
-        if chat is not None:
-            self.effective_chat = chat
-        else:
-            chat_id = getattr(msg, "chat_id", None)
-            self.effective_chat = _RouterChat(chat_id) if chat_id is not None else None
-
-    def __getattr__(self, item):
-        return getattr(object.__getattribute__(self, "_raw"), item)
-
-
-def _message_user(msg):
-    """Message se user nikalo: from_user -> chat (private) -> generic (id 0)."""
-    user = getattr(msg, "from_user", None)
-    if user is None:
-        chat = getattr(msg, "chat", None)
-        if chat is not None and getattr(chat, "type", "private") == "private":
-            user = chat
-    if user is None:
-        return _RouterUser(0, "User")
-    return _RouterUser(getattr(user, "id", 0) or 0,
-                       getattr(user, "first_name", "") or "",
-                       getattr(user, "last_name", "") or "",
-                       getattr(user, "username", None),
-                       getattr(user, "is_bot", False))
-
-
-async def _route_user_account_owner_message(msg, context, uid: int) -> bool:
-    """Main-bot me user-account owner ke pending flows ko us bot ke handler par bhejo.
-
-    Panel se state `context.user_data` me hi set hoti hai (adding_channel_/setting_message_/
-    broadcast_stage_), aur unka poora logic `handle_user_bot_message` me already hai -
-    isliye wahi function main bot ke context ke saath call kar dete hain.
-    """
-    targets = []
-    uid_prefix = f"{uid}_"
-    for key in list(context.user_data.keys()):
-        for prefix in ("adding_channel_", "setting_message_", "broadcast_stage_"):
-            if key.startswith(prefix):
-                targets.append(key[len(prefix):])
-                break
-        else:
-            # editing text/media/buttons ya "buttons bhejo" wale pending states
-            value = context.user_data.get(key)
-            if key.startswith(uid_prefix) and isinstance(value, dict) and any(
-                    k in value for k in ("editing_text_msg_id", "editing_buttons_msg_id",
-                                         "editing_media_msg_id", "waiting_buttons")):
-                targets.append(key[len(uid_prefix):])
-    for bot_id in targets:
-        if not bot_id or not is_user_account(bot_id):
-            continue
-        if not is_bot_owner(bot_id, uid):
-            continue
-        try:
-            # raw Message ko Update jaisa banao (warna effective_user nahi milta)
-            await handle_user_bot_message(_RouterUpdate(msg, _RouterUser(uid)), context, bot_id, uid)
-            return True
-        except Exception as ex:
-            logging.error(f"user account owner flow error ({bot_id}): "
-                          f"{type(ex).__name__}: {mask_secrets(ex)}")
-            return True
-    return False
-
-
 async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
     user = update.effective_user
     if not user:
@@ -4293,11 +3901,11 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         if channel_chat and channel_chat.type in ['channel', 'group', 'supergroup']:
             ch = channel_chat
             try:
-                checker = get_account_sender(bot_id) if is_user_account(bot_id) else context.bot
+                checker = context.bot
                 try:
                     member = await checker.get_chat_member(ch.id, getattr(checker, "id", None))
                     if member.status not in ['administrator', 'creator']:
-                        _who = "user account" if is_user_account(bot_id) else "bot"
+                        _who = "bot"
                         await reply_premium_message(msg, f"{pe('❌')} Ye {_who} is channel me admin nahi hai!\n\nPehle ise admin banao, phir dobara try karo.", parse_mode=ParseMode.HTML)
                         return
                 except Exception as e:
@@ -4313,7 +3921,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                         return
 
                 db.add_channel(bot_id, ch.id, getattr(ch, 'username', None), ch.title or "Channel")
-                _sync_sender = get_account_sender(bot_id) if is_user_account(bot_id) else context.bot
+                _sync_sender = context.bot
                 await sync_pending_join_requests_for_channel(bot_id, ch.id, _sync_sender)
 
                 ud["adding_channel"] = False
@@ -4323,7 +3931,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
             except Exception as ex:
                 await reply_premium_message(msg, f"{pe('❌')} Error adding channel: {str(ex)}", parse_mode=ParseMode.HTML)
         else:
-            _who = "aapka <b>user account</b>" if is_user_account(bot_id) else "ye <b>bot</b>"
+            _who = "ye <b>bot</b>"
             await reply_premium_message(msg, f"{pe('🔽')} <b>How to add a channel:</b>\n\n1. Make sure {_who} <b>admin</b> hai us channel me\n2. Apna channel kholo\n3. Us channel se <b>koi bhi message forward</b> karke yahan bhejo\n4. Channel apne aap add ho jayega\n\n⚠️ Message channel se hi forward hona chahiye!", parse_mode=ParseMode.HTML)
         return
 
@@ -4522,11 +4130,7 @@ async def delete_pending_leave_recovery_messages(bot_id: str, user_id: int, targ
 async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: int,
                                chat_title: Optional[str] = None, chat_username: Optional[str] = None,
                                sender=None, approve=None, auto: Optional[bool] = None):
-    """Join request aane par: default message + saved welcome (media/album) + approve.
-
-    Ye logic bot account aur MTProto user account dono ke liye same hai - sirf `sender`
-    (PTB Bot ya UserAccountSender) aur `approve` callable badalta hai.
-    """
+    """Join request aane par: default message + saved welcome (media/album) + approve."""
     sender = sender or get_account_sender(bot_id)
     if sender is None:
         return
@@ -4567,21 +4171,19 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
     except Exception as ex:
         logging.error(f"Default first message render error: {mask_secrets(ex)}")
     if default_msg_text:
-        # Bot DM na bhej paye to owner ka user account (fallback) - dekho send_dm_fallback
-        ok, err, _used_ua = await send_dm_fallback(
+        ok, err, _ = await send_dm_fallback(
             bot_id, requester.id,
             lambda snd: send_user_message(snd, requester.id, default_msg_text, parse_mode=ParseMode.HTML),
-            primary=sender, owner_id=owner_id, kind="Default first message", channel_id=chat_id)
+            primary=sender, kind="Default first message")
         if not ok:
-            stop = dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM",
-                                           ua_available=bool(owner_user_account_senders(owner_id)))
+            stop = dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM")
             if stop and isinstance(err, (Forbidden, BadRequest)) and is_user_gone_error(err) \
                     and approve is not None and auto:
                 try:
                     await approve()
                 except Exception:
                     pass
-            if stop or isinstance(err, (NetworkError, TimedOut, AccountLimitedError)):
+            if stop or isinstance(err, (NetworkError, TimedOut)):
                 return
 
     msgs = db.get_messages(chat_id, bot_id)
@@ -4600,14 +4202,12 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
             elif wm:
                 await send_user_message(snd, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
 
-    ok, err, _used_ua = await send_dm_fallback(
-        bot_id, requester.id, _send_welcome, primary=sender, owner_id=owner_id,
-        kind="Welcome DM", channel_id=chat_id)
+    ok, err, _ = await send_dm_fallback(
+        bot_id, requester.id, _send_welcome, primary=sender, kind="Welcome DM")
     if ok:
         db.mark_reachable(bot_id, requester.id)
     else:
-        dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM",
-                                ua_available=bool(owner_user_account_senders(owner_id)))
+        dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM")
 
     db.add_join_request(bot_id, requester.id, chat_id, 'approved' if auto else 'pending')
     if auto and approve is not None:
@@ -4619,16 +4219,15 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
 
 
 async def _send_leave_message(bot_id: str, user_id, owner_id, primary, do_send):
-    """Leave-recovery DM: sender chain par bhejo. Return (ok, sent_message, error, used_ua)."""
+    """Leave-recovery DM: bot se bhejo. Return (ok, sent_message, error, used_alt)."""
     box = {"sent": None}
 
     async def _wrapped(snd):
         box["sent"] = await do_send(snd)
 
-    ok, err, used_ua = await send_dm_fallback(bot_id, user_id, _wrapped, primary=primary,
-                                              owner_id=owner_id, kind="leave recovery DM",
-                                              channel_id=_UA_CHANNEL_HINT.get())
-    return ok, box["sent"], err, used_ua
+    ok, err, used_alt = await send_dm_fallback(bot_id, user_id, _wrapped, primary=primary,
+                                               kind="leave recovery DM")
+    return ok, box["sent"], err, used_alt
 
 
 async def process_member_left(bot_id: str, member_user, chat_id: int,
@@ -4674,15 +4273,12 @@ async def process_member_left(bot_id: str, member_user, chat_id: int,
                 leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
             owner_id = (db.get_user_bot(bot_id) or {}).get("user_id") or 0
             try:
-                # Bot DM na bhej paye to owner ke user account se (Telegram bot ko
-                # "can't initiate conversation" rok deta hai jab tak user /start na kare).
-                sent_ok, sent, err, _used_ua2 = await _send_leave_message(
+                sent_ok, sent, err, _ = await _send_leave_message(
                     bot_id, member_user.id, owner_id, sender,
                     lambda snd: send_user_message(snd, member_user.id, text,
                                                   parse_mode=ParseMode.HTML, reply_markup=leave_markup))
                 if not sent_ok:
-                    dm_failure_log_and_mark(bot_id, member_user.id, err, "leave recovery DM",
-                                            ua_available=bool(owner_user_account_senders(owner_id)))
+                    dm_failure_log_and_mark(bot_id, member_user.id, err, "leave recovery DM")
                     break
             except Exception as ex:
                 logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
@@ -4694,7 +4290,7 @@ async def process_member_left(bot_id: str, member_user, chat_id: int,
 
 
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
-    """PTB wrapper - asli kaam shared process_join_request karta hai (user account bhi wahi)."""
+    """PTB wrapper - asli kaam process_join_request karta hai."""
     jr = update.chat_join_request
     if not jr:
         return
@@ -4965,9 +4561,6 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int, quiet: bool = F
     tha jab tak dobara restart na ho ("Failed to start user bot ... httpx.ReadError:").
     Permanent errors (revoked token / blocked) par turant band.
     """
-    # MTProto user account? Uske liye alag lifecycle hai (bot token nahi hota).
-    if is_user_account(bot_id):
-        return await start_user_account(bot_id, owner_id, quiet=quiet)
     fail_log = logging.warning if quiet else logging.error
     for attempt in range(1, USERBOT_START_ATTEMPTS + 1):
         try:
@@ -5018,8 +4611,6 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int, quiet: bool = F
 
 
 async def stop_user_bot(bot_id: str):
-    if bot_id in user_account_clients:
-        await stop_user_account(bot_id)
     if bot_id in user_bot_applications:
         try:
             app = user_bot_applications[bot_id]
@@ -5031,408 +4622,19 @@ async def stop_user_bot(bot_id: str):
         user_bot_applications.pop(bot_id, None)
         db.set_user_bot_active(bot_id, False)
 
-# ================= USER ACCOUNT (MTPROTO) MODE =================
-# Yahan poora "bot ke bajaye user account se message" wala hissa hai:
-#   * UserAccountSender  - Telethon client ko PTB Bot jaisa banata hai (isi liye saara
-#                          purana sending code - welcome, album, broadcast - waise hi chalta hai)
-#   * start/stop_user_account - login session (StringSession) se client chalu/band
-#   * Telethon event handlers - join request (UpdatePendingJoinRequests) + member leave
-MAIN_BOT_REF: Optional[Bot] = None
-user_account_clients: Dict[str, "UserAccountSender"] = {}
-user_account_tasks: Dict[str, Any] = {}
-_UA_MEDIA_CACHE: Dict[tuple, str] = {}
-# bot_id -> {user_id: access_hash} - bar-bar DB hit na ho
-_UA_ENTITY_MEM: Dict[str, Dict[int, int]] = {}
-_UA_LAST_SEND: Dict[str, float] = {}
-UA_MEDIA_CACHE_MAX = 200
-
-
-def is_user_account(bot_id: str) -> bool:
-    """Ye bot_id ek MTProto user account hai (bot token wala bot nahi)?"""
-    if not bot_id:
-        return False
-    if bot_id in user_account_clients:
-        return True
-    try:
-        row = db.get_user_bot(bot_id)
-    except Exception:
-        row = None
-    return bool(row) and (row.get("account_type") or "bot") == "user"
-
-
-def account_type_from_row(row) -> str:
-    if isinstance(row, dict):
-        return row.get("account_type") or "bot"
-    return "bot"
-
-
-# Telegram bot us user ko DM nahi kar sakta jisne bot ko kabhi /start nahi kiya. Isi error ke
-# liye user-account fallback chalta hai (user account MTProto se DM bhej sakta hai).
-try:  # contextvars hamesha available hai (py3.7+), phir bhi safe import
-    from contextvars import ContextVar
-except Exception:  # pragma: no cover
-    def ContextVar(name, default=None):  # type: ignore
-        class _Var:
-            def __init__(self, d):
-                self._v = d
-
-            def get(self):
-                return self._v
-
-            def set(self, v):
-                self._v = v
-        return _Var(default)
-
+# ================= DM HELPERS (BOT-ONLY) =================
+# Pehle yahan MTProto user-account system tha (UserAccountSender, Telethon login, Saved
+# Messages forward) - use poori tarah hata diya. Ab saare DM sirf bot se jate hain.
+_DM_INITIATE_WARNED: set = set()
 
 DM_INITIATE_MARKERS = ("can't initiate conversation", "cant initiate conversation",
                        "initiate conversation with a user", "bot can't initiate")
-_DM_INITIATE_WARNED: set = set()
 
 
 def is_dm_initiate_blocked(ex) -> bool:
-    """Bot ne DM shuru nahi kar paya (user ne bot ko start nahi kiya) - fallback wala case."""
+    """Bot ne DM shuru nahi kar paya (user ne bot ko /start nahi kiya)."""
     text = str(ex or "").lower()
     return any(m in text for m in DM_INITIATE_MARKERS)
-
-
-def owner_user_account_senders(owner_id) -> list:
-    """Owner ke chalu user accounts (welcome/leave DM ke liye)."""
-    if not owner_id:
-        return []
-    out = []
-    try:
-        rows = db.get_user_bots_by_owner(int(owner_id)) or []
-    except Exception:
-        rows = []
-    for row in rows:
-        if (row.get("account_type") or "bot") != "user":
-            continue
-        sender = user_account_clients.get(row.get("bot_id"))
-        if sender is not None:
-            out.append(sender)
-    return out
-
-
-def dm_sender_candidates(bot_id: str, primary=None, owner_id=None) -> list:
-    """DM ke liye sender chain: pehle apna sender, phir owner ke user accounts.
-
-    Ek hi account ho aur wahi owner ka ho to wahi use hota hai. Owner ke paas ek bhi chalu
-    user account na ho par poore system me sirf ek user account chalu ho, to wahi fallback
-    banta hai (single-operator setup me bot kisi aur owner ka bhi ho sakta hai) - ek baar
-    log kar dete hain taaki pata rahe.
-    """
-    chain = []
-    if primary is not None:
-        chain.append(primary)
-    owner_senders = owner_user_account_senders(owner_id)
-    for sender in owner_senders:
-        if sender not in chain:
-            chain.append(sender)
-    if not owner_senders:
-        all_accounts = [x for x in user_account_clients.values()]
-        if len(all_accounts) == 1:
-            only = all_accounts[0]
-            if only not in chain:
-                chain.append(only)
-                key = ("only-account", bot_id, getattr(only, "bot_id", ""))
-                if key not in _DM_INITIATE_WARNED:
-                    _DM_INITIATE_WARNED.add(key)
-                    logging.info(f"{bot_id}: owner ka koi user account nahi mila - DM fallback ke liye "
-                                 f"available account {getattr(only, 'bot_id', '?')} use karenge")
-    return chain
-
-
-async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, owner_id=None,
-                           kind: str = "DM", channel_id=None):
-    """`do_send(sender)` ko sender chain par try karo.
-
-    Return: (ok, error, used_user_account)
-      * ok=True  -> message chala gaya (used_user_account=True matlab bot se nahi, account se gaya)
-      * ok=False -> sab senders fail; error me aakhri exception
-    Network/flood errors par agla sender try nahi karte (warna do jagah se spam ho sakta hai).
-    """
-    chain = dm_sender_candidates(bot_id, primary=primary, owner_id=owner_id)
-    if not chain:
-        return False, BadRequest("koi sender available nahi (bot band / account add nahi)"), False
-    # user account ko ye hints chahiye: user kis channel se aaya (entity resolve) aur media
-    # kis bot ki hai (file_id download) - warna "input entity"/"wrong file_id" error aata hai.
-    chan_token = _UA_CHANNEL_HINT.set(channel_id)
-    media_token = _UA_MEDIA_BOT_HINT.set(bot_id)
-    try:
-        return await _send_dm_fallback_chain(bot_id, user_id, do_send, chain, kind=kind)
-    finally:
-        _UA_CHANNEL_HINT.reset(chan_token)
-        _UA_MEDIA_BOT_HINT.reset(media_token)
-
-
-async def _send_dm_fallback_chain(bot_id, user_id, do_send, chain, *, kind="DM"):
-    last_ex: Optional[Exception] = None
-    for idx, sender in enumerate(chain):
-        try:
-            await do_send(sender)
-        except (NetworkError, TimedOut) as ex:
-            return False, ex, False
-        except AccountLimitedError as ex:
-            return False, ex, False
-        except (Forbidden, BadRequest) as ex:
-            last_ex = ex
-            if isinstance(ex, Forbidden) and not is_dm_initiate_blocked(ex):
-                # Bot block / user gone: user ne khud block kiya hai - account se bhej kar
-                # spam nahi karte (account report/ban se bachana zaroori hai).
-                return False, ex, False
-            if idx < len(chain) - 1:
-                logging.info(f"{kind}: {bot_id} ke sender ({_sender_label(sender)}) se nahi gayi "
-                             f"({mask_secrets(ex)}) - agla sender try kar rahe hain")
-                continue
-            return False, ex, False
-        except Exception as ex:
-            return False, ex, False
-        if idx > 0:
-            logging.info(f"{kind}: user {user_id} ko DM user account "
-                         f"({_sender_label(sender)}) se chali gayi - bot se mumkin nahi thi "
-                         f"(user ne bot ko /start nahi kiya)")
-            return True, None, True
-        return True, None, False
-    return False, last_ex, False
-
-
-def _sender_label(sender) -> str:
-    bot_id = getattr(sender, "bot_id", None)
-    if bot_id:
-        return str(bot_id)
-    return getattr(sender, "name", None) or type(sender).__name__
-
-
-def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str, *, ua_available: bool) -> bool:
-    """Ek jagah DM failure ka faisla: log + (permanent) unreachable marking.
-
-    Return True = caller yahin ruk jaye (aage ke messages bhejne ka fayda nahi).
-    """
-    note = dm_error_note(ex)
-    if isinstance(ex, (NetworkError, TimedOut)):
-        logging.warning(f"{kind} network hiccup (transient): {mask_secrets(ex)}")
-        return True
-    if isinstance(ex, AccountLimitedError):
-        logging.warning(f"{kind}: account limited (flood) - {mask_secrets(ex)}"
-                        f"{' | ' + note if note else ''}")
-        return True
-    if is_dm_initiate_blocked(ex) and not ua_available:
-        # Bot DM shuru nahi kar sakta aur koi user account bhi nahi. Permanent mark NAHI karte:
-        # account add karte hi (ya user /start karte hi) ye DM ja sakti hai.
-        db.mark_unreachable(bot_id, user_id)
-        key = (bot_id, user_id, "initiate")
-        if key not in _DM_INITIATE_WARNED:
-            _DM_INITIATE_WARNED.add(key)
-            logging.warning(f"{kind} skip (user {user_id}): {mask_secrets(ex)} - "
-                            f"owner ka user account add karo to ye DM jaane lagegi "
-                            f"(Add Account → 👤 User Account)")
-        return True
-    if is_user_gone_error(ex) or isinstance(ex, Forbidden):
-        db.mark_unreachable(bot_id, user_id)
-        db.mark_permanently_unreachable(bot_id, user_id, str(ex))
-        logging.warning(f"{kind} skip (user {user_id} reachable nahi): "
-                        f"{type(ex).__name__}: {mask_secrets(ex)}"
-                        f"{' | ' + note if note else ''}")
-        return True
-    logging.error(f"{kind} error: {type(ex).__name__}: {mask_secrets(ex)}"
-                  f"{' | ' + note if note else ''}")
-    return False
-
-
-def is_account_running(bot_id: str) -> bool:
-    return bot_id in user_bot_applications or bot_id in user_account_clients
-
-
-def get_account_sender(bot_id: str):
-    """Is bot_id ka live sender: user account ho to adapter, warna PTB bot application."""
-    sender = user_account_clients.get(bot_id)
-    if sender is not None:
-        return sender
-    app = user_bot_applications.get(bot_id)
-    if app is not None:
-        return app.bot
-    return None
-
-
-def account_display_name(row: dict, bot_id: str = "") -> str:
-    """Panel me dikhane ke liye naam: @username, warna phone (masked), warna id."""
-    if not row:
-        return f"<code>{bot_id}</code>"
-    username = row.get("bot_username")
-    if username:
-        return f"@{username}"
-    phone = (row.get("phone") or "").strip()
-    if phone:
-        return f"{phone[:4]}***{phone[-3:]}" if len(phone) > 8 else phone
-    return f"<code>{row.get('bot_id') or bot_id}</code>"
-
-
-def account_icon(row) -> str:
-    return "👤" if account_type_from_row(row) == "user" else "🤖"
-
-
-async def bot_api_download_file(file_id: str, tokens) -> Optional[str]:
-    """Bot API se `file_id` download karke local path do.
-
-    file_id sirf usi bot ke liye valid hota hai jisne file dekhi thi, isliye har diya gaya
-    token try karte hain (channel wala bot, phir main bot) - warna
-    "Wrong file_id or the file is temporarily unavailable" milta hai.
-    """
-    for token in tokens or []:
-        if not token:
-            continue
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
-                resp = await client.get(f"https://api.telegram.org/bot{token}/getFile",
-                                        params={"file_id": file_id})
-                data = resp.json() if hasattr(resp, "json") else {}
-                path = ((data.get("result") or {}).get("file_path")) if data.get("ok") else None
-                if not path:
-                    continue
-                fd, tmp_path = tempfile.mkstemp(
-                    prefix="ua_media_", suffix=os.path.splitext(path)[1] or ".bin")
-                os.close(fd)
-                async with client.stream(
-                        "GET", f"https://api.telegram.org/file/bot{token}/{path}") as dl:
-                    dl.raise_for_status()
-                    with open(tmp_path, "wb") as fh:
-                        async for chunk in dl.aiter_bytes(65536):
-                            fh.write(chunk)
-                return tmp_path
-        except Exception as ex:
-            logging.debug(f"file_id download fail (token ...{str(token)[-4:]}): {mask_secrets(ex)}")
-            continue
-    return None
-
-
-async def materialize_media(media, source_bot=None, source_token: Optional[str] = None,
-                            extra_tokens: Optional[list] = None):
-    """file_id ko aisi cheez me badlo jo dusra account bhej sake (local file / http url).
-
-    Bot ka file_id sirf usi bot ke liye valid hota hai. User account se bhejne ke liye
-    file pehle download karni padti hai (warna Telegram "wrong file identifier" deta hai).
-    `extra_tokens` me wo bots hote hain jinke file_id hone ke chance hain (channel wala bot).
-    """
-    if not isinstance(media, str) or not media:
-        return media
-    if media.startswith("http") or os.path.exists(media):
-        return media
-    # Pehle extra tokens (channel wala bot) try karo - file_id aksar usi bot ka hota hai
-    for token in (extra_tokens or []):
-        cached = _UA_MEDIA_CACHE.get((token, media))
-        if cached and os.path.exists(cached):
-            return cached
-    if extra_tokens:
-        path = await bot_api_download_file(media, extra_tokens)
-        if path:
-            _UA_MEDIA_CACHE[(extra_tokens[0], media)] = path
-            _ua_trim_media_cache()
-            return path
-    source_bot = source_bot or MAIN_BOT_REF
-    token = source_token or (getattr(source_bot, "token", "") if source_bot is not None else "") or MAIN_BOT_TOKEN
-    cache_key = (token, media)
-    cached = _UA_MEDIA_CACHE.get(cache_key)
-    if cached and os.path.exists(cached):
-        return cached
-    path = None
-    if source_bot is not None:
-        try:
-            remote = await source_bot.get_file(media)
-            path = getattr(remote, "file_path", None)
-        except Exception as ex:
-            logging.warning(f"media ka file path nahi mila: {mask_secrets(ex)}")
-    if not path or not token:
-        return media
-    suffix = os.path.splitext(path)[1] or ".bin"
-    fd, tmp_path = tempfile.mkstemp(prefix="ua_media_", suffix=suffix)
-    os.close(fd)
-    url = MEDIA_URL_TEMPLATE.format(token=token, path=path)
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
-            async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                with open(tmp_path, "wb") as fh:
-                    async for chunk in resp.aiter_bytes(65536):
-                        fh.write(chunk)
-    except Exception as ex:
-        logging.warning(f"media download fail (user account ke liye): {mask_secrets(ex)}")
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        return media
-    _UA_MEDIA_CACHE[cache_key] = tmp_path
-    _ua_trim_media_cache()
-    return tmp_path
-
-
-def _ua_trim_media_cache():
-    if len(_UA_MEDIA_CACHE) > UA_MEDIA_CACHE_MAX:
-        for key in list(_UA_MEDIA_CACHE.keys())[:50]:
-            old = _UA_MEDIA_CACHE.pop(key, None)
-            if old:
-                try:
-                    os.unlink(old)
-                except Exception:
-                    pass
-
-
-class AccountLimitedError(Exception):
-    """Telegram ne user account par flood/spam limit lagayi (apna account bachao)."""
-
-
-# Telethon error -> PTB error mapping. Isse broadcast/welcome ka poora purana logic
-# (Forbidden = user gone, BadRequest = media issue, NetworkError/TimedOut = retry) bina
-# badle user accounts ke liye bhi kaam karta hai.
-_UA_GONE_ERRORS = ("UserIsBlockedError", "YouBlockedUserError", "UserPrivacyRestrictedError",
-                   "UserNotMutualContactError", "ChatWriteForbiddenError", "InputUserDeactivatedError",
-                   "UserDeactivatedError", "PeerIdInvalidError", "UserBannedInChannelError")
-_UA_LIMIT_ERRORS = ("PeerFloodError",)
-
-
-# User account se custom (premium) emoji bhejna Telegram reject kar deta hai jab account
-# Premium na ho ya woh emoji set usne install na kiya ho:
-#   "The document file was invalid and can't be used in inline mode (caused by SendMessageRequest)"
-# Isliye reject hone par plain emoji par switch kar jate hain - warna poora message hi fail
-# ho jata tha (jaise /start ka panel DM: "kuch nhi aa rha").
-_UA_PREMIUM_EMOJI_OK: Dict[str, bool] = {}
-_UA_EMOJI_ERROR_HINTS = ("document file was invalid", "document_invalid",
-                         "can't be used in inline mode", "documentinvalid")
-
-
-def _ua_custom_emoji_rejected(ex) -> bool:
-    """Custom emoji/document ki wajah se aaya error? (type + message dono se check)"""
-    if type(ex).__name__ in ("DocumentInvalidError", "DocumentInvalid"):
-        return True
-    text = str(ex or "").lower()
-    return any(hint in text for hint in _UA_EMOJI_ERROR_HINTS)
-
-
-def _ua_premium_emoji_allowed(bot_id: str) -> bool:
-    """Is account se custom emoji jate hain? (default: pata nahi -> haan, try karenge)"""
-    return _UA_PREMIUM_EMOJI_OK.get(bot_id, True)
-
-
-_UA_SEND_MODE: Dict[str, str] = {}   # bot_id -> "direct" | "saved" (Saved Messages se forward)
-_WARN_ONCE_KEYS: set = set()         # ek hi warning baar-baar na aaye
-_UA_CHANNEL_HINT = ContextVar("ua_channel_hint", default=None)      # user kis channel se aaya
-_UA_MEDIA_BOT_HINT = ContextVar("ua_media_bot_hint", default=None)  # media kis bot ki hai
-
-
-def _ua_should_try_other_strategy(ex) -> bool:
-    """Is error ke baad doosra rasta (Saved Messages -> forward) try karein?
-
-    Forbidden (user ne block kiya / user gone) aur flood-limit par nahi - warna account par
-    spam-report lag sakti hai.
-    """
-    if isinstance(ex, (Forbidden, AccountLimitedError)):
-        return False
-    text = str(ex or "").lower()
-    if "flood" in text or "too many requests" in text:
-        return False
-    return True
 
 
 PLAIN_RETRY_SKIP_MARKERS = (
@@ -5452,1198 +4654,76 @@ def _should_plain_retry(ex) -> bool:
     return True
 
 
-def _warn_once(key: str, message: str):
-    """Wahi warning baar-baar log me na aaye (ek baar, phir debug)."""
-    if key in _WARN_ONCE_KEYS:
-        logging.debug(message)
-        return
-    _WARN_ONCE_KEYS.add(key)
-    logging.warning(message)
+async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, kind: str = "DM"):
+    """`do_send(sender)` ko bot sender par try karo.
 
-
-def _ua_note_send_mode(bot_id: str, mode: str):
-    """Kaunsi strategy chali - ek hi baar log karo (log spam nahi)."""
-    prev = _UA_SEND_MODE.get(bot_id)
-    _UA_SEND_MODE[bot_id] = mode
-    if prev == mode:
-        return
-    if mode == "saved":
-        logging.info(f"{bot_id}: direct DM nahi ja rahi - Saved Messages me daal kar forward "
-                     f"kar rahe hain (agli baar bhi isi raste se; Telegram cold-DM rok raha hai)")
-    elif prev == "saved":
-        logging.info(f"{bot_id}: direct DM phir se chal rahi hai - ab seedha bhejenge")
-
-
-def dm_error_note(ex) -> str:
-    """Error ke saath ek line ka rasta (user ko kya karna hai)."""
-    text = str(ex or "").lower()
-    if "flood" in text or "too many requests" in text:
-        return "Telegram ne account par flood-limit lagayi hai - kuch ghante ruk kar dobara try karo"
-    if "mutual contact" in text:
-        return ("Telegram naye/limited account se stranger DM rok raha hai - account ko warm karo "
-                "(us account se khud kuch chats karo) ya Saved-forward rasta use karo")
-    if "could not find the input entity" in text or "peer_id_invalid" in text:
-        return ("Telegram ko us user ki entity nahi mili - join request/leave wale update se milti hai, "
-                "isliye wahi account us channel se DM kar sakta hai")
-    if "blocked" in text:
-        return "user ne is account ko block kiya hai (respect karte hain, spam nahi bhejenge)"
-    if "initiate" in text:
-        return ("bot DM shuru nahi kar sakta (user ne bot ko /start nahi kiya) - "
-                "owner ka user account add karo to DM jaane lagegi")
-    if "document" in text and "invalid" in text:
-        return "custom/premium emoji wala message Telegram ne reject kiya - plain emoji me bhejenge"
-    return ""
-
-
-def _ua_note_emoji_reject(bot_id: str, ex) -> bool:
-    """Ek hi baar note (log spam nahi). True = ye naya reject tha."""
-    if _UA_PREMIUM_EMOJI_OK.get(bot_id) is False:
-        return False
-    _UA_PREMIUM_EMOJI_OK[bot_id] = False
-    logging.info(f"{bot_id}: is account se custom (premium) emoji nahi ja rahe "
-                 f"({mask_secrets(ex)}) - ab plain emoji me bhejenge, baaki message waisa hi rahega")
-    return True
-
-
-def translate_ua_error(ex):
-    """Telethon exception ko PTB-style exception me badlo (warna caller confuse ho jata hai)."""
-    name = type(ex).__name__
-    text = str(ex)
-    if name in _UA_GONE_ERRORS:
-        return Forbidden(f"Forbidden: {text}")
-    if name in _UA_LIMIT_ERRORS:
-        return AccountLimitedError(f"AccountLimited: {text}")
-    if "FloodWait" in name:
-        return AccountLimitedError(f"AccountLimited: {text}")
-    if name in ("TimeoutError", "TimedOutError", "RPCError") or "Timeout" in name:
-        return TimedOut(f"Timed out: {text}")
-    if name in ("ConnectionError", "RpcCallFailError", "ServerError", "ServiceUnavailableError",
-                "AuthKeyDuplicatedError"):
-        return NetworkError(f"NetworkError: {text}")
-    return BadRequest(text)
-
-
-def _ua_wrap(coro):
-    """Await karo aur Telethon error ko PTB error me translate karo."""
-    async def _runner():
-        try:
-            return await coro
-        except (Forbidden, BadRequest, NetworkError, TimedOut, AccountLimitedError):
-            raise
-        except Exception as ex:
-            raise translate_ua_error(ex) from ex
-    return _runner()
-
-
-class _UASentMessage:
-    """PTB `Message` jaisa halka wrapper (message_id / chat_id / delete()).
-
-    Telethon ka return object `.id` deta hai, par hamara poora code PTB style `.message_id`
-    maangta hai (jaise leave-recovery ko sent message yaad rakhna hota hai) - isliye wrap.
+    Return: (ok, error, used_alt)
+      * ok=True  -> message chala gaya
+      * ok=False -> send fail; error me exception
+    (Naam me "fallback" purana hai - ab ek hi sender hota hai: bot.)
     """
-
-    def __init__(self, raw, chat_id=None):
-        self.raw = raw
-        self.message_id = int(getattr(raw, "id", 0) or 0)
-        self.id = self.message_id
-        self.chat_id = chat_id if chat_id is not None else getattr(raw, "chat_id", None)
-
-    async def delete(self):
-        try:
-            return await self.raw.delete()
-        except Exception:
-            return None
-
-    def __getattr__(self, item):
-        if item.startswith("__"):
-            raise AttributeError(item)
-        return getattr(self.raw, item, None)
+    sender = primary if primary is not None else get_account_sender(bot_id)
+    if sender is None:
+        return False, BadRequest("koi sender available nahi (bot band hai)"), False
+    try:
+        await do_send(sender)
+    except (NetworkError, TimedOut) as ex:
+        return False, ex, False
+    except (Forbidden, BadRequest) as ex:
+        return False, ex, False
+    except Exception as ex:
+        return False, ex, False
+    return True, None, False
 
 
-class UserAccountSender:
-    """Telethon client ko PTB `Bot` jaisa interface deta hai.
+def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str) -> bool:
+    """Ek jagah DM failure ka faisla: log + (permanent) unreachable marking.
 
-    Telegram ki limits jo yahan handle ki gayi hain:
-      * User account inline keyboard/buttons bhej NAHI sakta (bots-only) -> buttons ko
-        message ke neeche clickable links bana dete hain (URL buttons), callback buttons
-        ka label bina link dikh jata hai.
-      * Premium emoji (`<tg-emoji emoji-id=...>`) MTProto HTML me supported hai -> text
-        aur caption me premium emoji waisa hi rehta hai.
-      * Bulk DM par spam-limit -> per message chhota delay (USER_ACCOUNT_SEND_DELAY).
+    Return True = caller yahin ruk jaye (aage ke messages bhejne ka fayda nahi).
     """
-
-    kind = "user"
-
-    def __init__(self, bot_id: str, owner_id: int, client, phone: str = "",
-                 username: Optional[str] = None, account_user_id: int = 0,
-                 premium: Optional[bool] = None):
-        self.bot_id = bot_id
-        self.owner_id = owner_id
-        self.client = client
-        self.phone = phone
-        self.username = username
-        self.id = int(account_user_id or 0)
-        self.token = ""  # sendable_media_id / cache keys ise dhoondhte hain
-        self.premium = premium
-        self._button_note_logged = False
-        # diagnostics (/diag) ke liye
-        self.connected_at = None
-        self.last_error = None      # /diag ke liye: aakhri send ka error (class name sameth)
-        self.raw_updates = 0
-        self.dm_count = 0
-        self.last_dm_at = None
-        self.last_dm_from = None
-        self.last_dm_text = ""
-        if premium is False:
-            # Non-Premium account custom emoji bhej hi nahi sakta - shuru se plain mode
-            # (warna har message ek baar fail hota aur phir retry)
-            _UA_PREMIUM_EMOJI_OK[bot_id] = False
-
-    # ---------- helpers ----------
-    def _markup_to_links(self, markup) -> str:
-        """Inline keyboard -> text links (user account se buttons allowed nahi hain)."""
-        rows = getattr(markup, "inline_keyboard", None)
-        if not rows:
-            return ""
-        lines = []
-        dropped = 0
-        for row in rows:
-            parts = []
-            for b in row:
-                label = getattr(b, "text", "") or ""
-                url = getattr(b, "url", None)
-                if not url:
-                    data = getattr(b, "callback_data", None)
-                    if isinstance(data, str) and data.startswith("http"):
-                        url = data
-                plain = strip_premium_emojis(label).strip()
-                if url:
-                    parts.append(f'<a href="{str(url).replace(chr(34), "%22")}">{plain}</a>')
-                else:
-                    dropped += 1
-                    parts.append(plain)
-            if parts:
-                lines.append(" • ".join(parts))
-        if dropped and not self._button_note_logged:
-            self._button_note_logged = True
-            logging.info(f"{self.bot_id}: user account se callback buttons kaam nahi karte "
-                         f"(Telegram bots-only rakhta hai) - {dropped} button bina link dikhega")
-        return ("\n\n" + "\n".join(lines)) if lines else ""
-
-    async def _throttle(self, chat_id):
-        """User account se DM bhejne se pehle chhota gap (spam-limit se bachne ke liye)."""
-        try:
-            target = int(chat_id)
-        except Exception:
-            return
-        if target <= 0 or USER_ACCOUNT_SEND_DELAY <= 0:
-            return
-        now = time.monotonic()
-        last = _UA_LAST_SEND.get(self.bot_id, 0.0)
-        wait = USER_ACCOUNT_SEND_DELAY - (now - last)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _UA_LAST_SEND[self.bot_id] = time.monotonic()
-
-    async def _prepare_media(self, media):
-        if isinstance(media, str) and media and not media.startswith("http") and not os.path.exists(media):
-            # file_id usi bot ka hota hai jisne file dekhi thi - pehle usi bot ka token try
-            return await materialize_media(media, MAIN_BOT_REF, extra_tokens=self._media_tokens())
-        return media
-
-    def _media_tokens(self):
-        """Media download ke liye kaunse bot tokens try karne hain (channel wala pehle)."""
-        tokens = []
-        bot_id = _UA_MEDIA_BOT_HINT.get() or self.bot_id
-        if bot_id:
-            try:
-                tok = (db.get_user_bot(bot_id) or {}).get("bot_token")
-            except Exception:
-                tok = None
-            if tok:
-                tokens.append(tok)
-        if MAIN_BOT_TOKEN and MAIN_BOT_TOKEN not in tokens:
-            tokens.append(MAIN_BOT_TOKEN)
-        return tokens
-
-    async def _resolve_peer(self, chat_id, channel_id=None):
-        """Telethon ko user ka peer chahiye: user_id + access_hash (warna "input entity" error).
-
-        Koshish ka order:
-          1) memory/DB cache (join-request list ya pichle DM se mila access_hash)
-          2) client.get_input_entity (session cache / dialogs me ho to)
-          3) channel ke pending-requester/importer list se (wo full User dete hain)
-          4) aakhiri koshish: access_hash=0 (kabhi-kabhi Telegram maan leta hai)
-        """
-        try:
-            uid = int(chat_id)
-        except Exception:
-            return chat_id
-        if uid < 0:      # channel/group - Telethon khud resolve kar leta hai
-            return chat_id
-        ah = ua_cached_access_hash(self.bot_id, uid)
-        if ah:
-            return _tl_input_peer_user(uid, ah)
-        try:
-            peer = await self.client.get_input_entity(uid)
-        except Exception:
-            peer = None
-        if peer is not None:
-            try:
-                got = int(getattr(peer, "access_hash", 0) or 0)
-            except Exception:
-                got = 0
-            if got:
-                _UA_ENTITY_MEM.setdefault(self.bot_id, {})[uid] = got
-                try:
-                    db.remember_user_entity(self.bot_id, uid, got)
-                except Exception:
-                    pass
-            return peer
-        # channel se nikalne ki koshish (join-request wale users yahin milte hain)
-        for hint in (channel_id, _UA_CHANNEL_HINT.get()):
-            if not hint:
-                continue
-            try:
-                users = await self.list_pending_join_requesters(hint, remember=False)
-            except Exception:
-                users = []
-            for u in users or []:
-                if int(getattr(u, "id", 0) or 0) == uid:
-                    ua_remember_entities(self.bot_id, [u])
-                    return _tl_input_peer_user(uid, int(getattr(u, "access_hash", 0) or 0))
-        logging.debug(f"{self.bot_id}: user {uid} ka access_hash nahi mila - "
-                      f"aakhiri koshish (access_hash=0) kar rahe hain")
-        return _tl_input_peer_user(uid, 0)
-
-    # ---------- PTB-Bot-compatible API ----------
-    async def get_me(self):
-        return await self.client.get_me()
-
-    async def send_to_chat(self, chat_id, text, parse_mode=None, reply_to=None, reply_markup=None):
-        """Seedha Telethon se bhejo - panel DM / /start ka reply (PTB kwargs ke bina).
-
-        User account buttons nahi bhej sakta, isliye reply_markup ke URL buttons links
-        ban ke text me hi chale jate hain (callback buttons sirf label dikhate hain).
-        """
-        if reply_markup is not None:
-            text = (text or "") + self._markup_to_links(reply_markup)
-        return await self._send_text(chat_id, text, parse_mode=parse_mode, reply_to=reply_to)
-
-    # ---------- premium emoji fallback ----------
-    def _premium_ok(self) -> bool:
-        return _ua_premium_emoji_allowed(self.bot_id)
-
-    def _downgrade_premium(self, text):
-        """Account custom emoji nahi bhej sakta to tg-emoji tags hata do (plain emoji rehta hai)."""
-        if not text or self._premium_ok():
-            return text
-        return strip_premium_emojis(text)
-
-    async def _try_strategies(self, chat_id, payload, strategies, reply_to=None):
-        """Raste ek-ek karke try karo: direct, phir Saved Messages -> forward.
-
-        Jo rasta pehle chal jaye wahi yaad rakh liya jata hai (agli baar wahi pehle).
-        Custom emoji reject ho to usi raste me plain emoji se dobara try hota hai.
-        """
-        mode = _UA_SEND_MODE.get(self.bot_id, "direct")
-        order = ["saved", "direct"] if mode == "saved" else ["direct", "saved"]
-        plain_payload = strip_premium_emojis(payload or "")
-        last_ex = None
-        for name in order:
-            fn = strategies.get(name)
-            if fn is None:
-                continue
-            bodies = [payload] if plain_payload == payload else [payload, plain_payload]
-            for idx, body in enumerate(bodies):
-                try:
-                    res = await fn(body)
-                except Exception as ex:
-                    last_ex = ex
-                    self.last_error = f"{type(ex).__name__}: {mask_secrets(ex)}"
-                    if idx == 0 and _ua_custom_emoji_rejected(ex):
-                        _ua_note_emoji_reject(self.bot_id, ex)
-                        continue
-                    if not _ua_should_try_other_strategy(ex):
-                        raise
-                    note = dm_error_note(ex)
-                    logging.debug(f"{self.bot_id}: {name} strategy se DM nahi gayi "
-                                  f"({mask_secrets(ex)}) - agla rasta try kar rahe hain"
-                                  f"{' | ' + note if note else ''}")
-                    break
-                else:
-                    self.last_error = None
-                    _ua_note_send_mode(self.bot_id, name)
-                    return res
-        if last_ex is not None:
-            raise last_ex
-        return None
-
-    async def _send_text(self, chat_id, text, parse_mode=None, reply_to=None):
-        """Text bhejo: seedha, na chale to Saved Messages me daal kar forward."""
-        text = self._downgrade_premium(text) or ""
-        html = "html" if parse_mode == ParseMode.HTML else None
-        await self._throttle(chat_id)
-        peer = await self._resolve_peer(chat_id)
-
-        async def _direct(body):
-            res = await _ua_wrap(self.client.send_message(
-                peer, body, parse_mode=html, link_preview=False, reply_to=reply_to))
-            return _UASentMessage(res, chat_id)
-
-        async def _saved(body):
-            # pehle apne Saved Messages me, phir wahi message user ko forward (user ka idea)
-            saved = await _ua_wrap(self.client.send_message("me", body, parse_mode=html,
-                                                            link_preview=False))
-            fwd = await _ua_wrap(self.client.forward_messages(peer, saved, from_peer="me"))
-            if isinstance(fwd, (list, tuple)):
-                fwd = fwd[0] if fwd else saved
-            return _UASentMessage(fwd, chat_id)
-
-        return await self._try_strategies(chat_id, text,
-                                          {"direct": _direct, "saved": _saved}, reply_to=reply_to)
-
-    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None,
-                           disable_web_page_preview=None, **kwargs):
-        if reply_markup is not None:
-            text = (text or "") + self._markup_to_links(reply_markup)
-        return await self._send_text(chat_id, text, parse_mode=parse_mode)
-
-    async def _send_media(self, chat_id, media, caption=None, parse_mode=None,
-                          reply_markup=None, force_document=False, voice_note=False,
-                          video_note=False, **kwargs):
-        if reply_markup is not None:
-            caption = (caption or "") + self._markup_to_links(reply_markup)
-        file = await self._prepare_media(media)
-        if file is None or file == "":
-            if caption:
-                return await self.send_message(chat_id, caption, parse_mode=ParseMode.HTML)
-            return None
-        await self._throttle(chat_id)
-        peer = await self._resolve_peer(chat_id)
-
-        async def _direct(cap):
-            res = await _ua_wrap(self.client.send_file(
-                peer, file, caption=cap or None,
-                parse_mode="html" if cap else None,
-                force_document=force_document,
-                voice_note=voice_note, video_note=video_note))
-            return _UASentMessage(res, chat_id)
-
-        async def _saved(cap):
-            # Saved Messages me daal kar forward - media dobara upload nahi hoti
-            saved = await _ua_wrap(self.client.send_file(
-                "me", file, caption=cap or None, parse_mode="html" if cap else None,
-                force_document=force_document, voice_note=voice_note, video_note=video_note))
-            fwd = await _ua_wrap(self.client.forward_messages(peer, saved, from_peer="me"))
-            if isinstance(fwd, (list, tuple)):
-                fwd = fwd[0] if fwd else saved
-            return _UASentMessage(fwd, chat_id)
-
-        caption = self._downgrade_premium(caption)
-        return await self._try_strategies(chat_id, caption,
-                                          {"direct": _direct, "saved": _saved})
-
-    async def send_photo(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, caption, parse_mode, reply_markup, **kw)
-
-    async def send_video(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, caption, parse_mode, reply_markup, **kw)
-
-    async def send_document(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
-        kw.pop("filename", None)
-        return await self._send_media(chat_id, media, caption, parse_mode, reply_markup,
-                                      force_document=True, **kw)
-
-    async def send_animation(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, caption, parse_mode, reply_markup, **kw)
-
-    async def send_audio(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, caption, parse_mode, reply_markup, **kw)
-
-    async def send_voice(self, chat_id, media, caption=None, parse_mode=None, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, caption, parse_mode, reply_markup,
-                                      voice_note=True, **kw)
-
-    async def send_video_note(self, chat_id, media, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, None, None, reply_markup, video_note=True, **kw)
-
-    async def send_sticker(self, chat_id, media, reply_markup=None, **kw):
-        return await self._send_media(chat_id, media, None, None, reply_markup, **kw)
-
-    async def send_media_group(self, chat_id, media, caption=None, reply_markup=None, **kw):
-        """PTB ke InputMedia* objects -> Telethon album (caption album par hi rehta hai)."""
-        files = []
-        album_caption = caption
-        for item in media or []:
-            raw = getattr(item, "media", None)
-            if raw is None:
-                continue
-            files.append(await self._prepare_media(raw))
-            if not album_caption and getattr(item, "caption", None):
-                album_caption = item.caption
-        if not files:
-            return None
-        if reply_markup is not None:
-            album_caption = (album_caption or "") + self._markup_to_links(reply_markup)
-        await self._throttle(chat_id)
-        peer = await self._resolve_peer(chat_id)
-        target = files[0] if len(files) == 1 else files
-
-        async def _direct(cap):
-            res = await _ua_wrap(self.client.send_file(
-                peer, target, caption=cap or None,
-                parse_mode="html" if cap else None))
-            return _UASentMessage(res, chat_id)
-
-        async def _saved(cap):
-            saved = await _ua_wrap(self.client.send_file(
-                "me", target, caption=cap or None, parse_mode="html" if cap else None))
-            fwd = await _ua_wrap(self.client.forward_messages(peer, saved, from_peer="me"))
-            if isinstance(fwd, (list, tuple)):
-                fwd = fwd[0] if fwd else saved
-            return _UASentMessage(fwd, chat_id)
-
-        album_caption = self._downgrade_premium(album_caption)
-        return await self._try_strategies(chat_id, album_caption,
-                                          {"direct": _direct, "saved": _saved})
-
-    async def delete_message(self, chat_id, message_id, **kw):
-        """Panel se message delete karne wale flows ke liye (best effort)."""
-        try:
-            await self.client.delete_messages(int(chat_id), [int(message_id)])
-            return True
-        except Exception as ex:
-            logging.debug(f"user account: message delete nahi hua ({message_id}): {mask_secrets(ex)}")
-            return False
-
-    async def edit_message_text(self, text=None, chat_id=None, message_id=None, **kw):
-        """PTB Bot.edit_message_text jaisa (user account ke liye)."""
-        if chat_id is None or message_id is None:
-            raise BadRequest("chat_id aur message_id chahiye")
-        return await _ua_wrap(self.client.edit_message(
-            int(chat_id), int(message_id), text or "",
-            parse_mode="html" if kw.get("parse_mode") == ParseMode.HTML else None))
-
-    async def delete_webhook(self, **kw):
+    if isinstance(ex, (NetworkError, TimedOut)):
+        logging.warning(f"{kind} network hiccup (transient): {mask_secrets(ex)}")
         return True
-
-    async def get_chat(self, chat_id, **kw):
-        try:
-            entity = await self.client.get_entity(int(chat_id))
-        except Exception as ex:
-            raise BadRequest(mask_secrets(ex)) from ex
-        return entity
-
-    async def get_chat_member(self, chat_id, user_id=None):
-        from types import SimpleNamespace
-        try:
-            perms = await self.client.get_permissions(chat_id, "me")
-            status = "administrator" if (getattr(perms, "is_admin", False) or getattr(perms, "is_creator", False)) else "member"
-        except Exception:
-            status = "member"
-        return SimpleNamespace(status=status, user=SimpleNamespace(id=self.id))
-
-    async def approve_chat_join_request(self, chat_id, user_id):
-        return await self.client(tl_functions.messages.HideChatJoinRequestRequest(
-            peer=chat_id, user_id=user_id, approved=True))
-
-    async def decline_chat_join_request(self, chat_id, user_id):
-        return await self.client(tl_functions.messages.HideChatJoinRequestRequest(
-            peer=chat_id, user_id=user_id, approved=False))
-
-    async def list_pending_join_requesters(self, chat_id, remember: bool = True) -> List[Any]:
-        """Admin user accounts ko `UpdatePendingJoinRequests` milta hai; list isse nikalte hain.
-
-        `offset_user=0` nahi bhejna - Telethon use PeerUser(0) bana deta hai aur
-        "Could not find the input entity for PeerUser(user_id=0)" milta tha. Pehle page ke
-        liye `InputUserEmpty()` sahi value hai.
-        """
-        try:
-            res = await self.client(tl_functions.messages.GetChatInviteImportersRequest(
-                peer=chat_id, offset_date=None, offset_user=_tl_input_user_empty(),
-                limit=100, requested=True))
-        except Exception as ex:
-            _warn_once(f"ua:pending:{self.bot_id}",
-                       f"pending join requests laane me error: {mask_secrets(ex)}")
-            return []
-        users = {getattr(u, "id", 0): u for u in (getattr(res, "users", None) or [])}
-        out = []
-        for imp in (getattr(res, "importers", None) or []):
-            user = users.get(getattr(imp, "user_id", 0))
-            if user is not None:
-                out.append(user)
-        if remember and out:
-            # in users ke access_hash mil gaye - aage DM bhejne ke liye kaam aayenge
-            ua_remember_entities(self.bot_id, out)
-        return out
-
-
-def user_account_credentials(row: Optional[dict] = None):
-    """(api_id, api_hash) - pehle account-specific, warna .env se."""
-    row = row or {}
-    api_id = row.get("api_id") or (int(TELEGRAM_API_ID) if str(TELEGRAM_API_ID).isdigit() else None)
-    api_hash = row.get("api_hash") or (TELEGRAM_API_HASH or None)
-    return api_id, api_hash
-
-
-def ua_credentials_available(row: Optional[dict] = None) -> bool:
-    """User account mode ke liye api_id + api_hash dono set hain?"""
-    api_id, api_hash = user_account_credentials(row)
-    return bool(api_id and api_hash)
-
-
-async def start_user_account(bot_id: str, owner_id: int = 0, row: Optional[dict] = None,
-                             quiet: bool = False, client_factory=None) -> bool:
-    """Saved session (StringSession) se MTProto client chalu karo + handlers lagao."""
-    fail_log = logging.warning if quiet else logging.error
-    if not TELETHON_AVAILABLE:
-        fail_log("user account mode ke liye telethon install nahi hai - "
-                 "'pip install telethon' karke ./start dobara chalao")
-        return False
-    row = row or db.get_user_bot(bot_id) or {}
-    owner_id = owner_id or row.get("user_id") or 0
-    session_string = row.get("session_string")
-    if not session_string:
-        fail_log(f"user account {bot_id}: session nahi mila (dobara login karna padega)")
-        return False
-    api_id, api_hash = user_account_credentials(row)
-    if not api_id or not api_hash:
-        fail_log(f"user account {bot_id}: TELEGRAM_API_ID / TELEGRAM_API_HASH set nahi hai\n{TELEGRAM_API_HINT}")
-        return False
-    factory = client_factory or (lambda: TelegramClient(StringSession(session_string), api_id, api_hash,
-                                                        connection_retries=2, retry_delay=1,
-                                                        timeout=30, request_retries=3,
-                                                        auto_reconnect=True))
-    for attempt in range(1, USER_ACCOUNT_ATTEMPTS + 1):
-        client = None
-        try:
-            client = factory()
-            await client.connect()
-            if not await client.is_user_authorized():
-                fail_log(f"user account {bot_id}: session expire/revoke ho gaya - "
-                         f"owner ko dobara login karna hoga")
-                try:
-                    db.set_user_bot_active(bot_id, False)
-                except Exception:
-                    pass
-                await _notify_account_owner(owner_id, bot_id,
-                                            "⚠️ Aapke user account ka login expire ho gaya. "
-                                            "Panel me jaake dobara login karo (➕ Add Account → 👤 User Account).")
-                await _ua_disconnect(client)
-                return False
-            me = await client.get_me()
-            premium_flag = getattr(me, "premium", None)
-            sender = UserAccountSender(bot_id, owner_id, client,
-                                       phone=row.get("phone") or "",
-                                       username=getattr(me, "username", None),
-                                       account_user_id=getattr(me, "id", 0),
-                                       premium=premium_flag)
-            sender.connected_at = time.time()
-            _register_user_account_handlers(client, sender, bot_id, owner_id)
-            user_account_clients[bot_id] = sender
-            task = asyncio.create_task(client.run_until_disconnected())
-            user_account_tasks[bot_id] = task
-            task.add_done_callback(
-                lambda t, b=bot_id, c=client: asyncio.create_task(_on_account_disconnected(b, t, client=c)))
-            try:
-                db.set_user_bot_active(bot_id, True)
-            except Exception:
-                pass
-            name = f"@{me.username}" if getattr(me, "username", None) else (row.get("phone") or bot_id)
-            logging.info(f"{pp('✅')} User account {name} chalu ho gaya ({bot_id}) - panel ke liye isi "
-                         f"account se (ya manager account se) main bot me /start karo")
-            if premium_flag is False:
-                logging.info(f"{bot_id}: account Premium nahi hai - custom (premium) emoji ki jagah "
-                             f"plain emoji bhejenge (Telegram inhe reject karta hai)")
-            try:
-                for ch in db.get_bot_channels(bot_id) or []:
-                    await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], sender)
-            except Exception as ex:
-                logging.warning(f"{bot_id}: pending join requests sync fail: {mask_secrets(ex)}")
-            return True
-        except FloodWaitError as ex:  # pragma: no cover - network path
-            await _ua_disconnect(client)
-            fail_log(f"user account {bot_id}: Telegram ne {getattr(ex, 'seconds', '?')}s ka wait diya "
-                     f"(flood limit) - thodi der me dobara try hoga")
-            return False
-        except Exception as ex:
-            await _ua_disconnect(client)
-            if attempt < USER_ACCOUNT_ATTEMPTS:
-                logging.warning(f"user account {bot_id}: attempt {attempt} fail ({mask_secrets(ex)}) - dobara try")
-                await asyncio.sleep(2 * attempt)
-                continue
-            fail_log(f"user account {bot_id} start nahi ho paya: {mask_secrets(ex)}")
-            return False
+    if is_dm_initiate_blocked(ex):
+        # Bot DM shuru nahi kar sakta (user ne /start nahi kiya). Permanent mark NAHI
+        # karte: user ke /start karte hi ye DM ja sakti hai.
+        db.mark_unreachable(bot_id, user_id)
+        key = (bot_id, user_id, "initiate")
+        if key not in _DM_INITIATE_WARNED:
+            _DM_INITIATE_WARNED.add(key)
+            logging.warning(f"{kind} skip (user {user_id}): {mask_secrets(ex)} - "
+                            f"user ne bot ko /start nahi kiya (user /start kare to DM ja sakti hai)")
+        return True
+    if is_user_gone_error(ex) or isinstance(ex, Forbidden):
+        db.mark_unreachable(bot_id, user_id)
+        db.mark_permanently_unreachable(bot_id, user_id, str(ex))
+        logging.warning(f"{kind} skip (user {user_id} reachable nahi): "
+                        f"{type(ex).__name__}: {mask_secrets(ex)}")
+        return True
+    logging.error(f"{kind} error: {type(ex).__name__}: {mask_secrets(ex)}")
     return False
 
 
-async def _ua_disconnect(client):
-    if client is None:
-        return
-    try:
-        if getattr(client, "is_connected", None) and client.is_connected():
-            await client.disconnect()
-    except Exception:
-        pass
+def is_account_running(bot_id: str) -> bool:
+    return bot_id in user_bot_applications
 
 
-async def _on_account_disconnected(bot_id: str, task, client=None):
-    """Account ka connection apne aap band ho gaya (logout/network) - registry saaf karo
-    taaki 10-min wala retry job ise dobara connect kar sake (self-heal).
-
-    `client` diya ho to sirf tabhi saaf karo jab registry me wahi purana client ho - warna
-    ek purani task ka callback naya chalu hua client bhi uda deta hai.
-    """
-    sender = user_account_clients.get(bot_id)
-    if sender is None or (client is not None and getattr(sender, "client", None) is not client):
-        return
-    user_account_clients.pop(bot_id, None)
-    user_account_tasks.pop(bot_id, None)
-    if task.cancelled():
-        return
-    exc = None
-    try:
-        exc = task.exception()
-    except Exception:
-        pass
-    try:
-        db.set_user_bot_active(bot_id, False)
-    except Exception:
-        pass
-    logging.warning(f"user account {bot_id} ka connection band ho gaya"
-                    f"{': ' + mask_secrets(exc) if exc else ''} - retry job dobara connect karega")
-    row = db.get_user_bot(bot_id) or {}
-    await _notify_account_owner(sender.owner_id or row.get("user_id") or 0, bot_id,
-                                "⚠️ Aapke user account ka connection band ho gaya.\n"
-                                "Bot 10 minute me khud dobara connect karega; agar phir bhi band rahe to "
-                                "panel se dobara login karo (➕ Add Account → 👤 User Account).")
+def get_account_sender(bot_id: str):
+    """Is bot_id ka live sender: PTB bot application ka bot."""
+    app = user_bot_applications.get(bot_id)
+    if app is not None:
+        return app.bot
+    return None
 
 
-async def stop_user_account(bot_id: str):
-    sender = user_account_clients.pop(bot_id, None)
-    task = user_account_tasks.pop(bot_id, None)
-    if task is not None:
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    if sender is not None:
-        await _ua_disconnect(sender.client)
-    _UA_LAST_SEND.pop(bot_id, None)
-    if sender is not None:
-        try:
-            db.set_user_bot_active(bot_id, False)
-        except Exception:
-            pass
-        logging.info(f"user account {bot_id} band kar diya")
-
-
-async def _notify_account_owner(owner_id: int, bot_id: str, text: str):
-    """Owner ko main bot se batao (best effort)."""
-    try:
-        if MAIN_BOT_REF is not None and owner_id:
-            await send_premium_message(MAIN_BOT_REF, owner_id, text, parse_mode=ParseMode.HTML)
-    except Exception as ex:
-        logging.debug(f"owner notify fail ({bot_id}): {mask_secrets(ex)}")
-
-
-UA_ACCOUNT_COMMANDS = ("/start", "/menu", "/panel", "/help")
-_UA_SUPPORT_GREETED: set = set()
-_UA_DM_SEEN: set = set()   # pehla DM kahan se aaya (diagnostics)
-
-
-def _main_bot_ref_name() -> str:
-    """Main bot ka @username (jo bhi ho chale) - user account ke DM me batane ke liye."""
-    ref = MAIN_BOT_REF
-    if ref is None:
-        return ""
-    try:
-        username = getattr(ref, "username", None)
-    except Exception:
-        username = None
-    return f"@{username}" if username else ""
-
-
-def _ua_panel_text(bot_id: str, manager_uid: int = 0) -> str:
-    """User account ka panel text (buttons user account bhej nahi sakta, isliye text + links)."""
-    row = db.get_user_bot(bot_id) or {}
-    sub = db.get_subscription_for_bot(bot_id)
-    plan = "No active plan"
-    if sub:
-        try:
-            expiry = sub.get("expiry_date")
-            expiry = make_aware(expiry) if isinstance(expiry, datetime) else expiry
-            if isinstance(expiry, str):
-                expiry = datetime.fromisoformat(expiry.replace("+00:00", "").strip())
-            plan = f"{sub.get('subscription_type') or 'Active'} (expiry {str(expiry)[:10]})"
-        except Exception:
-            plan = str(sub.get("subscription_type") or "Active")
-    main_bot = _main_bot_ref_name()
-    link = (f'<a href="https://t.me/{main_bot[1:]}">{main_bot}</a>' if main_bot else "main bot")
-    lines = [
-        f"<blockquote>{pp('👤')} <b>MANAGE USER ACCOUNT</b></blockquote>",
-        "",
-        f"{pp('🆔')} <code>{bot_id}</code>",
-        f"{pp('📱')} {account_display_name(row, bot_id)}",
-        f"{pp('⭐️')} Plan: {plan}",
-        "",
-        f"{pe('📋')} Is panel me kya-kya hai:",
-        f"{pe('➕')} Add Channel (channel ka message forward karo)",
-        f"{pe('📝')} Welcome / Leave message set karo",
-        f"{pe('🖼')} Album + buttons, aur broadcast",
-        "",
-        f"{pe('📌')} Panel ke buttons {link} me chalte hain - wahan se",
-        "<code>/start</code> karo to yehi panel clickable buttons ke saath milega.",
-        f"{pe('ℹ️')} (Telegram user account ko buttons bhejne ki ijazat nahi deta,",
-        "isliye yahan buttons ki jagah ye list hai.)",
-    ]
-    if manager_uid:
-        lines.insert(5, f"{pp('👑')} Manager: <a href=\"tg://user?id={manager_uid}\">owner account</a>")
-    return "\n".join(lines)
-
-
-async def _ua_handle_owner_start(sender: "UserAccountSender", bot_id: str, owner_id: int,
-                                 msg=None, text: str = "") -> bool:
-    """DM me /start (ya /menu, /panel, /help) aaye to us chat me panel wapas bhejo.
-
-    Return True agar handle ho gaya (caller ko aur kuch nahi karna).
-    """
-    stripped = (text or "").strip()
-    if not stripped:
-        return False
-    head = stripped.split()[0].split("@")[0].lower()
-    if head not in UA_ACCOUNT_COMMANDS:
-        return False
-
-    chat_id = int(getattr(sender, "id", 0) or 0)
-    manager_uid = int(owner_id or 0)
-    if not manager_uid:
-        try:
-            manager_uid = int(next(iter(sorted(ADMIN_USER_IDS)), 0) or 0)
-        except Exception:
-            manager_uid = 0
-    if not chat_id:
-        return False
-
-    sent = False
-    try:
-        # Keyboard attach nahi karte: user account buttons bhej nahi sakta, warna
-        # 14 button sirf plain label ban ke dikhte hain (confusing).
-        await sender.send_to_chat(chat_id, _ua_panel_text(bot_id, manager_uid),
-                                  parse_mode=ParseMode.HTML)
-        sent = True
-    except Exception as ex:
-        logging.warning(f"{bot_id}: DM me panel nahi ja paya: {mask_secrets(ex)}")
-
-    if sent and msg is not None:
-        try:
-            await sender.send_to_chat(
-                chat_id,
-                f"{pe('✅')} Panel upar bhej diya hai - channel add / welcome / broadcast "
-                f"sab isi panel se chalta hai.\n"
-                f"{pe('📌')} Dobara chahiye to kabhi bhi <code>/start</code> bhej do.",
-                parse_mode=ParseMode.HTML, reply_to=msg)
-        except Exception:
-            pass
-    if sent:
-        logging.info(f"{bot_id}: DM me /start aaya - account ke chat me panel bhej diya")
-    return sent
-
-
-def _register_user_account_handlers(client, sender: "UserAccountSender", bot_id: str, owner_id: int):
-    """Telethon events -> wahi shared logic jo PTB bot use karta hai."""
-    logging.info(f"{bot_id}: DM handler laga - account ko aane wale private messages ab sunne me aayenge")
-
-    @client.on(tl_events.NewMessage(incoming=True))
-    async def _on_dm(event):  # pragma: no cover - live network path
-        """Account ko aaya DM: /start wali command par panel, warna chup-chaap."""
-        try:
-            if not getattr(event, "is_private", False):
-                return
-            text = getattr(event, "raw_text", None) or ""
-            sender_id = int(getattr(event, "sender_id", 0) or 0)
-            head = text.strip().split()[0].split("@")[0].lower() if text.strip() else ""
-            is_manager = bool(sender_id) and (sender_id == owner_id or sender_id in ADMIN_USER_IDS)
-            # /diag ke liye hisaab
-            sender.dm_count += 1
-            sender.last_dm_at = time.time()
-            sender.last_dm_from = sender_id
-            sender.last_dm_text = text[:60]
-            if sender_id and sender_id not in _UA_DM_SEEN:
-                _UA_DM_SEEN.add(sender_id)
-                logging.info(f"{bot_id}: pehla DM mila user {sender_id} se: {text[:40]!r}")
-            if head in UA_ACCOUNT_COMMANDS:
-                logging.info(f"{bot_id}: DM me {head} aaya ({'manager' if is_manager else 'user'} {sender_id})")
-            else:
-                logging.debug(f"{bot_id}: DM ({'manager' if is_manager else 'user'} {sender_id}): {text[:40]}")
-            if is_manager and await _ua_handle_owner_start(sender, bot_id, owner_id,
-                                                           getattr(event, "message", None), text):
-                return
-            if head in UA_ACCOUNT_COMMANDS and not is_manager and sender_id:
-                # support account: ek hi baar chhota jawab (spam-limit se bachne ke liye)
-                if sender_id not in _UA_SUPPORT_GREETED:
-                    _UA_SUPPORT_GREETED.add(sender_id)
-                    try:
-                        await sender.send_to_chat(
-                            sender_id,
-                            f"{pe('👋')} Hi! Ye ek automated support account hai.\n"
-                            f"{pe('📞')} Madad ke liye {ADMIN_USERNAME} se contact karo.",
-                            parse_mode=ParseMode.HTML)
-                    except Exception as ex:
-                        logging.debug(f"{bot_id}: support greeting fail: {mask_secrets(ex)}")
-        except Exception as ex:
-            logging.error(f"user account DM error ({bot_id}): {type(ex).__name__}: {mask_secrets(ex)}")
-
-    @client.on(tl_events.ChatAction)
-    async def _on_chat_action(event):  # pragma: no cover - live network path
-        try:
-            chat = await event.get_chat()
-            chat_id = getattr(chat, "id", None)
-            if chat_id is None:
-                return
-            user = await event.get_user()
-            if user is None or getattr(user, "bot", False):
-                return
-            if event.user_joined or event.user_added:
-                await _ua_on_user_joined(bot_id, owner_id, user, chat, sender)
-            elif event.user_left or event.user_kicked:
-                await _ua_on_user_left(bot_id, owner_id, user, chat, sender)
-        except Exception as ex:
-            logging.error(f"user account chat-action error ({bot_id}): {mask_secrets(ex)}")
-
-    @client.on(tl_events.Raw())
-    async def _on_raw_update(update):  # pragma: no cover - live network path
-        try:
-            sender.raw_updates += 1
-            if tl_functions is None or not hasattr(update, "peer"):
-                return
-            if type(update).__name__ != "UpdatePendingJoinRequests":
-                return
-            peer = getattr(update, "peer", None)
-            chat_id = None
-            for attr in ("channel_id", "chat_id", "user_id"):
-                if getattr(peer, attr, None):
-                    chat_id = getattr(peer, attr)
-                    break
-            if not chat_id:
-                return
-            await _ua_process_pending_join_requests(bot_id, owner_id, chat_id, sender)
-        except Exception as ex:
-            logging.error(f"user account join-request error ({bot_id}): {mask_secrets(ex)}")
-
-
-async def _ua_on_user_joined(bot_id, owner_id, user, chat, sender):
-    """Member joined (channel/group) - leave-recovery target ya normal join."""
-    chat_id = getattr(chat, "id", None)
-    leave_cfg = db.get_leave_recovery_config() or {}
-    target = leave_cfg.get("target_channel_id")
-    if leave_cfg.get("enabled") and target and int(target) == int(chat_id):
-        await delete_pending_leave_recovery_messages(bot_id, user.id, int(chat_id), sender)
-        return
-    # Join *request* wale channel me approval ke baad join hone par bhi welcome DM chale
-    channel_row = db.get_channel_owner_data(chat_id, bot_id)
-    if channel_row:
-        await process_join_request(bot_id, owner_id, user, chat_id,
-                                   getattr(chat, "title", None) or str(chat_id),
-                                   getattr(chat, "username", None), sender, approve=None)
-
-
-async def _ua_on_user_left(bot_id, owner_id, user, chat, sender):
-    chat_id = getattr(chat, "id", None)
-    await process_member_left(bot_id, user, chat_id,
-                              getattr(chat, "title", None) or str(chat_id), sender)
-
-
-async def _ua_process_pending_join_requests(bot_id, owner_id, channel_id, sender):
-    """UpdatePendingJoinRequests -> importers list -> welcome DM + (auto) approve."""
-    channel_row = db.get_channel_owner_data(channel_id, bot_id)
-    if not channel_row:
-        return
-    requesters = await sender.list_pending_join_requesters(channel_id)
-    if not requesters:
-        return
-    logging.info(f"{bot_id}: {len(requesters)} join request mile (user account se)")
-    for user in requesters:
-        try:
-            auto = int(channel_row.get("auto_approve", 0) or 0) == 1
-            await process_join_request(bot_id, owner_id, user, channel_id,
-                                       channel_row.get("channel_title") or str(channel_id),
-                                       channel_row.get("channel_username"), sender,
-                                       approve=(lambda u=user: sender.approve_chat_join_request(channel_id, u.id)),
-                                       auto=auto)
-        except Exception as ex:
-            logging.error(f"join request process error ({bot_id}/{getattr(user, 'id', '?')}): {mask_secrets(ex)}")
-
-# ================= USER ACCOUNT LOGIN WIZARD =================
-# Bot token ki jagah: phone -> OTP -> (2FA password) -> StringSession DB me save.
-# Session poori account ka login hai, isliye na log me jata hai na kabhi print hota hai.
-_UA_LOGINS: Dict[int, Dict[str, Any]] = {}
-UA_LOGIN_PHONE_TEXT = (
-    "<blockquote>👤 <b>USER ACCOUNT SETUP</b></blockquote>\n\n"
-    "Jis Telegram account se messages jane chahiye uska <b>phone number</b> bhejo "
-    "(country code ke saath).\n\n"
-    "Jaise: <code>+919876543210</code>\n\n"
-    "Bot token ki zaroorat nahi padegi - isi account se welcome/broadcast messages jayenge.")
-UA_LOGIN_CODE_TEXT = (
-    "<blockquote>📩 <b>OTP BHEJ DIYA</b></blockquote>\n\n"
-    "Telegram app (ya SMS) me aaya login code yahan bhejo.\n"
-    "Code me space mat daalo.")
-UA_LOGIN_PASSWORD_TEXT = (
-    "<blockquote>🔐 <b>2-STEP VERIFICATION</b></blockquote>\n\n"
-    "Is account par two-step password laga hua hai - apna password bhejo.\n"
-    "(Password sirf login ke liye use hoga, kahin save nahi hota.)")
-
-
-def normalize_phone(raw: Optional[str]) -> str:
-    """'+91 98765-43210' -> '+919876543210' (galat ho to empty)."""
-    if not raw:
-        return ""
-    digits = re.sub(r"[^\d+]", "", str(raw).strip())
-    if digits.startswith("00"):
-        digits = "+" + digits[2:]
-    if not digits.startswith("+"):
-        digits = "+" + digits.lstrip("+")
-    return digits if len(re.sub(r"\D", "", digits)) >= 8 else ""
-
-
-def ua_login_state(uid: int) -> Optional[Dict[str, Any]]:
-    return _UA_LOGINS.get(uid)
-
-
-def ua_login_begin(uid: int, target_owner: Optional[int] = None):
-    _UA_LOGINS[uid] = {"step": "phone", "owner_id": int(target_owner or uid),
-                       "target_owner": int(target_owner or uid), "client": None,
-                       "started_at": time.monotonic()}
-
-
-async def ua_login_gc(max_age_seconds: int = 900) -> int:
-    """Aadhe chhode gaye logins (phone/code step par atke) band karo - warna un
-    clients ki connection bani rehti hai."""
-    now = time.monotonic()
-    closed = 0
-    for uid, state in list(_UA_LOGINS.items()):
-        started = state.get("started_at")
-        if started is None:
-            state["started_at"] = now
-            continue
-        if now - started > max_age_seconds:
-            _UA_LOGINS.pop(uid, None)
-            await _ua_disconnect(state.get("client"))
-            closed += 1
-    if closed:
-        logging.info(f"{closed} adhura user-account login timeout par band kiya")
-    return closed
-
-
-async def ua_login_cancel(uid: int) -> bool:
-    st = _UA_LOGINS.pop(uid, None)
-    if not st:
-        return False
-    await _ua_disconnect(st.get("client"))
-    return True
-
-
-def _ua_login_error(status: str) -> str:
-    code = (status or "").split(":", 1)[-1]
-    mapping = {
-        "telethon": "Is feature ke liye telethon library chahiye - server par "
-                    "<code>pip install telethon</code> karke ./start dobara chalao.",
-        "phone": "Phone number galat lag raha hai. Country code ke saath bhejo, jaise <code>+919876543210</code>",
-        "api": "Pehle <b>TELEGRAM_API_ID</b> / <b>TELEGRAM_API_HASH</b> set karo (.env me).\n\n" + TELEGRAM_API_HINT,
-        "code_invalid": "Code galat hai. Telegram app me jo naya code aaya ho wahi bhejo.",
-        "code_expired": "Code expire ho gaya. Login dobara shuru karo (➕ Add Account → 👤 User Account).",
-        "password_invalid": "Password galat hai. Dobara bhejo (ya Cancel karke naya login shuru karo).",
-    }
-    if "api_id/api_hash combination is invalid" in code.lower() or "api_id_invalid" in code.lower():
-        # Aksar yahan example/dummy values hoti hain (my.telegram.org se asli lena padta hai)
-        return ("Telegram ne ye api_id/api_hash reject kar diye.\n\n"
-                "Zaroori nahi ki galat ho - ho sakta hai ye <b>example/dummy values</b> hon. "
-                "my.telegram.org se <b>asli</b> api_id + api_hash lo aur `.env` me daalo:\n\n"
-                + TELEGRAM_API_HINT)
-    if status and status.startswith("flood:"):
-        secs = status.split(":", 1)[1]
-        return f"Telegram ne flood-limit laga di hai ({secs}s). Thodi der baad dobara try karo."
-    return mapping.get(code, f"Login fail hua: {mask_secrets(code)}")
-
-
-async def ua_login_start(operator_id: int, phone: str, target_owner: Optional[int] = None,
-                         client_factory=None) -> str:
-    """OTP bhejo. Return: 'code' | 'password' | 'error:<reason>'."""
-    if not TELETHON_AVAILABLE:
-        return "error:telethon"
-    norm = normalize_phone(phone)
-    if not norm:
-        return "error:phone"
-    api_id = int(TELEGRAM_API_ID) if str(TELEGRAM_API_ID).isdigit() else None
-    api_hash = TELEGRAM_API_HASH or None
-    if not api_id or not api_hash:
-        return "error:api"
-    factory = client_factory or (lambda: TelegramClient(StringSession(), api_id, api_hash,
-                                                        connection_retries=2, retry_delay=1,
-                                                        timeout=30, request_retries=3))
-    client = factory()
-    try:
-        await client.connect()
-        sent = await client.send_code_request(norm)
-    except FloodWaitError as ex:
-        await _ua_disconnect(client)
-        return f"error:flood:{getattr(ex, 'seconds', '?')}"
-    except Exception as ex:
-        await _ua_disconnect(client)
-        logging.warning(f"user account login start fail: {mask_secrets(ex)}")
-        return f"error:{mask_secrets(ex)}"
-    state = _UA_LOGINS.get(operator_id) or {}
-    _UA_LOGINS[operator_id] = {
-        "step": "code", "client": client, "phone": norm, "started_at": time.monotonic(),
-        "phone_code_hash": getattr(sent, "phone_code_hash", None),
-        "owner_id": int(target_owner or state.get("target_owner") or operator_id),
-        "target_owner": int(target_owner or state.get("target_owner") or operator_id),
-    }
-    return "code"
-
-
-async def ua_login_submit_code(operator_id: int, code: str) -> str:
-    st = _UA_LOGINS.get(operator_id)
-    if not st or st.get("step") != "code" or st.get("client") is None:
-        return "error:code_expired"
-    code = re.sub(r"\D", "", code or "")
-    if not code:
-        return "error:code_invalid"
-    try:
-        await st["client"].sign_in(phone=st["phone"], code=code,
-                                   phone_code_hash=st.get("phone_code_hash"))
-    except SessionPasswordNeededError:
-        st["step"] = "password"
-        return "password"
-    except PhoneCodeInvalidError:
-        return "error:code_invalid"
-    except PhoneCodeExpiredError:
-        return "error:code_expired"
-    except FloodWaitError as ex:
-        return f"error:flood:{getattr(ex, 'seconds', '?')}"
-    except Exception as ex:
-        logging.warning(f"user account sign_in fail: {mask_secrets(ex)}")
-        return f"error:{mask_secrets(ex)}"
-    return await ua_login_finish(operator_id)
-
-
-async def ua_login_submit_password(operator_id: int, password: str) -> str:
-    st = _UA_LOGINS.get(operator_id)
-    if not st or st.get("step") != "password" or st.get("client") is None:
-        return "error:code_expired"
-    if not password:
-        return "error:password_invalid"
-    try:
-        await st["client"].sign_in(password=password)
-    except PasswordHashInvalidError:
-        return "error:password_invalid"
-    except FloodWaitError as ex:
-        return f"error:flood:{getattr(ex, 'seconds', '?')}"
-    except Exception as ex:
-        logging.warning(f"user account 2FA fail: {mask_secrets(ex)}")
-        return f"error:{mask_secrets(ex)}"
-    return await ua_login_finish(operator_id)
-
-
-async def ua_login_finish(operator_id: int) -> str:
-    """Login ho gaya: session save karo, account DB me likho, client band kar do."""
-    st = _UA_LOGINS.pop(operator_id, None)
-    if not st or st.get("client") is None:
-        return "error:code_expired"
-    client = st["client"]
-    try:
-        me = await client.get_me()
-        session_string = client.session.save()
-        bot_id = db.add_user_account(st.get("owner_id") or operator_id, getattr(me, "id", 0),
-                                     st.get("phone"), session_string,
-                                     getattr(me, "username", None),
-                                     int(TELEGRAM_API_ID) if str(TELEGRAM_API_ID).isdigit() else None,
-                                     TELEGRAM_API_HASH or None)
-    except Exception as ex:
-        await _ua_disconnect(client)
-        logging.error(f"user account save fail: {mask_secrets(ex)}")
-        return f"error:{mask_secrets(ex)}"
-    await _ua_disconnect(client)
-    logging.info(f"{pp('👤')} user account login ho gaya ({bot_id}) - subscription ke baad chalu hoga")
-    return f"ok:{bot_id}"
-
-
-def ua_login_cancel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[btn("❌ Cancel Login", "ua_login_cancel", "danger", "❌")]])
-
-
-async def ua_login_handle_message(msg, uid: int) -> bool:
-    """Login ke steps ke messages handle karo. True = message consume ho gaya."""
-    st = _UA_LOGINS.get(uid)
-    if not st:
-        return False
-    text = (msg.text or msg.caption or "").strip()
-    if text.lower() in ("/cancel", "cancel", "❌"):
-        await ua_login_cancel(uid)
-        await reply_premium_message(msg, f"{pe('❌')} Setup cancel kar diya.",
-                                    parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
-        return True
-    step = st.get("step")
-    if step == "phone":
-        status = await ua_login_start(uid, text, target_owner=st.get("target_owner"))
-    elif step == "code":
-        status = await ua_login_submit_code(uid, text)
-    elif step == "password":
-        status = await ua_login_submit_password(uid, text)
-    else:
-        return False
-
-    if status == "code":
-        await reply_premium_message(msg, UA_LOGIN_CODE_TEXT, parse_mode=ParseMode.HTML,
-                                    reply_markup=ua_login_cancel_kb())
-    elif status == "password":
-        await reply_premium_message(msg, UA_LOGIN_PASSWORD_TEXT, parse_mode=ParseMode.HTML,
-                                    reply_markup=ua_login_cancel_kb())
-    elif status.startswith("ok:"):
-        bot_id = status.split(":", 1)[1]
-        row = db.get_user_bot(bot_id) or {}
-        name = account_display_name(row, bot_id)
-        await reply_premium_message(
-            msg,
-            f"<blockquote>{pp('✅')} <b>USER ACCOUNT CONNECTED</b></blockquote>\n\n"
-            f"{pp('👤')} {name}\n{pp('🆔')} <code>{bot_id}</code>\n\n"
-            f"{pe('⚠️')} Ab is account ke liye subscription chahiye (jaise bot ke liye lagti hai).\n"
-            f"Subscription milte hi account chalu ho jayega aur welcome / broadcast saare messages "
-            f"isi account se jayenge.\n\n"
-            f"{pe('📞')} Contact {ADMIN_USERNAME} for subscription.",
-            parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
-        owner_id = int(st.get("owner_id") or uid)
-        try:
-            if db.get_active_subscription(bot_id):
-                await start_user_bot(None, bot_id, owner_id, quiet=True)
-        except Exception as ex:
-            logging.warning(f"{bot_id}: login ke baad account start nahi hua: {mask_secrets(ex)}")
-        if is_admin(uid):
-            # apne hi account par bhi ye button chahiye (pehle owner==admin par chhup jata tha)
-            await reply_premium_message(
-                msg,
-                f"{pe('📌')} Admin: is user account ko <b>subscription</b> do, tabhi ye chalu hoga.\n"
-                f"{pp('🆔')} <code>{bot_id}</code>\n"
-                f"{pe('💡')} Neeche wala button dabao, phir sirf <code>30 Basic</code> bhejna hai.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [btn("💰 Add Subscription (30 days Basic)", f"admin_quick_sub_{bot_id}", "success", "💰")],
-                    [btn("👑 Admin Panel", "admin_panel", "primary", "👑")]]))
-        if owner_id != uid:
-            try:
-                await send_premium_message(MAIN_BOT_REF, owner_id,
-                    f"<blockquote>{pp('👤')} <b>USER ACCOUNT ADDED</b></blockquote>\n\n"
-                    f"{pp('🆔')} <code>{bot_id}</code>\n{pe('⭐️')} Subscription ke baad chalu hoga.",
-                    parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-    else:
-        await reply_premium_message(msg, f"{pe('❌')} {_ua_login_error(status)}",
-                                    parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
-    return True
-
-
+def account_display_name(row: dict, bot_id: str = "") -> str:
+    """Panel me dikhane ke liye naam: @username, warna id."""
+    if not row:
+        return f"<code>{bot_id}</code>"
+    username = row.get("bot_username")
+    if username:
+        return f"@{username}"
+    return f"<code>{row.get('bot_id') or bot_id}</code>"
 
 
 # ================= BROADCAST FUNCTIONS =================
@@ -6901,7 +4981,7 @@ async def preview_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: 
 
 
 async def resolve_own_sender(bot_id: str, fallback=None, start_if_needed: bool = False):
-    """Owner ke bot/user-account ka sender do (chal raha na ho to chalu karne ki koshish)."""
+    """Owner ke bot ka sender do (chal raha na ho to chalu karne ki koshish)."""
     sender = get_account_sender(bot_id)
     if sender is not None:
         return sender
@@ -6930,7 +5010,7 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
         return
     sender = await resolve_own_sender(bot_id, fallback=None, start_if_needed=True)
     if sender is None:
-        await safe_edit_message_text(q, f"{pe('❌')} Aapka bot/account abhi chal nahi raha. Thodi der me "
+        await safe_edit_message_text(q, f"{pe('❌')} Aapka bot abhi chal nahi raha. Thodi der me "
                                         f"dobara try karo (subscription activate hone par apne aap chalu ho jata hai).",
                                      parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
@@ -6961,11 +5041,12 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
                 fail += 1
                 key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
                 reasons[key] = reasons.get(key, 0) + 1
-        except AccountLimitedError as ex:
-            # Telegram ne is account par spam-limit laga di - ruk jao, account safe rakho
-            logging.warning(f"user broadcast {bot_id}: account limit ho gaya, broadcast rok diya "
-                            f"({mask_secrets(ex)}) - thodi der baad dobara try karo")
-            reasons["account limited (flood)"] = reasons.get("account limited (flood)", 0) + 1
+        except RetryAfter as ex:
+            # Telegram flood-wait - ruk jao, warna aur limit lagegi
+            wait = getattr(ex, "retry_after", "?")
+            logging.warning(f"user broadcast {bot_id}: flood-wait ({wait}s) - broadcast rok diya, "
+                            f"thodi der baad dobara try karo")
+            reasons["flood-wait"] = reasons.get("flood-wait", 0) + 1
             break
         except Exception as ex:
             fail += 1
@@ -7052,9 +5133,8 @@ async def show_admin_sub_picker(q, context=None):
             sub = db.get_subscription_for_bot(bot_id)
         except Exception:
             pass
-        kind = (b.get("account_type") or "bot")
-        icon = "👤" if kind == "user" else "🤖"
-        name = b.get("bot_username") or b.get("phone") or bot_id
+        icon = "🤖"
+        name = b.get("bot_username") or bot_id
         label = f"{icon} {name}"
         if sub:
             label += f" ✅ {sub.get('subscription_type') or 'active'}"
@@ -7066,32 +5146,13 @@ async def show_admin_sub_picker(q, context=None):
         f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\n"
         f"Kis account ko subscription deni hai? Button dabao — phir sirf <b>days aur plan</b> "
         f"bhejna hoga (jaise <code>30 Basic</code>).\n\n"
-        f"{pe('ℹ️')} ✅ = pehle se active subscription\n"
-        f"{pe('👤')} = user account, {pe('🤖')} = bot",
+        f"{pe('ℹ️')} ✅ = pehle se active subscription",
         parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
-async def admin_add_chooser(q):
-    """ADD ACCOUNT ka pehla step: bot ya user account?"""
-    await safe_edit_message_text(
-        q,
-        f"<blockquote>{pp('🚀')} <b>ADD ACCOUNT</b></blockquote>\n\n"
-        f"{pp('🤖')} <b>Bot Account</b> — BotFather token se. Messages <b>bot</b> ke naam se jayenge "
-        f"aur bot ko channel me admin banana padega.\n\n"
-        f"{pp('👤')} <b>User Account</b> — client ke phone + OTP se login. Messages <b>uske account</b> "
-        f"se jayenge, bot token ki zaroorat nahi.\n\n"
-        "Pehle choose karo, phir main step-by-step user_id aur token/phone maangunga:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [btn("🤖 Bot Account (token)", "admin_add_bot", "primary", "🤖")],
-            [btn("👤 User Account (phone login)", "admin_add_ua", "success", "👤")],
-            [btn("Back", "admin_panel", "primary", "🔙")]]))
-
-
-def admin_add_user_id_text(kind: str) -> str:
-    who = "bot" if kind == "bot" else "user account"
+def admin_add_user_id_text(kind: str = "bot") -> str:
     return (f"<blockquote>{pp('🆔')} <b>USER ID (1/3)</b></blockquote>\n\n"
-            f"Jis client ka {who} add karna hai uska <b>Telegram user ID</b> bhejo (sirf numbers).\n\n"
+            f"Jis client ka bot add karna hai uska <b>Telegram user ID</b> bhejo (sirf numbers).\n\n"
             "Example: <code>123456789</code>")
 
 
@@ -7100,13 +5161,6 @@ def admin_add_token_text() -> str:
             "Ab <b>BotFather</b> wala token bhejo.\n"
             "Format: <code>123456789:ABCdef...</code>\n\n"
             "BotFather -> /mybots -> apna bot -> API Token")
-
-
-def admin_add_phone_text() -> str:
-    return ("<blockquote>👤 <b>PHONE NUMBER (2/3)</b></blockquote>\n\n"
-            "Ab us account ka <b>phone number</b> bhejo (country code ke saath).\n"
-            "Example: <code>+919876543210</code>\n\n"
-            f"{pe('📩')} Iske baad Telegram OTP aayega - wahi code yahan bhejna hai.")
 
 
 def _known_user_hint(user_id: int) -> str:
@@ -7149,26 +5203,8 @@ async def _admin_add_finish_bot(msg, context, target: int, token: str):
     logging.info(f"admin: bot account {bot_id} (@{bot_info.username}) user {target} ke liye add hua")
 
 
-async def _admin_add_start_ua_login(msg, context, user, target: int, phone: str):
-    """User account: OTP login wizard ko hand over (baaki steps wahi sambhalta hai)."""
-    _admin_add_clear(context)
-    ua_login_begin(user.id, target_owner=target)
-    status = await ua_login_start(user.id, phone, target_owner=target)
-    if status in ("code", "password"):
-        await reply_premium_message(msg, UA_LOGIN_CODE_TEXT if status == "code" else UA_LOGIN_PASSWORD_TEXT,
-                                    parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
-        await _try_delete_message(msg)  # phone number chat me na rahe
-    else:
-        # login start nahi hua (jaise .env me api_id/api_hash missing) - state "phone" par
-        # hi rehti hai, theek karne ke baad admin dobara phone bhej sakta hai
-        logging.warning(f"user account login start nahi hua ({status}) - "
-                        f"TELEGRAM_API_ID / TELEGRAM_API_HASH check karo")
-        await reply_premium_message(msg, f"{pe('❌')} {_ua_login_error(status)}",
-                                    parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
-
-
 async def admin_add_account_message(msg, context, user) -> bool:
-    """ADD ACCOUNT wizard: choose -> user_id -> token/phone (purana ek-line format bhi chalta hai)."""
+    """ADD ACCOUNT wizard: user_id -> token (purana ek-line format bhi chalta hai)."""
     st = _admin_add_state(context)
     if not st or not is_admin(user.id):
         return False
@@ -7177,20 +5213,14 @@ async def admin_add_account_message(msg, context, user) -> bool:
         await reply_premium_message(msg, f"{pe('❌')} Text bhejo.", parse_mode=ParseMode.HTML,
                                     reply_markup=admin_add_kb())
         return True
-    kind = st.get("kind") or "bot"
     step = st.get("step") or "user_id"
 
     if step == "user_id":
         parts = text.split()
-        # purana format bhi support: "user_id bot_token" ya "user_id +9198..."
-        if len(parts) >= 2 and parts[0].isdigit():
-            if ":" in parts[1]:
-                await _admin_add_finish_bot(msg, context, int(parts[0]), parts[1])
-                return True
-            pref_phone = normalize_phone(parts[1])
-            if pref_phone:
-                await _admin_add_start_ua_login(msg, context, user, int(parts[0]), pref_phone)
-                return True
+        # purana format bhi support: "user_id bot_token"
+        if len(parts) >= 2 and parts[0].isdigit() and ":" in parts[1]:
+            await _admin_add_finish_bot(msg, context, int(parts[0]), parts[1])
+            return True
         digits = re.sub(r"\D", "", text)
         if len(digits) < 5:
             await reply_premium_message(msg, f"{pe('❌')} Ye user ID nahi lag rahi — sirf numbers bhejo "
@@ -7198,14 +5228,9 @@ async def admin_add_account_message(msg, context, user) -> bool:
                                         parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
             return True
         target = int(digits)
-        if kind == "bot":
-            _admin_add_set(context, "bot", "token", target)
-            await reply_premium_message(msg, admin_add_token_text() + _known_user_hint(target),
-                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
-        else:
-            _admin_add_set(context, "user", "phone", target)
-            await reply_premium_message(msg, admin_add_phone_text() + _known_user_hint(target),
-                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+        _admin_add_set(context, "bot", "token", target)
+        await reply_premium_message(msg, admin_add_token_text() + _known_user_hint(target),
+                                    parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
         return True
 
     if step == "token":
@@ -7218,15 +5243,6 @@ async def admin_add_account_message(msg, context, user) -> bool:
         await _admin_add_finish_bot(msg, context, int(st.get("user_id") or 0), token)
         return True
 
-    if step == "phone":
-        phone = normalize_phone(text)
-        if not phone:
-            await reply_premium_message(msg, f"{pe('❌')} Phone number galat hai. Country code ke saath bhejo "
-                                            f"(jaise <code>+919876543210</code>).",
-                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
-            return True
-        await _admin_add_start_ua_login(msg, context, user, int(st.get("user_id") or 0), phone)
-        return True
     return False
 
 
@@ -7251,9 +5267,7 @@ async def show_admin_userbot_control(q, context: ContextTypes.DEFAULT_TYPE):
         status_icon = pe('🟢') if is_running else pe('🔴')
         plan_text = sub["subscription_type"] if sub else "No active plan"
         plan_icon = pe('⭐️') if sub else pe('❌')
-        kind = "👤 user account" if (bot.get("account_type") or "bot") == "user" else "🤖 bot"
-        if (bot.get("account_type") or "bot") == "user" and bot.get("phone"):
-            kind += " (" + str(bot["phone"]) + ")"
+        kind = "🤖 bot"
         lines.append(f"{status_icon} <b>{account_display_name(bot, bot['bot_id'])}</b> ({kind})\n   <code>{bot['bot_id']}</code> • {'Running' if is_running else 'Stopped'} • {plan_icon} {plan_text}")
 
     kb = []
@@ -7527,62 +5541,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop(key, None)
             return
 
-        if data == "add_new_bot":
-            await safe_edit_message_text(
-                q,
-                f"<blockquote>{pp('➕')} <b>ADD NEW</b></blockquote>\n\n"
-                f"{pp('🤖')} <b>Bot Account</b> — BotFather token se. Messages <b>bot</b> ke naam se "
-                f"jayenge aur bot ko channel me admin banana padega.\n\n"
-                f"{pp('👤')} <b>User Account</b> — apne Telegram account se login (phone + OTP). "
-                f"Messages <b>aapke account</b> se jayenge, bot token ki zaroorat nahi.\n\n"
-                "Kaunsa setup karna hai?",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [btn("🤖 Bot Account (token)", "add_bot_token", "primary", "🤖")],
-                    [btn("👤 User Account (phone login)", "add_ua_start", "success", "👤")],
-                    [btn("Back", "main_menu", "primary", "🔙")]]))
-            return
-
-        if data == "add_bot_token":
-            await safe_edit_message_text(q, f"<blockquote>{pp('🔐')} <b>ADD YOUR BOT</b></blockquote>\n\nSend your BotFather API token to link your bot:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "add_new_bot", "primary", "🔙")]]))
+        if data == "add_new_bot" or data == "add_bot_token":
+            await safe_edit_message_text(q, f"<blockquote>{pp('🔐')} <b>ADD YOUR BOT</b></blockquote>\n\nSend your BotFather API token to link your bot:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "main_menu", "primary", "🔙")]]))
             context.user_data["waiting_token"] = True
-            return
-
-        if data == "add_ua_start":
-            ua_login_begin(uid)
-            await safe_edit_message_text(q, UA_LOGIN_PHONE_TEXT, parse_mode=ParseMode.HTML,
-                                         reply_markup=ua_login_cancel_kb())
-            return
-
-        if data == "ua_login_cancel":
-            await ua_login_cancel(uid)
-            context.user_data.pop("waiting_token", None)
-            await safe_edit_message_text(q, f"{pe('❌')} Setup cancel kar diya.", parse_mode=ParseMode.HTML,
-                                         reply_markup=main_menu_kb(uid))
-            return
-
-        if data.startswith("ua_info_"):
-            bot_id = data.replace("ua_info_", "")
-            row = db.get_user_bot(bot_id)
-            if not row or (row.get("user_id") != uid and not is_admin(uid)):
-                await safe_edit_message_text(q, f"{pe('❌')} Not found.", parse_mode=ParseMode.HTML,
-                                             reply_markup=main_menu_kb(uid))
-                return
-            sub = db.get_subscription_for_bot(bot_id)
-            running = bot_id in user_account_clients
-            phone = row.get("phone") or "-"
-            if len(phone) > 8:
-                phone = f"{phone[:4]}***{phone[-3:]}"
-            await safe_edit_message_text(
-                q,
-                f"<blockquote>👤 <b>USER ACCOUNT INFO</b></blockquote>\n\n"
-                f"{pp('🆔')} <code>{bot_id}</code>\n"
-                f"{pp('📱')} Phone: <code>{phone}</code>\n"
-                f"{pp('🔑')} Login: {'🟢 active' if running else '🔴 band'}\n"
-                f"{pp('⭐️')} Plan: {sub['subscription_type'] if sub else 'No active plan'}\n\n"
-                f"{pe('ℹ️')} Session expire ho jaye to dobara isi number se login kar sakte ho "
-                f"(➕ Add Account → 👤 User Account) - wahi account update ho jayega.",
-                parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
             return
 
         if data.startswith("manage_bot_"):
@@ -7591,12 +5552,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not bot_data:
                 await safe_edit_message_text(q, f"{pe('❌')} Bot not found!", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
-            # Check if user is owner OR admin (user account ka apna id bhi owner hai)
+            # Check if user is owner OR admin
             if not is_bot_owner(bot_id, uid):
                 await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
-            _icon = "👤" if (bot_data.get("account_type") or "bot") == "user" else "🤖"
-            _kind = "USER ACCOUNT" if _icon == "👤" else "BOT"
+            _icon = "🤖"
+            _kind = "BOT"
             await safe_edit_message_text(q, f"<blockquote>{pp(_icon)} <b>MANAGE {_kind}</b></blockquote>\n\n"
                                             f"{_icon} {account_display_name(bot_data, bot_id)}\n"
                                             f"ID: <code>{bot_id}</code>",
@@ -7611,9 +5572,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_bot_owner(panel_bot, uid):
                 await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML)
                 return
-            if data.startswith(READONLY_PANEL_PREFIXES) or is_user_account(panel_bot):
-                # read-only panels + user accounts ka poora panel main bot se hi chalta hai
-                # (user account ka koi apna bot chat nahi hota). Isliye wahi handlers yahan
+            if data.startswith(READONLY_PANEL_PREFIXES):
+                # read-only panels main bot se hi chalte hain - isliye wahi handlers yahan
                 # bhi lagte hain jo userbot app me lagte hain.
                 await user_bot_callback(update, context, panel_bot, uid)
                 if data.startswith(("setbtn_", "setbtng_")):
@@ -7650,88 +5610,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 cleared = db.clear_initiate_blocked_unreachable()
                 note = (f"{pe('🧹')} {cleared} users ke purane \"bot can't initiate conversation\" "
-                        f"marks saaf kiye - ab unhe user account se DM ja sakti hai."
+                        f"marks saaf kiye - user ke /start karne par inhe DM ja sakti hai."
                         if cleared else
                         f"{pe('ℹ️')} Koi purana initiate-blocked mark nahi mila - kuch karne ki "
                         f"zarurat nahi thi.")
             except Exception as ex:
                 note = f"{pe('❌')} Reset fail hua: {mask_secrets(ex)}"
             logging.info(f"diag reset unreachable ({uid}): {strip_premium_emojis(note)}")
-            await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
-                                         parse_mode=ParseMode.HTML, reply_markup=diag_kb())
-            return
-
-        if data.startswith("diag_dm_"):
-            if not is_admin(uid):
-                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
-                return
-            payload = data.replace("diag_dm_", "")
-            mode, test_bot_id = "auto", payload
-            for m in ("direct", "saved"):
-                if payload.endswith("_" + m):
-                    mode, test_bot_id = m, payload[:-(len(m) + 1)]
-                    break
-            sender = user_account_clients.get(test_bot_id)
-            if sender is None:
-                await safe_edit_message_text(
-                    q, f"{pe('❌')} <code>{test_bot_id}</code> chalu nahi hai - pehle connect hone do.",
-                    parse_mode=ParseMode.HTML, reply_markup=diag_kb())
-                return
-            label = "Saved Messages → forward" if mode == "saved" else "direct"
-            prev_mode = _UA_SEND_MODE.get(test_bot_id)
-            _UA_SEND_MODE[test_bot_id] = mode
-            ok, why = True, ""
-            try:
-                await sender.send_to_chat(
-                    uid, f"{pe('🧪')} Test DM ({label}) - <code>{test_bot_id}</code> se.\n"
-                         f"{pe('🕒')} {now_aware().strftime('%Y-%m-%d %H:%M:%S')}",
-                    parse_mode=ParseMode.HTML)
-            except Exception as ex:
-                ok, why = False, f"{type(ex).__name__}: {mask_secrets(ex)}"
-            finally:
-                if prev_mode is None:
-                    _UA_SEND_MODE.pop(test_bot_id, None)
-                else:
-                    _UA_SEND_MODE[test_bot_id] = prev_mode
-            logging.info(f"{test_bot_id}: diag test DM ({label}) -> {uid}: "
-                         f"{'ok' if ok else 'FAIL ' + why}")
-            if ok:
-                note = (f"{pe('✅')} Test DM bhej diya ({label}) - apne DM me dekho. "
-                        f"Ye rasta chal raha hai.")
-            else:
-                hint = dm_error_note(BadRequest(why))
-                note = (f"{pe('❌')} {label} se DM nahi gayi: <code>{why}</code>"
-                        f"{chr(10) + pe('👉') + ' ' + hint if hint else ''}"
-                        f"{chr(10)}{pe('🧪')} Doosra button (dusra rasta) bhi try karo.")
-            await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
-                                         parse_mode=ParseMode.HTML, reply_markup=diag_kb())
-            return
-
-        if data.startswith("diag_test_"):
-            if not is_admin(uid):
-                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
-                return
-            test_bot_id = data.replace("diag_test_", "")
-            sender = user_account_clients.get(test_bot_id)
-            if sender is None:
-                await safe_edit_message_text(
-                    q, f"{pe('❌')} <code>{test_bot_id}</code> abhi chalu nahi hai - "
-                       f"pehle account connect hone do (10 min wala retry job chalta rehta hai).",
-                    parse_mode=ParseMode.HTML, reply_markup=diag_kb())
-                return
-            ok, why = True, ""
-            try:
-                await sender.send_to_chat(
-                    uid, f"{pe('🧪')} Test DM - <code>{test_bot_id}</code> se. "
-                         f"Ye message aa gaya matlab account se bhejna theek chal raha hai.\n"
-                         f"{pe('🕒')} {now_aware().strftime('%Y-%m-%d %H:%M:%S')}",
-                    parse_mode=ParseMode.HTML)
-            except Exception as ex:
-                ok, why = False, f"{type(ex).__name__}: {mask_secrets(ex)}"
-            logging.info(f"{test_bot_id}: diag test DM (auto) -> {uid}: {'ok' if ok else 'FAIL ' + why}")
-            note = (f"{pe('✅')} Test DM bhej diya <code>{test_bot_id}</code> se - apne DM me dekho "
-                    f"(isi chat me aayega jab account aur ye account alag hon)." if ok else
-                    f"{pe('❌')} Test DM fail hua: {why}")
             await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
                                          parse_mode=ParseMode.HTML, reply_markup=diag_kb())
             return
@@ -7764,7 +5649,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             _admin_add_clear(context)
-            await admin_add_chooser(q)
+            _admin_add_set(context, "bot", "user_id")
+            await safe_edit_message_text(q, admin_add_user_id_text(), parse_mode=ParseMode.HTML,
+                                         reply_markup=admin_add_kb())
             return
 
         if data == "admin_add_bot":
@@ -7772,14 +5659,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             _admin_add_set(context, "bot", "user_id")
             await safe_edit_message_text(q, admin_add_user_id_text("bot"), parse_mode=ParseMode.HTML,
-                                         reply_markup=admin_add_kb())
-            return
-
-        if data == "admin_add_ua":
-            if not is_admin(uid):
-                return
-            _admin_add_set(context, "user", "user_id")
-            await safe_edit_message_text(q, admin_add_user_id_text("user"), parse_mode=ParseMode.HTML,
                                          reply_markup=admin_add_kb())
             return
 
@@ -7825,7 +5704,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message_text(q,
                                          f"<blockquote>{pp('⌨️')} <b>ADD SUBSCRIPTION (manual)</b></blockquote>\n\n"
                                          "Bhejo: <code>@username days Plan</code> ya <code>bot_id days Plan</code>\n"
-                                         "Example: <code>ua8394878310 30 Basic</code>",
+                                         "Example: <code>b1 30 Basic</code>",
                                          parse_mode=ParseMode.HTML,
                                          reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_add_sub", "primary", "🔙")]]))
             context.user_data["admin_add_sub"] = True
@@ -8290,15 +6169,12 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         if await ensure_broadcast_subscription(bot_id, bot.get("bot_token"), bot.get("user_id")):
             auto_subs.append(bot_id)
         bot_instance = get_account_sender(bot_id)
-        if bot_instance is None and (bot.get("account_type") or "bot") == "user":
-            await start_user_bot(bot.get("bot_token") or "", bot_id, bot.get("user_id") or 0, quiet=True)
-            bot_instance = get_account_sender(bot_id)
         if bot_instance is None:
             try:
                 bot_instance = Bot(token=bot["bot_token"])
             except Exception as ex:
                 logging.error(f"admin broadcast: bad token for {bot_id}: {mask_secrets(ex)}")
-                per_bot_lines.append(f"❌ {bot.get('bot_username') or bot_id}: account start nahi hua")
+                per_bot_lines.append(f"❌ {bot.get('bot_username') or bot_id}: bot start nahi hua")
                 continue
         recipients = list(dict.fromkeys(db.get_requesters_for_bot(bot_id) or []))
         bot_sent = 0
@@ -8334,10 +6210,10 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
                     bot_fail += 1
                     key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
                     reasons[key] = reasons.get(key, 0) + 1
-            except AccountLimitedError as ex:
-                logging.warning(f"admin broadcast {bot_id}: account limit (flood/spam) - is account "
-                                f"ko rok diya ({mask_secrets(ex)})")
-                reasons["account limited (flood)"] = reasons.get("account limited (flood)", 0) + 1
+            except RetryAfter as ex:
+                wait = getattr(ex, "retry_after", "?")
+                logging.warning(f"admin broadcast {bot_id}: flood-wait ({wait}s) - is bot ko rok diya")
+                reasons["flood-wait"] = reasons.get("flood-wait", 0) + 1
                 break
             except Exception as ex:
                 bot_fail += 1
@@ -8423,26 +6299,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await handle_button_wizard_message(msg, context):
         return
 
-    # User account wale owners ke flows (channel add / welcome set / broadcast) main bot
-    # se hi chalte hain - unka apna bot app nahi hota.
-    if await _route_user_account_owner_message(msg, context, user.id):
-        return
-
-    # User-account login wizard (phone -> OTP -> 2FA) - is user ka flow
-    if ua_login_state(user.id):
-        # api_id/api_hash set nahi hain to phone lene se pehle hi batao (warna phone
-        # bhejne ke baad samajh hi nahi aata kyun kuch nahi hua).
-        _st = ua_login_state(user.id) or {}
-        if _st.get("step") == "phone" and not ua_credentials_available():
-            logging.warning("user account login ruk gaya: TELEGRAM_API_ID / TELEGRAM_API_HASH set nahi hain")
-            await reply_premium_message(
-                msg,
-                f"{pe('⚠️')} <b>Pehle Telegram API credentials setup karo</b>\n\n{TELEGRAM_API_HINT}",
-                parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
-            return
-        if await ua_login_handle_message(msg, user.id):
-            return
-
     if context.user_data.get("waiting_token") and not is_admin(user.id):
         token = msg.text.strip()
         if ":" in token and len(token) > 10:
@@ -8458,26 +6314,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_premium_message(msg, f"{pe('❌')} Invalid token format. Please send the correct BotFather token.", parse_mode=ParseMode.HTML)
         return
 
-    # ADD ACCOUNT wizard (bot ya user account) - step by step
+    # ADD ACCOUNT wizard (bot) - step by step
     if _admin_add_state(context) and await admin_add_account_message(msg, context, user):
         return
 
     if context.user_data.get("admin_add_userbot") and is_admin(user.id):
         parts = msg.text.strip().split()
-        if len(parts) == 2 and parts[0].isdigit() and normalize_phone(parts[1]) and ":" not in parts[1]:
-            # ---- user account (phone login) ----
-            target = int(parts[0])
-            phone = normalize_phone(parts[1])
-            context.user_data.pop("admin_add_userbot", None)
-            ua_login_begin(user.id, target_owner=target)
-            status = await ua_login_start(user.id, phone, target_owner=target)
-            if status in ("code", "password"):
-                await reply_premium_message(msg, UA_LOGIN_CODE_TEXT if status == "code" else UA_LOGIN_PASSWORD_TEXT,
-                                            parse_mode=ParseMode.HTML, reply_markup=ua_login_cancel_kb())
-            else:
-                await reply_premium_message(msg, f"{pe('❌')} {_ua_login_error(status)}",
-                                            parse_mode=ParseMode.HTML, reply_markup=admin_kb())
-            return
         if len(parts) == 2 and parts[0].isdigit():
             target = int(parts[0])
             token = parts[1]
@@ -8522,10 +6364,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 started = await start_user_bot(bot.get("bot_token"), bot["bot_id"], bot["user_id"])
                 if started is False:
-                    _row = db.get_user_bot(bot["bot_id"]) or {}
-                    if (_row.get("account_type") or "bot") == "user":
-                        raise RuntimeError("user account start nahi hua - dobara login karo "
-                                           "(panel -> ➕ Add Account -> 👤 User Account)")
                     raise RuntimeError("token invalid - naya token add karo")
                 db.set_user_bot_active(bot["bot_id"], True)
                 await send_premium_message(context.bot, bot["user_id"], f"<blockquote>{pp('✅')} <b>BOT ACTIVATED</b></blockquote>\n\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days\n\nYour bot is now running!", parse_mode=ParseMode.HTML)
@@ -8753,21 +6591,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user.id):
         await reply_premium_message(update.message, f"<blockquote>{pp('👑')} <b>ADMIN PANEL</b></blockquote>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
-    # User account se /start? -> seedha uska panel (account ka apna koi bot chat nahi hota)
-    try:
-        self_row = db.get_user_bot(f"ua{user.id}")
-    except Exception:
-        self_row = None
-    if self_row and (self_row.get("account_type") or "bot") == "user":
-        await reply_premium_message(
-            update.message,
-            f"<blockquote>{pp('👤')} <b>MANAGE USER ACCOUNT</b></blockquote>\n\n"
-            f"{pp('🆔')} <code>{self_row.get('bot_id')}</code>\n"
-            f"{pe('ℹ️')} Is account se welcome / broadcast messages jayenge.\n"
-            f"{pe('📌')} Channel add karo, welcome set karo, phir broadcast bhejo.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=bot_management_kb(str(self_row.get("bot_id")), user.id))
-        return
     await reply_premium_message(update.message, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(user.id))
 
 
@@ -8794,7 +6617,8 @@ async def start_bots_on_boot():
         logging.info(f"Found {len(bots)} user bots to start")
         for bot in bots:
             bot_id = bot["bot_id"]
-            is_ua = (bot.get("account_type") or "bot") == "user"
+            if not bot.get("bot_token"):
+                continue  # bina token wali purani rows skip (user-account system hata diya)
             reason = ""
             sub = db.get_subscription_for_bot(bot_id)
             if not sub:
@@ -8808,21 +6632,14 @@ async def start_bots_on_boot():
                     logging.error(f"Error checking expiry for {bot_id}: {ex}")
                     continue
             if reason:
-                if is_ua and UA_START_WITHOUT_SUBSCRIPTION:
-                    # Owner ka apna account hai: offline rakhne ka koi fayda nahi - DM/panel
-                    # chalta rahe. (Pehle yahi wajah thi ki restart ke baad account chup ho
-                    # jata tha aur /start par kuch jawab nahi aata tha.)
-                    logging.info(f"{bot_id}: user account {reason} hone par bhi chalu kar rahe hain "
-                                 f"(DM/panel chalega; channels add karne ke liye subscription chahiye)")
-                else:
-                    logging.info(f"Skipping {bot_id} - {reason}")
-                    db.set_user_bot_active(bot_id, False)
-                    continue
+                logging.info(f"Skipping {bot_id} - {reason}")
+                db.set_user_bot_active(bot_id, False)
+                continue
             try:
                 if not await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0):
                     continue
                 db.set_user_bot_active(bot_id, True)
-                kind = "user account" if is_ua else f"user bot @{bot.get('bot_username')}"
+                kind = f"user bot @{bot.get('bot_username')}"
                 logging.info(f"{pp('✅')} Started {kind} for {bot_id}")
             except Exception as ex:
                 logging.error(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
@@ -8839,25 +6656,13 @@ async def main():
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
     logging.info(f"{pp('🏷')} build {BUILD_TAG} (agar ye line purani dikhe to ./start dobara "
                  f"chalao - purana process chal raha hai)")
-    # .env se user-account credentials pick hue ya nahi - ek line me saaf dikh jaye
-    if not TELETHON_AVAILABLE:
-        logging.info(f"{pp('👤')} user account mode OFF: telethon install nahi hai "
-                     f"(server par: pip install telethon, phir ./start)")
-    elif ua_credentials_available():
-        _api_id, _ = user_account_credentials()
-        logging.info(f"{pp('👤')} user account mode ready (api_id "
-                     f"{str(_api_id)[:3]}***, api_hash ***) - panel me '👤 User Account' option chalu hai")
-    else:
-        logging.info(f"{pp('👤')} user account mode OFF: TELEGRAM_API_ID / TELEGRAM_API_HASH .env me nahi hain\n"
-                     f"{TELEGRAM_API_HINT}")
-
     # Purane "bot can't initiate conversation" wale unreachable marks saaf karo: wo sach me
-    # permanent nahi the (user account se ya user ke /start karne par DM ja sakti hai).
+    # permanent nahi hain (user ke /start karne par DM ja sakti hai).
     try:
         cleared = db.clear_initiate_blocked_unreachable()
         if cleared:
             logging.info(f"{pp('🧹')} {cleared} users ke purane \"bot can't initiate conversation\" "
-                         f"marks saaf kiye - ab inhe user account se DM ja sakti hai")
+                         f"marks saaf kiye - user ke /start karne par inhe DM ja sakti hai")
     except Exception as ex:
         logging.warning(f"unreachable cleanup skip: {mask_secrets(ex)}")
 
@@ -8883,8 +6688,6 @@ async def main():
         logging.error(f"{pp('❌')} Userbot startup error (main bot phir bhi chalu hoga): {mask_secrets(ex)}")
 
     app = ApplicationBuilder().token(MAIN_BOT_TOKEN).concurrent_updates(True).request(_tuned_request()).build()
-    global MAIN_BOT_REF
-    MAIN_BOT_REF = app.bot  # user-account media translate ke liye reference bot
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
@@ -8922,11 +6725,6 @@ async def main():
                 await user_app.stop()
                 await user_app.shutdown()
                 logging.info(f"{pp('✅')} Stopped user bot {bot_id}")
-            except Exception:
-                pass
-        for bot_id in list(user_account_clients.keys()):
-            try:
-                await stop_user_account(bot_id)
             except Exception:
                 pass
         logging.info(f"{pp('✅')} All bots stopped")
