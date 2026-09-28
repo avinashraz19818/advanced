@@ -4,6 +4,7 @@ import json
 import time
 import os
 import re
+import inspect
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from functools import wraps
@@ -17,7 +18,6 @@ from telegram import (
     InputMediaVideo,
     InputMediaDocument,
     InputMediaAudio,
-    MessageEntity,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,7 +31,8 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TimedOut
+
 
 # ================= RETRY DECORATOR =================
 def retry_async(max_retries=3, delay=1, backoff=2):
@@ -60,9 +61,11 @@ def retry_async(max_retries=3, delay=1, backoff=2):
                 except (NetworkError, TimedOut, ConnectionError) as e:
                     retries += 1
                     if retries >= max_retries:
-                        logging.error(f"Failed after {max_retries} retries: {e}")
+                        # Final failure: caller apne context ke saath log karta hai
+                        logging.warning(f"{max_retries} attempts ke baad bhi network fail: {mask_secrets(e)}")
                         raise
-                    logging.warning(f"Retry {retries}/{max_retries} after {current_delay}s: {e}")
+                    # Per-attempt lines DEBUG par (log spam na ho) - final result caller batata hai
+                    logging.debug(f"Retry {retries}/{max_retries} after {current_delay}s: {mask_secrets(e)}")
                     await asyncio.sleep(current_delay)
                     current_delay *= backoff
                 except Exception:
@@ -80,10 +83,202 @@ def make_aware(dt):
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
+# ================= LOG SECURITY (secret masking) =================
+TOKEN_RE = re.compile(r"\d{6,12}:[A-Za-z0-9_\-]{30,}")
+# Bahut lambi base64-ish strings (sessions/keys) kabhi log me na jayein.
+SESSION_RE = re.compile(r"[A-Za-z0-9_\-]{150,}")
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+
+# Agar Telegram premium emoji document reject kar de (Document_invalid), to wo is bot ke
+# liye permanent hota hai - har message par "styled fail -> plain retry" warning likhne ka
+# koi fayda nahi. Do fail ke baad styling band + simple text (log saaf rehta hai).
+STYLE_FAILURE_LIMIT = 2
+_style_state = {"failures": 0, "disabled": False}
+
+
+def premium_styling_disabled() -> bool:
+    return bool(_style_state.get("disabled"))
+
+
+def reset_premium_styling_state():
+    """Tests / diagnostics ke liye."""
+    _style_state["failures"] = 0
+    _style_state["disabled"] = False
+
+
+def note_premium_failure(ex) -> bool:
+    """True = ye styling ka permanent issue hai (premium emoji/html)."""
+    text = str(ex).lower()
+    markers = ("document_invalid", "unsupported start tag", "can't parse entities",
+               "custom emoji", "button user consent required", "not enough rights to send "
+               "text messages")
+    if not any(m in text for m in markers):
+        return False
+    _style_state["failures"] = _style_state.get("failures", 0) + 1
+    if _style_state["failures"] >= STYLE_FAILURE_LIMIT and not _style_state.get("disabled"):
+        _style_state["disabled"] = True
+        logging.info("premium styling is bot ke liye available nahi hai (Document_invalid) - "
+                     "aage se simple text + plain buttons (log saaf rahega)")
+    return True
+
+
+def configured_secrets() -> list:
+    """.env se aaye literal secrets - inhe logs me mask karna hai."""
+    out = []
+    for value in (os.getenv("MAIN_BOT_TOKEN", ""), os.getenv("DATABASE_URL", "")):
+        value = (value or "").strip()
+        if len(value) >= 8 and value not in out:
+            out.append(value)
+    return out
+
+
+def mask_secrets(text) -> str:
+    """Bot tokens ko kabhi log/error me mat dikhao.
+
+    Ek leaked token Telegram khud revoke kar deta hai (aur public repo me padha
+    hua token poore internet ke liye open hota hai), isliye har log line se
+    pehle token mask ho jata hai."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = TOKEN_RE.sub(lambda m: f"{m.group(0).split(':', 1)[0]}:***MASKED***", text)
+    for secret in configured_secrets():
+        if secret in text:
+            text = text.replace(secret, "***MASKED***")
+    return SESSION_RE.sub("***SESSION-MASKED***", text)
+
+
+class MaskingFormatter(logging.Formatter):
+    """Formatter jo traceback ke andar chhupe tokens ko bhi mask karta hai."""
+
+    def format(self, record):
+        return mask_secrets(super().format(record))
+
+
+NETWORK_NOISE_MARKERS = (
+    "ReadError", "ConnectError", "WriteError", "PoolTimeout", "ConnectTimeout",
+    "ReadTimeout", "httpx.", "NetworkError", "TimedOut", "ServerDisconnected",
+)
+
+
+class TransientNetworkFilter(logging.Filter):
+    """PTB ke polling network errors ko chhote warning me badlo.
+
+    VPS <-> Telegram link par transient hiccup (httpx.ReadError etc.) PTB khud retry
+    karta hai, par har baar ek poora 40-line traceback ERROR par log karta hai - log
+    itna bhar jata hai ki asli bug chhup jate hain. Ye filter un records ko ek line ka
+    WARNING bana deta hai (aur traceback hata deta hai)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if record.levelno < logging.WARNING:
+            return True
+        # Network error ka pata message me ya exception me kahin bhi lag sakta hai
+        haystack = message
+        exc_name = ""
+        if record.exc_info and record.exc_info[1] is not None:
+            try:
+                exc_name = type(record.exc_info[1]).__name__
+                haystack = f"{message} {exc_name} {record.exc_info[1]}"
+            except Exception:
+                pass
+        if not any(m in haystack for m in NETWORK_NOISE_MARKERS):
+            return True
+        record.levelno = logging.WARNING
+        record.levelname = "WARNING"
+        record.exc_info = None
+        record.exc_text = None
+        detail = f" ({exc_name})" if exc_name else ""
+        record.msg = ("Telegram network hiccup (PTB khud retry kar raha hai, koi action "
+                      f"zaroori nahi): {message[:140]}{detail}")
+        record.args = ()
+        return True
+
+
+def install_network_log_filter():
+    """PTB ke interne loggers par transient-network filter lagao."""
+    filt = TransientNetworkFilter()
+    for name in ("telegram.ext.Updater", "telegram.request", "telegram.ext",
+                 "telegram.ext._utils.networkloop", "httpx", "httpcore"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, TransientNetworkFilter) for f in logger.filters):
+            logger.addFilter(filt)
+
+
+def install_log_masking():
+    """Root logger ke saare handlers par masking formatter laga do."""
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+    for handler in root.handlers:
+        handler.setFormatter(MaskingFormatter(LOG_FORMAT))
+    install_network_log_filter()
+
+
+def force_ipv4_enabled() -> bool:
+    return os.getenv("FORCE_IPV4", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def install_force_ipv4() -> bool:
+    """Kuch VPS par IPv6 route toota hota hai -> Telegram API calls par httpx.ReadError.
+
+    .env me FORCE_IPV4=1 karne par sirf IPv4 addresses resolve honge (Telegram IPv4 par
+    poori tarah kaam karta hai). Default off - sirf tab lagao jab logs me ReadError aayein.
+    """
+    if not force_ipv4_enabled():
+        return False
+    import socket
+    if getattr(socket, "_advanced_force_ipv4", False):
+        return True
+    original = socket.getaddrinfo
+
+    def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        results = original(host, port, family, type, proto, flags)
+        filtered = [r for r in results if r[0] != socket.AF_INET6]
+        return filtered or results
+
+    socket.getaddrinfo = ipv4_only
+    socket._advanced_force_ipv4 = True
+    return True
+
+
+def load_env_file():
+    """MAIN_BOT_TOKEN / DATABASE_URL ko .env se load karo (repo me secret commit na ho)."""
+    candidates = [os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), ".env"]
+    for path in candidates:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if key.startswith("export "):  # shell-style .env bhi chale
+                        key = key[len("export "):].strip()
+                    os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+        except Exception:
+            continue
+
+
 # ================= CONFIG =================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7687421668:AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE")
+load_env_file()
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "").strip()
+MAIN_BOT_TOKEN_HINT = (
+    "BotFather -> /mybots -> apna bot -> API Token -> Revoke -> NAYA token copy karo,\n"
+    "phir server par:  cd ~/advanced && echo 'MAIN_BOT_TOKEN=<naya_token>' > .env && ./start\n"
+    "(Naya token kabhi GitHub/chat me mat bhejo - Telegram use turant revoke kar deta hai.)")
 ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
+# Konsa code chal raha hai - server par purana process pada ho to turant pata chale
+# (./start ke baad log me is line ka hona zaroori hai)
+BUILD_TAG = "2026-09-27-r17"
+START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
 if _ADMIN_IDS_RAW:
@@ -91,6 +286,7 @@ if _ADMIN_IDS_RAW:
         _x = _x.strip()
         if _x.isdigit():
             ADMIN_USER_IDS.add(int(_x))
+
 
 SUPPORT_REPLY_MAP: Dict[int, Dict] = {}
 USERBOT_SUPPORT_REPLY_MAP: Dict[str, Dict] = {}
@@ -147,12 +343,120 @@ def format_support_msg(user_name: str, username: str, user_id: int, message_text
         body += f'\n\n{pe("💬")} <b>Message:</b>\n▸ {message_text}'
     return f'{header}\n\n{body}\n\n'
 
+# ================= STYLED / PREMIUM BUTTON CORE =================
+# Telegram (Bot API 9.5+) lets a bot show a custom (premium/animated) emoji on an
+# inline button through `icon_custom_emoji_id`, and colour it through `style`.
+# python-telegram-bot < 22.7 has no dedicated parameters for those yet, so we
+# detect support at runtime and otherwise pass them via `api_kwargs` (which is
+# forwarded to the Bot API untouched by every PTB 20+/21+/22+ build).
+STYLE_VALUES = ("primary", "success", "danger")
+_BTN_PARAM_CACHE: Dict[str, bool] = {}
+
+
+def _button_supports(field: str) -> bool:
+    if field not in _BTN_PARAM_CACHE:
+        try:
+            _BTN_PARAM_CACHE[field] = field in inspect.signature(InlineKeyboardButton.__init__).parameters
+        except Exception:
+            _BTN_PARAM_CACHE[field] = False
+    return _BTN_PARAM_CACHE[field]
+
+
+# custom-emoji-id -> emoji character. We keep our own cache (filled while parsing
+# user input) plus a reverse view of EMOJI_IDS so that, when Telegram refuses the
+# animated emoji, the button still shows *some* emoji instead of nothing.
+_CUSTOM_EMOJI_CHARS: Dict[str, str] = {}
+_EMOJI_CHAR_BY_ID: Dict[str, str] = {}
+for _emoji_char, _emoji_id in EMOJI_IDS.items():
+    _EMOJI_CHAR_BY_ID.setdefault(_emoji_id, _emoji_char)
+
+
+def remember_emoji_char(emoji_id: Optional[str], emoji_char: Optional[str]):
+    """Remember which plain emoji belongs to a custom emoji id (fallback rendering)."""
+    if not emoji_id or not emoji_char:
+        return
+    _CUSTOM_EMOJI_CHARS[str(emoji_id)] = str(emoji_char)[:8]
+
+
+def emoji_char_for_id(emoji_id: Optional[str]) -> str:
+    if not emoji_id:
+        return ""
+    return (_CUSTOM_EMOJI_CHARS.get(str(emoji_id))
+            or _EMOJI_CHAR_BY_ID.get(str(emoji_id))
+            or "")
+
+
+def build_button(text: str, callback_data: Optional[str] = None, url: Optional[str] = None,
+                 style: Optional[str] = None, icon_id: Optional[str] = None,
+                 with_style: bool = True, with_icon: bool = True) -> InlineKeyboardButton:
+    """Build an inline button with an optional colour (style) + premium emoji icon.
+
+    `with_style=False` / `with_icon=False` are used by the automatic fallbacks when
+    Telegram rejects styled buttons (unavailable custom emoji document, old client,
+    bot owner without Premium, ...).
+    """
+    kwargs: Dict[str, Any] = {}
+    api_kwargs: Dict[str, Any] = {}
+    if style in STYLE_VALUES and with_style:
+        if _button_supports("style"):
+            kwargs["style"] = style
+        else:
+            api_kwargs["style"] = style
+    if icon_id and with_icon:
+        if _button_supports("icon_custom_emoji_id"):
+            kwargs["icon_custom_emoji_id"] = str(icon_id)
+        else:
+            api_kwargs["icon_custom_emoji_id"] = str(icon_id)
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    else:
+        kwargs["url"] = url
+    if api_kwargs:
+        kwargs["api_kwargs"] = api_kwargs
+    return InlineKeyboardButton(text, **kwargs)
+
+
+def button_icon_id(b) -> Optional[str]:
+    """Read the custom-emoji icon id of a button, no matter how it was set."""
+    try:
+        value = getattr(b, "icon_custom_emoji_id", None)
+        if value:
+            return str(value)
+        # NOTE: PTB stores unknown api_kwargs in a mappingproxy, not a dict
+        api_kwargs = getattr(b, "api_kwargs", None)
+        value = api_kwargs.get("icon_custom_emoji_id") if api_kwargs else None
+        return str(value) if value else None
+    except Exception:
+        return None
+
+
+def markup_has_icons(markup) -> bool:
+    try:
+        for row in (markup.inline_keyboard if markup else []):
+            for b in row:
+                if button_icon_id(b):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _strip_leading_icon(text: str, emoji: Optional[str]) -> str:
+    """Remove the icon emoji from the label *only* when it sits at the beginning,
+    so meaningful emojis inside the label (🟢/🔴 status dots etc.) survive."""
+    raw = text or ""
+    stripped = raw.strip()
+    if emoji and stripped.startswith(emoji):
+        stripped = stripped[len(emoji):].strip()
+    return stripped or raw.strip() or "Button"
+
+
 def _degrade_markup(markup):
     """
-    Fallback helper: strip icon_custom_emoji_id/style from every button, keeping
-    only text/url/callback_data. Used when Telegram rejects a "styled" message
-    (custom emoji icon referencing an invalid/inaccessible document) so we can
-    retry with a plain version instead of crashing.
+    Fallback helper: strip style + custom-emoji icon from every button, keeping only
+    text/url/callback_data, and restore the emoji as a *plain text* emoji so the
+    button never loses its icon completely. Used when Telegram rejects a "styled"
+    message (invalid/inaccessible custom-emoji document).
     """
     if not markup:
         return markup
@@ -161,10 +465,14 @@ def _degrade_markup(markup):
         for row in markup.inline_keyboard:
             new_row = []
             for b in row:
-                if b.url:
-                    new_row.append(InlineKeyboardButton(b.text, url=b.url))
-                elif b.callback_data:
-                    new_row.append(InlineKeyboardButton(b.text, callback_data=b.callback_data))
+                text = b.text or ""
+                char = emoji_char_for_id(button_icon_id(b))
+                if char and char not in text:
+                    text = f"{char} {text}".strip()
+                if getattr(b, "url", None):
+                    new_row.append(InlineKeyboardButton(text, url=b.url))
+                elif getattr(b, "callback_data", None):
+                    new_row.append(InlineKeyboardButton(text, callback_data=b.callback_data))
                 else:
                     new_row.append(b)
             new_rows.append(new_row)
@@ -174,44 +482,15 @@ def _degrade_markup(markup):
 
 
 def btn(text: str, callback_data: str, style: str = "primary", emoji: str = None) -> InlineKeyboardButton:
-    api_kwargs = {}
-    style_map = {"primary": "primary", "success": "success", "danger": "danger"}
-    if style and style in style_map:
-        api_kwargs["style"] = style_map[style]
-    if emoji and emoji in EMOJI_IDS:
-        api_kwargs["icon_custom_emoji_id"] = EMOJI_IDS[emoji]
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else "Button"
-    else:
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else text
-    if api_kwargs:
-        return InlineKeyboardButton(text, callback_data=callback_data, **api_kwargs)
-    return InlineKeyboardButton(text, callback_data=callback_data)
+    icon_id = EMOJI_IDS.get(emoji) if emoji else None
+    return build_button(_strip_leading_icon(text, emoji), callback_data=callback_data,
+                        style=style, icon_id=icon_id)
+
 
 def btn_url(text: str, url: str, style: str = "primary", emoji: str = None) -> InlineKeyboardButton:
-    api_kwargs = {}
-    style_map = {"primary": "primary", "success": "success", "danger": "danger"}
-    if style and style in style_map:
-        api_kwargs["style"] = style_map[style]
-    if emoji and emoji in EMOJI_IDS:
-        api_kwargs["icon_custom_emoji_id"] = EMOJI_IDS[emoji]
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else "Button"
-    else:
-        clean_text = text
-        for e in EMOJI_IDS.keys():
-            clean_text = clean_text.replace(e, "").strip()
-        text = clean_text if clean_text else text
-    if api_kwargs:
-        return InlineKeyboardButton(text, url=url, **api_kwargs)
-    return InlineKeyboardButton(text, url=url)
+    icon_id = EMOJI_IDS.get(emoji) if emoji else None
+    return build_button(_strip_leading_icon(text, emoji), url=url,
+                        style=style, icon_id=icon_id)
 
 def premiumize_ui_emojis(text: Optional[str]) -> str:
     """Convert plain emojis to premium <tg-emoji> tags in bot UI text."""
@@ -224,6 +503,45 @@ def premiumize_ui_emojis(text: Optional[str]) -> str:
     for emoji_char, eid in EMOJI_IDS.items():
         text = text.replace(emoji_char, f'<tg-emoji emoji-id="{eid}">{emoji_char}</tg-emoji>')
     return text
+
+# Telegram HTML: sirf inhi tags ko as-is jaane do, baaki "<...>" ko escape karo.
+# (Isi bug se ek `printf '<id>'` wali hint line poora message reject karwa rahi thi:
+#  "Can't parse entities: unsupported start tag id".)
+_TG_HTML_ALLOWED = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span", "tg-spoiler",
+    "tg-emoji", "a", "code", "pre", "blockquote", "br", "tg-mention",
+}
+# Sirf valid-looking tags (naam + optional key="value") match hote hain
+_TG_HTML_TAG_RE = re.compile(
+    r"</?([a-zA-Z][a-zA-Z0-9_-]*)((?:\s+[a-zA-Z-]+\s*=\s*\"[^\"]*\")*)\s*/?>")
+
+
+def sanitize_telegram_html(text: Optional[str]) -> str:
+    """HTML parse_mode ke liye text ko safe banao.
+
+    Allowed tags (b, code, tg-emoji, blockquote, a href=...) waise hi rehte hain,
+    aur baaki sab `<` escape ho jate hain. Isse ek chhoti si galti (jaise hint me
+    likha `<id>`) poore message ko fail nahi karti.
+    """
+    if not text or "<" not in text:
+        return text
+    protected = {}
+
+    def _protect(match):
+        tag = match.group(1).lower()
+        if tag not in _TG_HTML_ALLOWED:
+            return match.group(0)
+        key = f"\x00T{len(protected)}\x00"
+        protected[key] = match.group(0)
+        return key
+
+    out = _TG_HTML_TAG_RE.sub(_protect, text)
+    out = out.replace("&", "&amp;").replace("<", "&lt;")
+    # protected tags ke andar wale & ko wapas theek karo (humne sab escape kar diya tha)
+    for key, tag in protected.items():
+        out = out.replace(key, tag)
+    return out
+
 
 def strip_premium_emojis(text: Optional[str]) -> str:
     """Strip <tg-emoji> tags and return plain text with plain emojis. For user-facing messages."""
@@ -270,10 +588,12 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
                         expiry = now_aware()
                 is_active = expiry > now_aware()
             status = "🟢" if is_active else "🔴"
-            lines.append([btn(f"{status} @{bot_username}", f"manage_bot_{bot_id}", "primary", "🤖")])
-        lines.append([btn("Add New Bot", "add_new_bot", "success", "➕")])
+            icon = "🤖"
+            shown = f"@{bot_username}" if bot_username else bot_id
+            lines.append([btn(f"{status} {shown}", f"manage_bot_{bot_id}", "primary", icon)])
+        lines.append([btn("Add Bot", "add_new_bot", "success", "➕")])
     else:
-        lines.append([btn("Create New Bot", "add_new_bot", "success", "➕")])
+        lines.append([btn("Create Bot", "add_new_bot", "success", "➕")])
     lines.append([btn_url("Contact Admin", f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", "primary", "📞")])
     if is_admin(uid):
         lines.append([btn("Admin Panel", "admin_panel", "danger", "👑")])
@@ -332,11 +652,78 @@ def subscription_plans_kb(bot_id: str = None) -> InlineKeyboardMarkup:
         [btn("Back", back_cb, "primary", "🔙")],
     ])
 
+def _fmt_ago(ts: Optional[float]) -> str:
+    if not ts:
+        return "kabhi nahi"
+    secs = max(0, int(time.time() - ts))
+    if secs < 60:
+        return f"{secs}s pehle"
+    if secs < 3600:
+        return f"{secs // 60}m pehle"
+    return f"{secs // 3600}h {(secs % 3600) // 60}m pehle"
+
+
+def build_diag_text() -> str:
+    """Ek message me poora status: build, main bot, bot accounts."""
+    lines = [f"<blockquote>{pp('🩺')} <b>DIAGNOSTICS</b></blockquote>", ""]
+    lines.append(f"{pp('🏷')} Build: <code>{BUILD_TAG}</code>")
+    lines.append(f"{pe('⏱')} Bot chalu: {_fmt_ago(START_TS).replace(' pehle', '')}")
+    try:
+        import telegram as _tg
+        lines.append(f"{pe('🐍')} python-telegram-bot {getattr(_tg, '__version__', '?')}")
+    except Exception:
+        pass
+    lines.append(f"{pe('🔑')} Main bot token: {'haan' if MAIN_BOT_TOKEN else 'NAHI'} "
+                 f"| admins: {len(ADMIN_USER_IDS)}")
+    lines.append("")
+    bots = [b for b in (db.get_all_user_bots() or [])]
+    lines.append(f"{pp('🤖')} <b>Bot accounts ({len(bots)})</b>")
+    if not bots:
+        lines.append(f"{pe('ℹ️')} koi bot account add nahi hai")
+    for row in bots[:10]:
+        bot_id = row.get("bot_id") or "?"
+        running = bot_id in user_bot_applications
+        try:
+            chans = len(db.get_bot_channels(bot_id) or [])
+        except Exception:
+            chans = "?"
+        try:
+            gone = db.count_permanently_unreachable(bot_id)
+        except Exception:
+            gone = "?"
+        sub = db.get_subscription_for_bot(bot_id)
+        plan = "no plan"
+        if sub:
+            plan = f"{sub.get('subscription_type')} ({str(sub.get('expiry_date'))[:10]})"
+        lines.append(f"{pe('🆔')} <code>{bot_id}</code> | {account_display_name(row, bot_id)}")
+        lines.append(f"   {pe('▶️')} chalu: {'🟢 haan' if running else '🔴 NAHI'}"
+                     f" | channels: {chans} | unreachable users: {gone} | plan: {plan}")
+    lines.append("")
+    lines.append(f"{pe('📌')} Kisi bot ko DM me <code>/start</code> bhejo - welcome panel aana chahiye.")
+    return "\n".join(lines)
+
+
+def diag_kb() -> InlineKeyboardMarkup:
+    rows = [[btn("Unreachable reset", "diag_reset_unreachable", "success", "🧹")]]
+    rows.append([btn("Refresh", "admin_diag", "primary", "🔄")])
+    rows.append([btn("Admin Panel", "admin_panel", "primary", "👑")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    text = build_diag_text()
+    logging.info(f"diag ({user.id}):\n{strip_premium_emojis(text)}")
+    await reply_premium_message(update.message, text, parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+
+
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [btn("All Users", "admin_all_users", "primary", "📇"),
          btn("Manage UserBots", "admin_userbots", "success", "🤖")],
-        [btn("Add UserBot", "admin_add_userbot", "success", "➕"),
+        [btn("Add Account", "admin_add_userbot", "success", "➕"),
          btn("Add Subscription", "admin_add_sub", "success", "⭐️")],
         [btn("Subscription List", "admin_sub_list", "primary", "📋")],
         [btn("Check Expiry", "admin_check_expiry", "primary", "⏰"),
@@ -347,6 +734,7 @@ def admin_kb() -> InlineKeyboardMarkup:
         [btn("Default First Message", "admin_default_first_msg", "primary", "💬")],
         [btn("Broadcast", "admin_broadcast", "success", "✈️"),
          btn("Send Reminders", "admin_send_reminders", "primary", "🔔")],
+        [btn("Diagnostics", "admin_diag", "primary", "🩺")],
         [btn("Main Menu", "main_menu", "primary", "🔙")],
     ])
 
@@ -387,6 +775,49 @@ def _cleanup_support_maps():
         for k in stale:
             store.pop(k, None)
 
+# Callback prefixes of the userbot manage panel (they only carry the bot_id inside
+# their payload, so the main bot has to work out which bot is meant).
+USERBOT_PANEL_PREFIXES = ("ub_", "ubm_", "ubmm_", "delmsg_", "setmsg_", "setbtn_", "setbtng_",
+                          "bcast_", "toggleauto_", "removechan_", "back_to_manage_")
+READONLY_PANEL_PREFIXES = ("ub_stats_", "ub_list_channels_")
+
+
+def resolve_managed_bot_id(user_id: int, data: str) -> Optional[str]:
+    """Which userbot does this panel callback belong to?"""
+    if not data:
+        return None
+    try:
+        candidates = list(db.get_user_bots_by_owner(user_id) or [])
+        known = {str(b.get("bot_id")) for b in candidates}
+        if is_admin(user_id):
+            for bot in (db.get_all_user_bots() or []):
+                if str(bot.get("bot_id")) not in known:
+                    candidates.append(bot)
+                    known.add(str(bot.get("bot_id")))
+        for bot in sorted(candidates, key=lambda b: -len(str(b.get("bot_id") or ""))):
+            bot_id = str(bot.get("bot_id") or "")
+            if bot_id and bot_id in data:
+                return bot_id
+    except Exception as ex:
+        logging.error(f"resolve_managed_bot_id failed: {ex}")
+    return None
+
+
+async def show_manage_from_bot_help(q, bot_id: str):
+    """The manage panel needs the userbot's own chat (that's where its handlers live)."""
+    bot_data = db.get_user_bot(bot_id) or {}
+    username = bot_data.get("bot_username")
+    rows = []
+    if username:
+        rows.append([btn_url("Open My Bot", f"https://t.me/{username}", "success", "🚀")])
+    rows.append([btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")])
+    await safe_edit_message_text(q,
+        f"<blockquote>{pp('🤖')} <b>MANAGE FROM YOUR BOT</b></blockquote>\n\n"
+        "Channels, welcome messages aur broadcast apne <b>bot ke andar</b> se manage hote hain.\n\n"
+        f"👉 @{username or bot_id} ko <code>/start</code> bhejo aur panel kholo.",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
 def _parse_id(s: str):
     try:
         return int(s)
@@ -404,7 +835,15 @@ def _extract_last_id(parts: list) -> int:
     return 0
 
 # ================= DATABASE =================
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/advanced_bot"
+# Broadcast audience: reachable users + approved join requests, permanent failures excluded.
+REQUESTERS_SQL = """SELECT requester_id, MAX(ok) AS ok FROM (
+       SELECT requester_id, 1 AS ok FROM reachable_users WHERE bot_id=%s
+       UNION ALL
+       SELECT DISTINCT requester_id, 0 AS ok FROM join_requests WHERE bot_id=%s AND status='approved'
+       ) AS all_users
+       WHERE requester_id NOT IN (SELECT requester_id FROM unreachable_users WHERE bot_id=%s)
+       GROUP BY requester_id ORDER BY ok DESC"""
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/advanced_bot")
 
 try:
     import psycopg2
@@ -439,20 +878,34 @@ class Database:
     def init_db(self):
         statements = [
             """CREATE TABLE IF NOT EXISTS users (\n                user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,\n                verified BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now()\n            )""",
-            """CREATE TABLE IF NOT EXISTS user_bots (\n                bot_id TEXT PRIMARY KEY, user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,\n                bot_token TEXT UNIQUE, bot_username TEXT, is_active INT DEFAULT 0,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
+            """CREATE TABLE IF NOT EXISTS user_bots (\n                bot_id TEXT PRIMARY KEY, user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,\n                bot_token TEXT UNIQUE, bot_username TEXT, is_active INT DEFAULT 0,\n                created_at TIMESTAMPTZ DEFAULT now(),\n                account_type TEXT DEFAULT 'bot', phone TEXT, session_string TEXT,\n                api_id BIGINT, api_hash TEXT\n            )""",
             """CREATE TABLE IF NOT EXISTS bot_subscriptions (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                subscription_type TEXT, expiry_date TIMESTAMPTZ, max_channels INT DEFAULT 1,\n                reminder_3d_sent BOOLEAN DEFAULT FALSE, reminder_1d_sent BOOLEAN DEFAULT FALSE,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS user_bot_channels (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                channel_id BIGINT, channel_username TEXT, channel_title TEXT,\n                welcome_message TEXT, welcome_media_id TEXT, welcome_media_type TEXT,\n                auto_approve INT DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, channel_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS user_bot_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                channel_id BIGINT, content_text TEXT, media_id TEXT, media_type TEXT,\n                file_name TEXT, mime_type TEXT, telegram_message_id BIGINT,\n                media_group_id TEXT, buttons_json TEXT, entities_json TEXT,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS join_requests (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, channel_id BIGINT, status TEXT,\n                request_date TIMESTAMPTZ DEFAULT now(), approved_date TIMESTAMPTZ,\n                UNIQUE(bot_id, requester_id, channel_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS reachable_users (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, last_ok_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, requester_id)\n            )""",
+            """CREATE TABLE IF NOT EXISTS unreachable_users (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, reason TEXT, failed_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, requester_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS user_emoji_maps (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                msg_id BIGINT, emoji_map JSONB DEFAULT '{}',\n                updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (bot_id, msg_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS system_settings (\n                key TEXT PRIMARY KEY, value_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS leave_recovery_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT, user_id BIGINT,\n                source_channel_id BIGINT, target_channel_id BIGINT, message_id BIGINT,\n                sent_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ\n            )""",
+            # user-account system hata diya - purani entity-cache table ho to saaf karo
+            "DROP TABLE IF EXISTS user_entity_cache",
             "CREATE INDEX IF NOT EXISTS idx_bot_subscriptions ON bot_subscriptions(bot_id, expiry_date)",
             "CREATE INDEX IF NOT EXISTS idx_join_requests ON join_requests(bot_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_user_bots_user ON user_bots(user_id)",
             "CREATE INDEX IF NOT EXISTS idx_messages_bot ON user_bot_messages(bot_id, channel_id)",
             "CREATE INDEX IF NOT EXISTS idx_reachable_bot ON reachable_users(bot_id, last_ok_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_unreachable_bot ON unreachable_users(bot_id)",
+            # Migration: purane DB me user-account columns add ho jayein
+            "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS account_type TEXT DEFAULT 'bot'",
+            "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS phone TEXT",
+            "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS session_string TEXT",
+            "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS api_id BIGINT",
+            "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS api_hash TEXT",
+            # Purane DB me bot_token par NOT NULL tha -> user account (jisme token nahi hota)
+            # insert hi nahi ho paata tha ("null value in column bot_token violates
+            # not-null constraint"). Ye migration use theek kar deta hai.
+            "ALTER TABLE user_bots ALTER COLUMN bot_token DROP NOT NULL",
         ]
         with self.conn.cursor() as cur:
             for stmt in statements:
@@ -468,6 +921,7 @@ class Database:
     def get_user(self, user_id):
         return self._fetchone("SELECT * FROM users WHERE user_id=%s", (user_id,)) or {}
 
+    # ---------------- user entity (access_hash) cache ----------------
     def mark_user_verified(self, user_id: int):
         self._execute("UPDATE users SET verified=TRUE WHERE user_id=%s", (user_id,))
 
@@ -497,19 +951,24 @@ class Database:
         return bot_id
 
     def get_user_bot(self, bot_id: str):
-        b = self._fetchone("SELECT * FROM user_bots WHERE bot_id=%s", (bot_id,))
+        # Sirf bot rows: user-account system hata diya (purani 'user' rows invisible).
+        b = self._fetchone("SELECT * FROM user_bots WHERE bot_id=%s "
+                           "AND COALESCE(account_type,'bot')='bot'", (bot_id,))
         return dict(b) if b else None
 
     def get_user_bots_by_owner(self, user_id: int):
-        rows = self._fetchall("SELECT * FROM user_bots WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
+        rows = self._fetchall("SELECT * FROM user_bots WHERE user_id=%s "
+                              "AND COALESCE(account_type,'bot')='bot' ORDER BY created_at DESC", (user_id,))
         return [dict(r) for r in rows]
 
     def get_all_user_bots(self):
-        rows = self._fetchall("SELECT * FROM user_bots ORDER BY user_id, created_at")
+        rows = self._fetchall("SELECT * FROM user_bots WHERE COALESCE(account_type,'bot')='bot' "
+                              "ORDER BY user_id, created_at")
         return [dict(r) for r in rows]
 
     def get_bot_by_username(self, username: str):
-        return self._fetchone("SELECT * FROM user_bots WHERE bot_username=%s", (username,))
+        return self._fetchone("SELECT * FROM user_bots WHERE bot_username=%s "
+                              "AND COALESCE(account_type,'bot')='bot'", (username,))
 
     def set_user_bot_active(self, bot_id: str, active):
         self._execute("UPDATE user_bots SET is_active=%s WHERE bot_id=%s", (1 if active else 0, bot_id))
@@ -525,6 +984,30 @@ class Database:
         max_channels = 1 if sub_type.lower() == "basic" else 5
         expiry_date = now_aware() + timedelta(days=days)
         self._execute("""INSERT INTO bot_subscriptions (bot_id, subscription_type, expiry_date, max_channels)\n               VALUES (%s,%s,%s,%s)""", (bot_id, sub_type, expiry_date, max_channels))
+
+    def get_active_subscription(self, bot_id: str):
+        """Latest subscription row that is still valid, or None."""
+        row = self._fetchone("""SELECT * FROM bot_subscriptions\n               WHERE bot_id=%s AND expiry_date >= now()\n               ORDER BY expiry_date DESC LIMIT 1""", (bot_id,))
+        return dict(row) if row else None
+
+    def has_active_subscription(self, bot_id: str) -> bool:
+        try:
+            return self.get_active_subscription(bot_id) is not None
+        except Exception:
+            return False
+
+    def grant_broadcast_subscription(self, bot_id: str, days: int = 1, sub_type: str = "Basic") -> bool:
+        """Admin broadcast ke liye: agar koi active subscription nahi hai to 1 din ka
+        Basic khud se add kar do, taaki broadcast us userbot ke users tak pahunch jaye."""
+        try:
+            if self.has_active_subscription(bot_id):
+                return False
+            self.add_subscription_for_bot(bot_id, sub_type, days)
+            logging.info(f"Auto-added {days}-day {sub_type} subscription for {bot_id} (broadcast)")
+            return True
+        except Exception as ex:
+            logging.error(f"grant_broadcast_subscription failed for {bot_id}: {ex}")
+            return False
 
     def update_subscription_expiry(self, bot_id: str, new_expiry):
         row = self._fetchone("SELECT id FROM bot_subscriptions WHERE bot_id=%s ORDER BY expiry_date DESC LIMIT 1", (bot_id,))
@@ -707,15 +1190,52 @@ class Database:
 
     def mark_reachable(self, bot_id: str, requester_id):
         self._execute("INSERT INTO reachable_users (bot_id, requester_id, last_ok_at) VALUES (%s,%s,now()) ON CONFLICT (bot_id, requester_id) DO UPDATE SET last_ok_at=now()", (bot_id, requester_id))
+        # User wapas aa gaya (start / join request) -> purana permanent-fail marker hata do
+        self._execute("DELETE FROM unreachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
 
     def mark_unreachable(self, bot_id: str, requester_id):
         self._execute("DELETE FROM reachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
 
+    def is_permanently_unreachable(self, bot_id: str, requester_id) -> bool:
+        """Kya ye user pehle hi permanently fail ho chuka hai (block/chat not found)?"""
+        row = self._fetchone("SELECT 1 AS x FROM unreachable_users WHERE bot_id=%s AND requester_id=%s",
+                             (bot_id, requester_id))
+        return bool(row)
+
+    def mark_permanently_unreachable(self, bot_id: str, requester_id, reason: str = ""):
+        """Jo user permanently reachable nahi hai (block / chat not found / deactivated)
+        use yaad rakho - warna har broadcast me hazaaron dead ids par API calls jati hain
+        aur log spam hota hai (yehi server logs me dikh raha tha)."""
+        self._execute("""INSERT INTO unreachable_users (bot_id, requester_id, reason, failed_at)
+               VALUES (%s,%s,%s,now()) ON CONFLICT (bot_id, requester_id)
+               DO UPDATE SET reason=EXCLUDED.reason, failed_at=now()""",
+            (bot_id, requester_id, (reason or "")[:200]))
+
+    def clear_initiate_blocked_unreachable(self) -> int:
+        """Sirf wo marks hatao jinka reason "bot can't initiate conversation" tha.
+
+        Ye marks sach me permanent nahi hain: user baad me bot ko /start kar de to DM ja
+        sakti hai. Blocked/deactivated users ke marks waise hi rahenge.
+        """
+        try:
+            rows = self._fetchall("""DELETE FROM unreachable_users
+                   WHERE reason ILIKE %s OR reason ILIKE %s RETURNING requester_id""",
+                                  ("%initiate conversation%", "%can't initiate%"))
+            return len(rows or [])
+        except Exception as ex:
+            logging.warning(f"unreachable marks clear nahi hua: {mask_secrets(ex)}")
+            return 0
+
+    def count_permanently_unreachable(self, bot_id: str) -> int:
+        row = self._fetchone("SELECT COUNT(*) AS c FROM unreachable_users WHERE bot_id=%s", (bot_id,))
+        return int(row["c"]) if row else 0
+
     def get_requesters_for_bot(self, bot_id: str):
-        rows = self._fetchall("SELECT requester_id FROM reachable_users WHERE bot_id=%s ORDER BY last_ok_at DESC", (bot_id,))
-        if rows:
-            return [r["requester_id"] for r in rows]
-        rows = self._fetchall("SELECT DISTINCT requester_id FROM join_requests WHERE bot_id=%s AND status='approved'", (bot_id,))
+        """Broadcast audience: reachable users + approved join requests (ek id ek baar).
+
+        Permanently unreachable users (block / chat not found / deactivated) skip hote
+        hain - pehle un par har broadcast me API calls jati thin aur log spam hota tha."""
+        rows = self._fetchall(REQUESTERS_SQL, (bot_id, bot_id, bot_id))
         return [r["requester_id"] for r in rows]
 
     def get_total_requesters_count(self, bot_id: str):
@@ -1093,11 +1613,15 @@ def is_admin(user_id: int) -> bool:
 
 
 def is_bot_owner(bot_id: str, user_id: int) -> bool:
-    """Check if user is owner of the bot OR is admin"""
+    """Check if user is owner of the bot OR is admin."""
     if is_admin(user_id):
         return True
     bot_data = db.get_user_bot(bot_id)
-    return bool(bot_data and bot_data.get("user_id") == user_id)
+    if not bot_data:
+        return False
+    if bot_data.get("user_id") == user_id:
+        return True
+    return False
 
 
 @retry_async(max_retries=3, delay=1, backoff=2)
@@ -1118,10 +1642,14 @@ async def safe_edit_message_text(q, *args, **kwargs):
     if len(args) > 0:
         args = list(args)
         raw_text = args[0]
-        args[0] = premiumize_ui_emojis(raw_text)
+        args[0] = sanitize_telegram_html(premiumize_ui_emojis(raw_text))
     elif "text" in kwargs:
         raw_text = kwargs["text"]
-        kwargs["text"] = premiumize_ui_emojis(raw_text)
+        kwargs["text"] = sanitize_telegram_html(premiumize_ui_emojis(raw_text))
+
+    if premium_styling_disabled():
+        # Styling is bot ke liye kaam nahi karti - seedha plain bhejo (logs clean)
+        return await _plain_edit_message_text(q, raw_text, args, kwargs)
 
     try:
         return await q.edit_message_text(*args, **kwargs)
@@ -1129,46 +1657,57 @@ async def safe_edit_message_text(q, *args, **kwargs):
         if "Message is not modified" in str(ex):
             return None
 
-        logging.warning(f"styled edit_message_text failed ({ex}); retrying plain")
-        plain_text = strip_premium_emojis(raw_text) if raw_text else raw_text
-        plain_kwargs = dict(kwargs)
-        if "reply_markup" in plain_kwargs:
-            plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
-        try:
-            if len(args) > 0:
-                plain_args = list(args)
-                plain_args[0] = plain_text
-                return await q.edit_message_text(*plain_args, **plain_kwargs)
-            else:
-                plain_kwargs["text"] = plain_text
-                return await q.edit_message_text(**plain_kwargs)
-        except Exception as ex2:
-            logging.warning(f"plain edit also failed ({ex2}); falling back to delete+resend")
+        if not note_premium_failure(ex):
+            logging.warning(f"styled edit_message_text failed ({ex}); retrying plain")
+        return await _plain_edit_message_text(q, raw_text, args, kwargs)
 
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        try:
-            send_kwargs = {k: v for k, v in plain_kwargs.items() if k != "text"}
-            return await q.message.chat.send_message(plain_text or "", **send_kwargs)
-        except Exception as send_ex:
-            logging.error(f"safe_edit_message_text fallback send also failed: {send_ex}")
+
+async def _plain_edit_message_text(q, raw_text, args, kwargs):
+    """Plain edit -> fail ho to delete + naya plain message (navigation kabhi na toote)."""
+    plain_text = strip_premium_emojis(raw_text) if raw_text else raw_text
+    plain_kwargs = dict(kwargs)
+    if "reply_markup" in plain_kwargs:
+        plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+    try:
+        if len(args) > 0:
+            plain_args = list(args)
+            plain_args[0] = plain_text
+            return await q.edit_message_text(*plain_args, **plain_kwargs)
+        plain_kwargs["text"] = plain_text
+        return await q.edit_message_text(**plain_kwargs)
+    except BadRequest as ex:
+        if "Message is not modified" in str(ex):
             return None
+        logging.debug(f"plain edit failed ({ex}); delete + resend")
+    except Exception as ex:
+        logging.debug(f"plain edit failed ({ex}); delete + resend")
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    try:
+        send_kwargs = {k: v for k, v in plain_kwargs.items() if k != "text"}
+        return await q.message.chat.send_message(plain_text or "", **send_kwargs)
+    except Exception as send_ex:
+        logging.error(f"safe_edit_message_text fallback send also failed: {send_ex}")
+        return None
 
 
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def send_premium_message(bot, chat_id, text, *args, **kwargs):
     """Send message with PREMIUM emojis (for bot UI/admin messages). Falls back to
     a plain (non-premium) version if Telegram rejects the styled one."""
+    if premium_styling_disabled():
+        return await _plain_send_premium_message(bot, chat_id, text, args, kwargs)
     try:
-        premium_text = premiumize_ui_emojis(text)
+        premium_text = sanitize_telegram_html(premiumize_ui_emojis(text))
         return await bot.send_message(chat_id, premium_text, *args, **kwargs)
     except Forbidden:
         logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
         return None
     except BadRequest as ex:
-        logging.warning(f"styled send_premium_message failed for {chat_id} ({ex}); retrying plain")
+        if not note_premium_failure(ex):
+            logging.warning(f"styled send_premium_message failed for {chat_id} ({ex}); retrying plain")
         try:
             plain_kwargs = dict(kwargs)
             if "reply_markup" in plain_kwargs:
@@ -1185,18 +1724,38 @@ async def send_premium_message(bot, chat_id, text, *args, **kwargs):
         return None
 
 
+async def _plain_send_premium_message(bot, chat_id, text, args, kwargs):
+    """Styling band hone par simple text (premium tags hata ke) bhejo."""
+    plain_kwargs = dict(kwargs)
+    if "reply_markup" in plain_kwargs:
+        plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+    try:
+        return await bot.send_message(chat_id, strip_premium_emojis(text), *args, **plain_kwargs)
+    except Forbidden:
+        logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
+        return None
+    except (NetworkError, TimedOut):
+        raise
+    except Exception as ex:
+        logging.error(f"send_premium_message (plain) failed for {chat_id}: {ex}")
+        return None
+
+
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def reply_premium_message(message, text, *args, **kwargs):
     """Reply with PREMIUM emojis (for bot UI/admin messages). Falls back to a
     plain (non-premium) version if Telegram rejects the styled one."""
+    if premium_styling_disabled():
+        return await _plain_reply_premium_message(message, text, args, kwargs)
     try:
-        premium_text = premiumize_ui_emojis(text)
+        premium_text = sanitize_telegram_html(premiumize_ui_emojis(text))
         return await message.reply_text(premium_text, *args, **kwargs)
     except Forbidden:
         logging.warning(f"Cannot reply to {message.chat_id}: bot blocked")
         return None
     except BadRequest as ex:
-        logging.warning(f"styled reply_premium_message failed for {message.chat_id} ({ex}); retrying plain")
+        if not note_premium_failure(ex):
+            logging.warning(f"styled reply_premium_message failed for {message.chat_id} ({ex}); retrying plain")
         try:
             plain_kwargs = dict(kwargs)
             if "reply_markup" in plain_kwargs:
@@ -1213,32 +1772,78 @@ async def reply_premium_message(message, text, *args, **kwargs):
         return None
 
 
+async def _plain_reply_premium_message(message, text, args, kwargs):
+    """Styling band hone par simple text reply."""
+    plain_kwargs = dict(kwargs)
+    if "reply_markup" in plain_kwargs:
+        plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+    try:
+        return await message.reply_text(strip_premium_emojis(text), *args, **plain_kwargs)
+    except Forbidden:
+        logging.warning(f"Cannot reply to {message.chat_id}: bot blocked")
+        return None
+    except (NetworkError, TimedOut):
+        raise
+    except Exception as ex:
+        logging.error(f"reply_premium_message (plain) failed: {ex}")
+        return None
+
+
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def send_user_message(bot, chat_id, text, *args, **kwargs):
-    """Send user-facing messages without stripping premium custom emoji tags."""
+    """Send user-facing messages (premium emoji tags allowed).
+
+    Telegram can reject a message because of a custom-emoji document the bot may not
+    use (Bot API: "Document_invalid") or because of broken HTML. Both cases used to
+    end with the message simply NOT being delivered (broadcast buttons/emoji were lost
+    that way), so we now retry with the emoji tags stripped and the button icons
+    removed - a plain message is always better than no message.
+    """
+    raise_on_failure = kwargs.pop("raise_on_failure", False)
     try:
         return await bot.send_message(chat_id, text, *args, **kwargs)
     except Forbidden:
-        logging.warning(f"Cannot send message to {chat_id}: bot blocked or can't initiate")
-        return None
+        # Blocked / can't initiate: broadcast ko is user ko unreachable mark karna hai,
+        # isliye swallow nahi karte (pehle chup-chaap None return hota tha aur broadcast
+        # ise "sent" ginta tha).
+        raise
     except BadRequest as ex:
-        if kwargs.get("parse_mode") == ParseMode.HTML and "can't parse entities" in str(ex).lower():
-            logging.warning(f"HTML parse failed for {chat_id}; retrying with escaped text: {ex}")
-            safe_kwargs = dict(kwargs)
-            safe_kwargs["parse_mode"] = ParseMode.HTML
-            safe_text = escape_preserving_premium_emojis(text)
+        if is_user_gone_error(ex):
+            raise
+        if not _should_plain_retry(ex):
+            # entity-nahi-mila / file_id ghalat - plain text se dobara try karne ka fayda
+            # nahi (pehle 3 line warning aati thi, ab ek).
+            logging.warning(f"send_user_message skip (user {chat_id}): "
+                            f"{type(ex).__name__}: {mask_secrets(ex)}")
+            if raise_on_failure:
+                raise
+            return None
+        logging.warning(f"send_user_message BadRequest for {chat_id}: {ex}; retrying plainly")
+        plain_kwargs = dict(kwargs)
+        if plain_kwargs.get("reply_markup") is not None:
+            plain_kwargs["reply_markup"] = _degrade_markup(plain_kwargs["reply_markup"])
+        candidates = []
+        if kwargs.get("parse_mode") == ParseMode.HTML:
+            candidates.append(escape_preserving_premium_emojis(text))
+        candidates.append(strip_premium_emojis(text))
+        for candidate in candidates:
+            if not candidate or candidate == text:
+                continue
             try:
-                return await bot.send_message(chat_id, safe_text, *args, **safe_kwargs)
+                return await bot.send_message(chat_id, candidate, *args, **plain_kwargs)
             except Exception as retry_ex:
-                logging.error(f"send_user_message escaped retry failed: {retry_ex}")
-                return None
+                logging.warning(f"send_user_message plain retry failed for {chat_id}: {retry_ex}")
         logging.error(f"send_user_message failed: {ex}")
+        if raise_on_failure:
+            raise
         return None
     except (NetworkError, TimedOut) as ex:
         logging.warning(f"Network error sending to {chat_id}: {ex}")
         raise
     except Exception as ex:
         logging.error(f"send_user_message failed: {ex}")
+        if raise_on_failure:
+            raise
         return None
 
 
@@ -1263,123 +1868,722 @@ def render_dynamic_text(text: Optional[str], user=None, extra: Optional[dict] = 
     return rendered
 
 
-def parse_buttons_text(text: Optional[str]):
+# ================= INLINE BUTTON PARSING (PREMIUM-EMOJI AWARE) =================
+# Telegram sends a premium (custom) emoji as: plain emoji character + a
+# `custom_emoji` message entity that carries the emoji id. The old parser only
+# looked at the raw text, so the id was thrown away and the premium emoji was
+# downgraded to a normal emoji. We now read those entities and store the id in
+# buttons_json["icon_id"], which is sent back as `icon_custom_emoji_id`.
+BUTTON_ROW_SEPARATOR = "||"
+EMOJI_KEYS_BY_LEN = sorted(EMOJI_IDS.keys(), key=len, reverse=True)
+
+
+def _utf16_index(text: str) -> List[int]:
+    """python char index -> Telegram utf-16 offset (entities use utf-16 units)."""
+    out: List[int] = []
+    pos = 0
+    for ch in text:
+        out.append(pos)
+        pos += len(ch.encode("utf-16-le")) // 2
+    return out
+
+
+def custom_emoji_spans(text: Optional[str], entities: Optional[List]) -> List[dict]:
+    """Custom-emoji entities as python-index spans: {start, end, emoji_id, char}."""
+    if not text or not entities:
+        return []
+    try:
+        u16 = _utf16_index(text)
+        lookup = {offset: idx for idx, offset in enumerate(u16)}
+        spans: List[dict] = []
+        for entity in entities:
+            if getattr(entity, "type", None) != "custom_emoji":
+                continue
+            emoji_id = getattr(entity, "custom_emoji_id", None)
+            if not emoji_id:
+                continue
+            start = lookup.get(getattr(entity, "offset", -1))
+            if start is None:
+                continue
+            end = lookup.get(getattr(entity, "offset", 0) + getattr(entity, "length", 0), len(text))
+            char = text[start:end]
+            remember_emoji_char(emoji_id, char)
+            spans.append({"start": start, "end": end, "emoji_id": str(emoji_id), "char": char})
+        return spans
+    except Exception as ex:
+        logging.warning(f"custom_emoji_spans failed: {ex}")
+        return []
+
+
+def _split_span(raw: str, start: int) -> Tuple[str, int, int]:
+    """Strip a sub-string but keep its absolute offsets in sync."""
+    stripped = raw.strip()
+    left = len(raw) - len(raw.lstrip())
+    peak = len(raw.rstrip())
+    end = start + max(peak, left)
+    return stripped, start + left, end
+
+
+def _label_to_text_and_icon(label: str, abs_start: int, abs_end: int,
+                            spans: List[dict]) -> Tuple[str, Optional[str], Optional[str]]:
+    """Return (button text, icon_id, icon_char) for one button label.
+
+    * a premium/custom emoji typed in the label wins and becomes the button icon
+    * otherwise the first emoji of our premium set is promoted to the icon
+    * the chosen icon emoji is removed from the visible text (it IS the icon now)
+    """
+    icon_id: Optional[str] = None
+    icon_char: Optional[str] = None
+    cuts: List[Tuple[int, int]] = []
+    for span in spans:
+        if span["start"] >= abs_start and span["end"] <= abs_end:
+            if icon_id is None:
+                icon_id, icon_char = span["emoji_id"], span["char"]
+            cuts.append((span["start"] - abs_start, span["end"] - abs_start))
+    if icon_id is None:
+        for idx in range(len(label)):
+            match = None
+            for key in EMOJI_KEYS_BY_LEN:
+                if label.startswith(key, idx):
+                    match = key
+                    break
+            if match:
+                icon_id, icon_char = EMOJI_IDS[match], match
+                cuts.append((idx, idx + len(match)))
+                break
+    text = label
+    for cut_start, cut_end in sorted(cuts, reverse=True):
+        text = text[:cut_start] + text[cut_end:]
+    return text.strip(), icon_id, icon_char
+
+
+def _link_label(url: str) -> str:
+    try:
+        host = re.sub(r"^[a-z]+://", "", url or "").split("/")[0]
+        return (host.replace("www.", "")[:30] or "Open Link")
+    except Exception:
+        return "Open Link"
+
+
+def parse_button_lines(text: Optional[str], entities: Optional[List] = None) -> List[List[dict]]:
+    """Parse the easy button syntax into rows of button dicts.
+
+        Join Channel|https://t.me/channel              -> 1 button, own row
+        Join|https://t.me/a || Site|https://site.com   -> 2 buttons on one row
+        https://t.me/channel                           -> label = link host
+
+    Premium emoji anywhere in the label is stored as the button's custom-emoji icon
+    (icon_id + icon_char) so it stays premium after sending.
+    """
     if not text:
         return []
-    buttons = []
-    for line in text.strip().split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split(' || ')]
-        row_buttons = []
-        for part in parts:
-            if '|' not in part:
+    spans = custom_emoji_spans(text, entities)
+    rows: List[List[dict]] = []
+    cursor = 0
+    for raw_line in text.split("\n"):
+        line_start = cursor
+        cursor += len(raw_line) + 1  # +1 for the "\n"
+        parts: List[Tuple[str, int, int]] = []
+        search = 0
+        while True:
+            idx = raw_line.find(BUTTON_ROW_SEPARATOR, search)
+            if idx == -1:
+                parts.append((raw_line[search:], line_start + search, line_start + len(raw_line)))
+                break
+            parts.append((raw_line[search:idx], line_start + search, line_start + idx))
+            search = idx + len(BUTTON_ROW_SEPARATOR)
+        row_buttons: List[dict] = []
+        for part, part_start, part_end in parts:
+            part_text, part_start, part_end = _split_span(part, part_start)
+            if not part_text:
                 continue
-            idx = part.index('|')
-            label = part[:idx].strip()
-            url = part[idx + 1:].strip()
-            if label and url:
-                icon_id = None
-                display_label = label
-                for emoji_char, eid in EMOJI_IDS.items():
-                    if label.startswith(emoji_char):
-                        icon_id = eid
-                        display_label = label[len(emoji_char):].strip()
-                        break
-                if not icon_id:
-                    icon_id = EMOJI_IDS.get("🔗", "5042101437237036298")
-                row_buttons.append(InlineKeyboardButton(
-                    display_label or label, url=url,
-                    api_kwargs={"style": "primary", "icon_custom_emoji_id": icon_id}
-                ))
+            sep = part_text.find("|")
+            if sep == -1:
+                if part_text.lower().startswith(("http://", "https://", "tg://")):
+                    label_raw, label_start, label_end, url = "", part_start, part_start, part_text
+                else:
+                    continue
+            else:
+                label_raw, label_start, label_end = _split_span(part_text[:sep], part_start)
+                url = part_text[sep + 1:].strip()
+            if not url:
+                continue
+            label, icon_id, icon_char = _label_to_text_and_icon(label_raw, label_start, label_end, spans)
+            if not label:
+                label = _link_label(url) if not label_raw else (icon_char or "Open Link")
+            item = {"text": label[:64], "icon_id": icon_id, "icon_char": icon_char, "style": "primary"}
+            if url.lower().startswith("cb:"):
+                item["cb"] = url[3:].strip()
+                item["url"] = None
+            else:
+                item["url"] = url
+                item["cb"] = None
+            row_buttons.append(item)
         if row_buttons:
-            buttons.append(row_buttons)
-    return buttons if buttons else []
+            rows.append(row_buttons)
+    return rows
 
 
-def buttons_to_markup(buttons_json: Optional[str]):
+def rows_to_buttons_json(rows: Optional[List[List[dict]]]) -> Optional[str]:
+    cleaned: List[List[dict]] = []
+    for row in rows or []:
+        clean_row: List[dict] = []
+        for b in row or []:
+            if not isinstance(b, dict):
+                continue
+            item = {"text": (b.get("text") or "Button").strip()[:64] or "Button"}
+            if b.get("url"):
+                item["url"] = b["url"]
+            elif b.get("cb") or b.get("callback_data"):
+                item["cb"] = b.get("cb") or b.get("callback_data")
+            else:
+                continue
+            if b.get("icon_id"):
+                item["icon_id"] = str(b["icon_id"])
+            icon_char = b.get("icon_char") or emoji_char_for_id(b.get("icon_id"))
+            if icon_char:
+                item["icon_char"] = icon_char
+            if b.get("style") in STYLE_VALUES:
+                item["style"] = b["style"]
+            clean_row.append(item)
+        if clean_row:
+            cleaned.append(clean_row)
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+
+
+def parse_buttons_json(buttons_json) -> List[List[dict]]:
+    """Tolerant buttons_json -> rows of dicts (always a list)."""
     if not buttons_json:
-        return None
+        return []
+    if isinstance(buttons_json, (list, tuple)):
+        return list(buttons_json)
     try:
         data = json.loads(buttons_json)
-        if not data:
-            return None
-        rows = []
-        for row in data:
-            row_btns = []
-            for btn_data in row:
-                text = btn_data.get('text', '')
-                icon_id = btn_data.get('icon_id') or EMOJI_IDS.get("🔗", "5042101437237036298")
-                if btn_data.get('url'):
-                    row_btns.append(InlineKeyboardButton(
-                        text, url=btn_data['url'],
-                        api_kwargs={"style": "primary", "icon_custom_emoji_id": icon_id}
-                    ))
-                elif btn_data.get('cb'):
-                    row_btns.append(InlineKeyboardButton(text, callback_data=btn_data['cb']))
-                elif btn_data.get('callback_data'):
-                    row_btns.append(InlineKeyboardButton(text, callback_data=btn_data['callback_data']))
-            if row_btns:
-                rows.append(row_btns)
-        return InlineKeyboardMarkup(rows) if rows else None
     except Exception:
-        return None
+        return []
+    return data if isinstance(data, list) else []
 
 
-def buttons_json_from_text(text: str):
-    if not text:
-        return None
-    json_rows = []
-    for line in text.strip().split('\n'):
-        line = line.strip()
-        if not line:
+def rows_from_buttons_json(buttons_json) -> List[List[dict]]:
+    """Normalise stored json into the internal row format used by the button builder."""
+    rows: List[List[dict]] = []
+    for row in parse_buttons_json(buttons_json):
+        if not isinstance(row, list):
             continue
-        parts = [p.strip() for p in line.split(' || ')]
-        json_row = []
-        for part in parts:
-            if '|' not in part:
+        clean_row: List[dict] = []
+        for b in row:
+            if not isinstance(b, dict):
                 continue
-            idx = part.index('|')
-            label = part[:idx].strip()
-            url = part[idx + 1:].strip()
-            if not label or not url:
-                continue
-            icon_id = None
-            display_label = label
-            for emoji_char, eid in EMOJI_IDS.items():
-                if label.startswith(emoji_char):
-                    icon_id = eid
-                    display_label = label[len(emoji_char):].strip()
-                    break
-            if not icon_id:
-                icon_id = EMOJI_IDS.get("🔗", "5042101437237036298")
-            json_row.append({
-                "text": display_label or label,
-                "url": url,
-                "icon_id": icon_id
-            })
-        if json_row:
-            json_rows.append(json_row)
-    return json.dumps(json_rows) if json_rows else None
+            item = {
+                "text": b.get("text") or "Button",
+                "url": b.get("url"),
+                "cb": b.get("cb") or b.get("callback_data"),
+                "icon_id": str(b.get("icon_id")) if b.get("icon_id") else None,
+                "icon_char": b.get("icon_char") or emoji_char_for_id(b.get("icon_id")),
+                "style": b.get("style") if b.get("style") in STYLE_VALUES else "primary",
+            }
+            if item["url"] or item["cb"]:
+                clean_row.append(item)
+        if clean_row:
+            rows.append(clean_row)
+    return rows
 
 
-def add_callback_button_to_json(buttons_json: Optional[str], text: str, cb: str, url: Optional[str] = None) -> str:
-    data = []
-    if buttons_json:
-        try:
-            data = json.loads(buttons_json) or []
-        except Exception:
-            data = []
-    for row in data:
-        for btn_data in row:
-            if (btn_data.get('cb') == cb or btn_data.get('callback_data') == cb or (url and btn_data.get('url') == url)):
-                return json.dumps(data)
-    if url:
-        data.append([{"text": text, "url": url}])
+def markup_from_rows(rows: Optional[List[List[dict]]], use_icons: bool = True):
+    if not rows:
+        return None
+    markup_rows = []
+    for row in rows:
+        btn_row = []
+        for b in row or []:
+            if not isinstance(b, dict):
+                continue
+            text = (b.get("text") or "Button")[:64]
+            icon_id = b.get("icon_id")
+            style = b.get("style") or "primary"
+            if not use_icons:
+                char = b.get("icon_char") or emoji_char_for_id(icon_id)
+                if char and char not in text:
+                    text = f"{char} {text}".strip()
+            if b.get("url"):
+                btn_row.append(build_button(text, url=b["url"], style=style,
+                                            icon_id=icon_id, with_icon=use_icons))
+            elif b.get("cb") or b.get("callback_data"):
+                btn_row.append(build_button(text, callback_data=b.get("cb") or b.get("callback_data"),
+                                            style=style, icon_id=icon_id, with_icon=use_icons))
+        if btn_row:
+            markup_rows.append(btn_row)
+    return InlineKeyboardMarkup(markup_rows) if markup_rows else None
+
+
+def buttons_to_markup(buttons_json, use_icons: bool = True):
+    return markup_from_rows(rows_from_buttons_json(buttons_json) if not isinstance(buttons_json, list)
+                            else buttons_json, use_icons=use_icons)
+
+
+def buttons_to_plain_markup(buttons_json):
+    rows = rows_from_buttons_json(buttons_json) if not isinstance(buttons_json, list) else buttons_json
+    return markup_from_rows(rows, use_icons=False)
+
+
+def button_count(buttons_json) -> int:
+    rows = rows_from_buttons_json(buttons_json) if not isinstance(buttons_json, list) else buttons_json
+    return sum(len(r) for r in rows or [])
+
+
+def buttons_json_from_text(text: Optional[str], entities: Optional[List] = None) -> Optional[str]:
+    return rows_to_buttons_json(parse_button_lines(text, entities))
+
+
+def parse_buttons_text(text: Optional[str], entities: Optional[List] = None):
+    """Legacy helper - returns PTB button rows (kept for compatibility)."""
+    markup = markup_from_rows(parse_button_lines(text, entities))
+    return markup.inline_keyboard if markup else []
+
+
+def add_callback_button_to_json(buttons_json, text: str, cb: str, url: Optional[str] = None) -> str:
+    rows = rows_from_buttons_json(buttons_json)
+    for row in rows:
+        for b in row:
+            if (cb and b.get("cb") == cb) or (url and b.get("url") == url):
+                return rows_to_buttons_json(rows) or "[]"
+    rows.append([{"text": text, "url": url, "cb": None if url else cb,
+                  "icon_id": None, "icon_char": None, "style": "primary"}])
+    return rows_to_buttons_json(rows) or "[]"
+
+
+# ================= EASY BUTTON BUILDER (WIZARD) =================
+# New flow that any user can follow without learning any syntax:
+#   ➕ Add Button  ->  send the button name  ->  send the link  ->
+#   same row / new row?  ->  repeat  ->  ✅ Save
+# The old "Label|link" bulk syntax stays available as "📄 Paste Many".
+BUTTON_WIZARD_KEY = "button_wizard"
+BUTTON_TARGET_KEY = "button_targets"
+BUTTON_TARGET_TTL = 6 * 3600
+
+
+def _target_store(context) -> dict:
+    store = context.user_data.get(BUTTON_TARGET_KEY)
+    if not isinstance(store, dict):
+        store = {}
+        context.user_data[BUTTON_TARGET_KEY] = store
+    now = time.time()
+    for key in [k for k, v in (list(store.items())) if now - v.get("ts", 0) > BUTTON_TARGET_TTL]:
+        store.pop(key, None)
+    return store
+
+
+def register_button_target(context, target: dict) -> str:
+    store = _target_store(context)
+    tid = str(int(time.time() * 1000) % 1000000)
+    while tid in store:
+        tid = str((int(tid) + 1) % 1000000)
+    store[tid] = {"target": target, "ts": time.time()}
+    return tid
+
+
+def get_button_target(context, tid) -> Optional[dict]:
+    if tid is None or tid == "":
+        return None
+    entry = _target_store(context).get(str(tid))
+    if not entry:
+        return None
+    entry["ts"] = time.time()
+    return entry.get("target")
+
+
+def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
+    """One row callers can drop into any keyboard: ➕ Add Button | 📄 Paste Many."""
+    tid = register_button_target(context, target)
+    return [btn("Add Button", f"bwz_start_{tid}", "success", "➕"),
+            btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄")]
+
+
+def _draft_for_target(context, target: dict) -> dict:
+    kind = target.get("kind")
+    if kind == "draft_user":
+        return context.user_data.get(f"broadcast_draft_{target.get('bot_id')}") or {}
+    if kind == "draft_admin":
+        return context.user_data.get("admin_broadcast_draft") or {}
+    return {}
+
+
+def _target_title(target: dict) -> str:
+    kind = target.get("kind")
+    if kind == "message":
+        return "Saved Message"
+    if kind == "messages":
+        return "Saved Album"
+    if kind == "draft_user":
+        return "Broadcast Message"
+    if kind == "draft_admin":
+        return "Admin Broadcast"
+    if kind == "leave_msg":
+        return f"Leave Message #{int(target.get('idx', 0)) + 1}"
+    return "Message"
+
+
+def target_rows(context, target: dict) -> List[List[dict]]:
+    kind = target.get("kind")
+    try:
+        if kind == "message":
+            row = db.get_message_by_id(target.get("msg_id"))
+            return rows_from_buttons_json(row.get("buttons_json") if row else None)
+        if kind == "messages":
+            for mid in target.get("msg_ids") or []:
+                row = db.get_message_by_id(mid)
+                if row and row.get("buttons_json"):
+                    return rows_from_buttons_json(row.get("buttons_json"))
+            return []
+        if kind in ("draft_user", "draft_admin"):
+            return rows_from_buttons_json(_draft_for_target(context, target).get("buttons_json"))
+        if kind == "leave_msg":
+            messages = db.get_leave_recovery_config().get("messages", [])
+            idx = int(target.get("idx", 0))
+            if 0 <= idx < len(messages):
+                return rows_from_buttons_json(messages[idx].get("buttons_json"))
+        return []
+    except Exception as ex:
+        logging.error(f"target_rows failed: {ex}")
+        return []
+
+
+def target_save_rows(context, target: dict, rows) -> bool:
+    payload = rows_to_buttons_json(rows) or "[]"
+    kind = target.get("kind")
+    try:
+        if kind == "message":
+            db.update_message_buttons(target.get("msg_id"), payload)
+            return True
+        if kind == "messages":
+            msg_ids = target.get("msg_ids") or []
+            for mid in msg_ids:
+                db.update_message_buttons(mid, payload)
+            return bool(msg_ids)
+        if kind == "draft_user":
+            draft = dict(_draft_for_target(context, target))
+            draft["buttons_json"] = payload
+            context.user_data[f"broadcast_draft_{target.get('bot_id')}"] = draft
+            return True
+        if kind == "draft_admin":
+            draft = dict(_draft_for_target(context, target))
+            draft["buttons_json"] = payload
+            context.user_data["admin_broadcast_draft"] = draft
+            return True
+        if kind == "leave_msg":
+            cfg = db.get_leave_recovery_config()
+            messages = cfg.get("messages", [])
+            idx = int(target.get("idx", 0))
+            if 0 <= idx < len(messages):
+                messages[idx]["buttons_json"] = payload
+                cfg["messages"] = messages
+                db.set_leave_recovery_config(cfg)
+                return True
+        return False
+    except Exception as ex:
+        logging.error(f"target_save_rows failed: {ex}")
+        return False
+
+
+def target_nav_rows(target: dict) -> List[List[InlineKeyboardButton]]:
+    kind = target.get("kind")
+    if kind == "draft_user":
+        bot_id = target.get("bot_id")
+        return [
+            [btn("Send Broadcast", f"bcast_send_{bot_id}", "success", "🚀")],
+            [btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")],
+        ]
+    if kind == "draft_admin":
+        return [
+            [btn("Send Broadcast", "admin_bcast_send", "success", "🚀")],
+            [btn("Cancel", "admin_panel", "danger", "❌")],
+        ]
+    if kind == "leave_msg":
+        return [[btn("Back", "admin_leave_msgs", "primary", "🔙")]]
+    if target.get("back_cb"):
+        return [[btn(target.get("back_text") or "Back", target["back_cb"], "primary", "🔙")]]
+    return []
+
+
+def _wizard_layout(rows) -> str:
+    if not rows:
+        return "<i>(abhi koi button nahi)</i>"
+    lines = []
+    for i, row in enumerate(rows, 1):
+        parts = []
+        for b in row or []:
+            icon = (b.get("icon_char") or "").strip()
+            label = (b.get("text") or "Button").strip()
+            parts.append(f"[{icon} {label}]" if icon else f"[{label}]")
+        lines.append(f"{i}. " + "  ".join(parts))
+    return "\n".join(lines)
+
+
+def _wizard_state(context) -> Optional[dict]:
+    state = context.user_data.get(BUTTON_WIZARD_KEY)
+    return state if isinstance(state, dict) else None
+
+
+def _wizard_text(state: dict, target: dict) -> str:
+    body = (f"{pe('🔘')} <b>BUTTON BUILDER</b> — {_target_title(target)}\n\n"
+            f"<b>Layout:</b>\n{_wizard_layout(state.get('rows') or [])}\n\n")
+    step = state.get("step")
+    if step == "name":
+        return body + (f"{pe('✏️')} <b>Button ka naam bhejo</b> — jo text button par dikhega.\n\n"
+                       "Premium emoji bhi chalega: <code>💎 Join Now</code> bhejo to 💎 premium icon ban jayega.")
+    if step == "url":
+        name = (state.get("pending") or {}).get("text") or ""
+        return body + (f"<b>Naam:</b> {EmojiManager._html_escape(name)}\n\n"
+                       f"{pe('🔗')} <b>Ab is button ka link bhejo</b>\n"
+                       "Example: <code>https://t.me/yourchannel</code>")
+    if step == "bulk":
+        return body + (f"{pe('📄')} <b>Bulk mode:</b> ek line me ek button bhejo\n\n"
+                       "<code>Join Channel|https://t.me/channel</code>\n"
+                       "<code>Join|https://t.me/a || Site|https://site.com</code>\n\n"
+                       "<i>Do button ek hi line me chahiye to <code>||</code> lagao.</i>")
+    return body + (f"{pe('➕')} <b>Naya button add karo</b> — Same Row = 2 button ek line me, "
+                   "New Row = apni alag line me.")
+
+
+def _wizard_kb(state: dict, target: dict) -> Optional[InlineKeyboardMarkup]:
+    tid = state.get("tid")
+    step = state.get("step")
+    rows = state.get("rows") or []
+    kb: List[List[InlineKeyboardButton]] = []
+    if step in ("name", "url", "bulk"):
+        if rows:
+            kb.append([btn("Save & Done", f"bwz_done_{tid}", "success", "✅")])
+        kb.append([btn("Cancel", f"bwz_cancel_{tid}", "danger", "❌")])
+        return InlineKeyboardMarkup(kb)
+    add_row: List[InlineKeyboardButton] = []
+    if rows and len(rows[-1]) < 2:
+        add_row.append(btn("Add Same Row", f"bwz_same_{tid}", "success", "↔️"))
+    add_row.append(btn("Add New Row", f"bwz_row_{tid}", "success", "➕"))
+    kb.append(add_row)
+    kb.append([btn("Preview", f"bwz_prev_{tid}", "primary", "👀"),
+               btn("Undo Last", f"bwz_undo_{tid}", "danger", "🗑")])
+    kb.append([btn("Save & Done", f"bwz_done_{tid}", "success", "✅")])
+    kb.append([btn("Cancel", f"bwz_cancel_{tid}", "danger", "❌")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def _wizard_render(context, state: dict, target: dict, q=None, note: str = ""):
+    text = _wizard_text(state, target)
+    if note:
+        text = f"{note}\n\n{text}"
+    kb = _wizard_kb(state, target)
+    if q is not None:
+        await safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    chat_id = state.get("chat_id")
+    if chat_id:
+        await send_premium_message(context.bot, chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def label_from_message(msg) -> Tuple[str, Optional[str], Optional[str]]:
+    """Extract a button label (+ premium emoji icon) from a user message."""
+    raw = msg.text or msg.caption or ""
+    if not raw.strip():
+        return "", None, None
+    first_line = raw.split("\n")[0]
+    entities = list(msg.entities or msg.caption_entities or [])
+    spans = custom_emoji_spans(raw, entities)
+    label, icon_id, icon_char = _label_to_text_and_icon(first_line, 0, len(first_line), spans)
+    if not label:
+        label = icon_char or first_line.strip()
+    return label.strip()[:64], icon_id, icon_char
+
+
+async def start_button_wizard(q, context, tid, mode: str = "wizard"):
+    target = get_button_target(context, tid)
+    if not target:
+        await safe_edit_message_text(q, f"{pe('❌')} Ye builder session purana ho gaya. Button dobara kholo.",
+                                     parse_mode=ParseMode.HTML)
+        return
+    rows = target_rows(context, target)
+    if mode == "bulk":
+        step = "bulk"
+    elif rows:
+        step = "next"
     else:
-        data.append([{"text": text, "cb": cb}])
-    return json.dumps(data)
+        step = "name"
+    state = {
+        "tid": str(tid), "rows": rows, "pending": None, "placement": "new", "step": step,
+        "chat_id": (q.message.chat_id if q.message else q.from_user.id), "ts": time.time(),
+    }
+    context.user_data[BUTTON_WIZARD_KEY] = state
+    note = ""
+    if rows:
+        note = f"{pe('👀')} Pehle se {button_count(rows_to_buttons_json(rows))} button hain — aur add kar sakte ho."
+    await _wizard_render(context, state, target, q=q, note=note)
+
+
+async def handle_button_wizard_callback(q, context, data: str) -> bool:
+    """Handles every `bwz_*` callback. Returns True when the update was consumed."""
+    if not data or not data.startswith("bwz_"):
+        return False
+    parts = data.split("_")
+    action = parts[1] if len(parts) > 1 else ""
+    tid = parts[2] if len(parts) > 2 else ""
+    if action in ("start", "bulk"):
+        await start_button_wizard(q, context, tid, mode="bulk" if action == "bulk" else "wizard")
+        return True
+    state = _wizard_state(context)
+    if not state or str(state.get("tid")) != str(tid):
+        await safe_edit_message_text(q, f"{pe('❌')} Ye builder band ho chuka hai. Button dobara kholo.",
+                                     parse_mode=ParseMode.HTML)
+        return True
+    target = get_button_target(context, tid)
+    if not target:
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        await safe_edit_message_text(q, f"{pe('❌')} Target session expire ho gaya.", parse_mode=ParseMode.HTML)
+        return True
+    if action in ("same", "row"):
+        state["step"] = "name"
+        state["placement"] = "same" if action == "same" else "new"
+        await _wizard_render(context, state, target, q=q)
+        return True
+    if action == "undo":
+        rows = state.get("rows") or []
+        if rows:
+            rows[-1].pop()
+            if not rows[-1]:
+                rows.pop()
+        state["rows"] = rows
+        state["step"] = "next"
+        await _wizard_render(context, state, target, q=q, note=f"{pe('🗑')} Last button hata diya.")
+        return True
+    if action == "prev":
+        markup = markup_from_rows(state.get("rows") or [])
+        if markup:
+            try:
+                await send_premium_message(context.bot, state.get("chat_id") or q.from_user.id,
+                                           f"{pe('👀')} <b>Preview</b> — yahi buttons users ko dikhenge:",
+                                           parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception as ex:
+                logging.warning(f"button preview failed: {ex}")
+        else:
+            await send_ephemeral_reply(q.message, f"{pe('❌')} Abhi koi button nahi hai.", 2)
+        return True
+    if action == "done":
+        rows = state.get("rows") or []
+        ok = target_save_rows(context, target, rows)
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        nav = target_nav_rows(target)
+        if not ok:
+            await safe_edit_message_text(q, f"{pe('❌')} Save nahi ho paya. Dobara try karo.",
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=InlineKeyboardMarkup(nav) if nav else None)
+            return True
+        extra: List[List[InlineKeyboardButton]] = []
+        if target.get("kind") in ("message", "messages") and rows:
+            extra.append(button_builder_row(context, target))
+        await safe_edit_message_text(q,
+                                     f"{pe('✅')} <b>Buttons saved!</b> ({button_count(rows_to_buttons_json(rows))})\n\n"
+                                     f"{_wizard_layout(rows)}",
+                                     parse_mode=ParseMode.HTML,
+                                     reply_markup=InlineKeyboardMarkup(extra + nav) if (extra or nav) else None)
+        return True
+    if action == "cancel":
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        nav = target_nav_rows(target)
+        await safe_edit_message_text(q, f"{pe('❌')} Button builder cancelled.", parse_mode=ParseMode.HTML,
+                                     reply_markup=InlineKeyboardMarkup(nav) if nav else None)
+        return True
+    return True
+
+
+async def userbot_wizard_callback(update, context, bot_id: str, owner_id: int):
+    """`bwz_*` callbacks inside a userbot chat - owner/admin only, always answered."""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not is_bot_owner(bot_id, q.from_user.id):
+        return
+    await handle_button_wizard_callback(q, context, q.data)
+
+
+async def handle_button_wizard_message(msg, context) -> bool:
+    """Consume text messages while the easy button builder is active."""
+    state = _wizard_state(context)
+    if not state:
+        return False
+    target = get_button_target(context, state.get("tid"))
+    if not target:
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        return False
+    has_media = any(getattr(msg, attr, None) for attr in
+                    ("photo", "video", "document", "audio", "voice", "video_note", "sticker", "animation"))
+    if has_media:
+        await reply_premium_message(msg, f"{pe('⚠️')} Button builder khula hai — pehle <b>Save & Done</b> "
+                                         f"ya <b>Cancel</b> dabao, phir media bhejo.",
+                                    parse_mode=ParseMode.HTML)
+        return True
+    if not (msg.text or msg.caption):
+        await reply_premium_message(msg, f"{pe('⚠️')} Text bhejo — button ka naam ya link.",
+                                    parse_mode=ParseMode.HTML)
+        return True
+    state["chat_id"] = msg.chat_id
+    step = state.get("step")
+    if step == "name":
+        label, icon_id, icon_char = label_from_message(msg)
+        if not label:
+            await reply_premium_message(msg, f"{pe('⚠️')} Button ka naam khali hai, dobara bhejo.",
+                                        parse_mode=ParseMode.HTML)
+            return True
+        state["pending"] = {"text": label, "icon_id": icon_id, "icon_char": icon_char,
+                            "url": None, "cb": None, "style": "primary"}
+        state["step"] = "url"
+        await _wizard_render(context, state, target)
+        return True
+    if step == "url":
+        url = (msg.text or msg.caption or "").strip().split("\n")[0].strip()
+        is_cb = url.lower().startswith("cb:")
+        if not is_cb and not url.lower().startswith(("http://", "https://", "tg://")):
+            await reply_premium_message(msg, f"{pe('⚠️')} Ye link valid nahi lag raha.\n\n"
+                                             "<code>https://t.me/yourchannel</code> jaisa link bhejo.",
+                                        parse_mode=ParseMode.HTML)
+            return True
+        pending = dict(state.get("pending") or {})
+        pending["url"] = None if is_cb else url
+        pending["cb"] = url[3:].strip() if is_cb else None
+        rows = state.get("rows") or []
+        if state.get("placement") == "same" and rows and len(rows[-1]) < 8:
+            rows[-1].append(pending)
+        else:
+            rows.append([pending])
+        state["rows"] = rows
+        state["pending"] = None
+        state["step"] = "next"
+        await _wizard_render(context, state, target,
+                            note=f"{pe('✅')} <b>{EmojiManager._html_escape(pending.get('text') or '')}</b> add ho gaya!")
+        return True
+    if step == "bulk":
+        new_rows = parse_button_lines(msg.text or msg.caption or "", msg.entities or msg.caption_entities)
+        if not new_rows:
+            await reply_premium_message(msg, f"{pe('❌')} Kuch samajh nahi aaya.\n\n"
+                                             "Ek line me ek button:\n<code>Join|https://t.me/channel</code>\n"
+                                             "<code>A|https://a.com || B|https://b.com</code>",
+                                        parse_mode=ParseMode.HTML)
+            return True
+        rows = state.get("rows") or []
+        rows.extend(new_rows)
+        state["rows"] = rows
+        state["step"] = "next"
+        await _wizard_render(context, state, target,
+                            note=f"{pe('✅')} {sum(len(r) for r in new_rows)} button add ho gaye!")
+        return True
+    if step == "next":
+        state["step"] = "name"
+        state["placement"] = "new"
+        await _wizard_render(context, state, target,
+                            note=f"{pe('➕')} Naya button — pehle naam bhejo:")
+        return True
+    return False
 
 
 async def send_ephemeral_reply(msg, text: str, seconds: int = 2):
@@ -1395,75 +2599,395 @@ async def send_ephemeral_reply(msg, text: str, seconds: int = 2):
         pass
 
 
+def _resolve_bot(bot_or_context):
+    """Accept a Bot/ExtBot or any context that carries one (context.bot)."""
+    if bot_or_context is None:
+        return None
+    if hasattr(bot_or_context, "send_message") and hasattr(bot_or_context, "send_photo"):
+        return bot_or_context
+    return getattr(bot_or_context, "bot", bot_or_context)
+
+
 @retry_async(max_retries=2, delay=0.5, backoff=1.5)
 async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
                      text: str = "", markup=None, emoji_map: dict = None,
                      entities_json: Optional[str] = None, file_name: Optional[str] = None,
-                     mime_type: Optional[str] = None):
-    bot = bot_or_context if isinstance(bot_or_context, Bot) else bot_or_context.bot
+                     mime_type: Optional[str] = None, raise_on_failure: bool = False):
+    bot = _resolve_bot(bot_or_context)
     kwargs = {}
     if markup:
         kwargs["reply_markup"] = markup
-    if text:
-        display_text = MessageManager.prepare_for_sending(text, entities_json, emoji_map)
-    else:
-        display_text = None
-    async def _do_send(send_kwargs):
+    display_text = MessageManager.prepare_for_sending(text, entities_json, emoji_map) if text else None
+
+    async def _do_send(send_kwargs, caption_override=None):
+        caption = caption_override if caption_override is not None else display_text
+        parse_mode = ParseMode.HTML if caption else None
         if media_type == "photo":
-            await bot.send_photo(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_photo(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "video":
-            await bot.send_video(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_video(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "document":
             doc_kwargs = dict(send_kwargs)
             if file_name:
                 doc_kwargs["filename"] = file_name
-            await bot.send_document(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **doc_kwargs)
+            await bot.send_document(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **doc_kwargs)
         elif media_type == "animation":
-            await bot.send_animation(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_animation(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "audio":
-            await bot.send_audio(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_audio(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "voice":
-            await bot.send_voice(chat_id, media_id, caption=display_text or None, parse_mode=ParseMode.HTML if display_text else None, **send_kwargs)
+            await bot.send_voice(chat_id, media_id, caption=caption or None, parse_mode=parse_mode, **send_kwargs)
         elif media_type == "video_note":
             await bot.send_video_note(chat_id, media_id, **send_kwargs)
         elif media_type == "sticker":
             await bot.send_sticker(chat_id, media_id, **send_kwargs)
         else:
-            if display_text:
-                await send_user_message(bot, chat_id, display_text, parse_mode=ParseMode.HTML, **send_kwargs)
+            if caption:
+                await send_user_message(bot, chat_id, caption, parse_mode=ParseMode.HTML, **send_kwargs)
 
     try:
         await _do_send(kwargs)
+        return True
     except Forbidden:
-        logging.warning(f"Cannot send media to {chat_id}: bot blocked")
+        # Blocked / can't initiate: chup-chaap swallow karne se broadcast "sent" count
+        # karta tha aur user DB me reachable hi rehta tha. Ab caller (broadcast) decide
+        # karta hai: unreachable mark karo.
+        raise
     except BadRequest as ex:
-        # Try again with button icons stripped first - a single bad custom-emoji
-        # icon on a button shouldn't cost the whole media delivery.
-        logging.warning(f"send_media BadRequest for {chat_id} ({media_type}): {ex}; retrying with plain buttons")
+        if is_user_gone_error(ex):
+            # "Chat not found" / deactivated / can't initiate: retry karna bekaar hai
+            raise
+        media_problem = is_media_error(ex)
+        # 1st retry: strip button icons + premium emoji from the caption. A single bad
+        # custom-emoji document must never cost the whole media delivery.
+        log = logging.debug if media_problem else logging.warning
+        log(f"send_media BadRequest for {chat_id} ({media_type}): {ex}; retrying plainly")
         degraded_kwargs = dict(kwargs)
         if "reply_markup" in degraded_kwargs:
             degraded_kwargs["reply_markup"] = _degrade_markup(degraded_kwargs["reply_markup"])
+        plain_caption = strip_premium_emojis(display_text) if display_text else None
+        delivered = False
         try:
-            await _do_send(degraded_kwargs)
+            await _do_send(degraded_kwargs, caption_override=plain_caption)
+            delivered = True
         except Exception as ex2:
-            logging.error(f"send_media plain-button retry also failed for {chat_id} ({media_type}): {ex2}")
+            log = logging.debug if (media_problem or is_media_error(ex2)) else logging.error
+            log(f"send_media plain retry also failed for {chat_id} ({media_type}): {ex2}")
+            # 2nd retry: text only (so the user at least receives the caption + buttons)
             try:
-                plain_text = (text or "").strip()
-                if plain_text:
-                    await send_user_message(bot, chat_id, plain_text, **degraded_kwargs)
+                if plain_caption:
+                    await send_user_message(bot, chat_id, plain_caption,
+                                            parse_mode=ParseMode.HTML, **degraded_kwargs)
+                    delivered = True
             except Exception:
                 pass
+        if delivered and media_problem:
+            # media nahi gayi par caption + buttons pahunch gaye (broadcast ise count karta hai).
+            # Har user ke liye alag line na chhape - pehle 3 WARNING, uske baad DEBUG.
+            key = (str(media_type), mask_secrets(ex)[:60])
+            seen = _MEDIA_ISSUE_SEEN.get(key, 0)
+            _MEDIA_ISSUE_SEEN[key] = seen + 1
+            log = logging.warning if seen < 3 else logging.debug
+            log(f"media deliver nahi hui ({chat_id}, {media_type}) - caption + buttons text ke "
+                f"roop me bheje: {mask_secrets(ex)}")
+            return "degraded"
+        if not delivered and raise_on_failure:
+            raise
+        return delivered
     except (NetworkError, TimedOut) as ex:
         logging.warning(f"Network error sending to {chat_id}: {ex}")
         raise
     except Exception as ex:
         logging.error(f"send_media failed: {ex}")
+        delivered = False
         try:
-            plain_text = (text or "").strip()
+            plain_text = strip_premium_emojis(display_text) if display_text else (text or "").strip()
             if plain_text:
-                await send_user_message(bot, chat_id, plain_text, **kwargs)
+                await send_user_message(bot, chat_id, plain_text,
+                                        parse_mode=ParseMode.HTML, **kwargs)
+                delivered = True
         except Exception:
             pass
+        if not delivered and raise_on_failure:
+            raise
+        return delivered
+
+
+# ================= ALBUM / BROADCAST DRAFT SENDING =================
+ALBUM_MEDIA_TYPES = ("photo", "video", "document", "audio")
+
+# User-level permanent failures: is user ko dobara try karne ka koi fayda nahi
+USER_GONE_MARKERS = (
+    "chat not found", "user not found", "user is deactivated", "user is deleted",
+    "bot was blocked", "blocked by the user", "bot can't initiate conversation",
+    "cant initiate conversation", "can't initiate conversation", "peer_id_invalid",
+    "bot was kicked", "bot is not a member",
+)
+# Media-level failures: user theek hai, sirf media reference galat hai
+MEDIA_ERROR_MARKERS = (
+    "wrong file identifier", "http url specified", "document_invalid", "media invalid",
+    "media_empty", "photo_invalid", "video_invalid", "audio_invalid", "file is too big",
+    "file too large", "file is too big", "image_process_failed",
+)
+
+
+def is_user_gone_error(ex) -> bool:
+    text = str(ex).lower()
+    return any(m in text for m in USER_GONE_MARKERS)
+
+
+def is_media_error(ex) -> bool:
+    text = str(ex).lower()
+    return any(m in text for m in MEDIA_ERROR_MARKERS)
+
+
+_MEDIA_REF_CACHE: Dict[tuple, str] = {}
+MEDIA_URL_TEMPLATE = "https://api.telegram.org/file/bot{token}/{path}"
+# ek hi media problem ke pehle 3 users WARNING par, baaki DEBUG (log spam na ho)
+_MEDIA_ISSUE_SEEN: Dict[tuple, int] = {}
+
+
+async def sendable_media_id(dest_bot, media_id, source_bot):
+    """file_id sirf usi bot ke liye valid hota hai jisne file receive ki thi.
+
+    Admin broadcast me media MAIN bot ne receive ki hoti hai aur bhejna kisi userbot se
+    hota hai -> Telegram "wrong file identifier/http url specified" deta hai (server
+    logs me yehi error dikh raha tha). Aise case me source bot ke get_file se ek file URL
+    banate hain jo destination bot khud download kar leta hai.
+    """
+    if not media_id or not source_bot or dest_bot is source_bot:
+        return media_id
+    if not isinstance(media_id, str) or media_id.startswith("http"):
+        return media_id
+    cache_key = (getattr(dest_bot, "token", "") or "", media_id)
+    if cache_key in _MEDIA_REF_CACHE:
+        return _MEDIA_REF_CACHE[cache_key]
+    resolved = media_id
+    try:
+        remote = await source_bot.get_file(media_id)
+        path = getattr(remote, "file_path", None)
+        token = getattr(source_bot, "token", "")
+        if path and token:
+            resolved = MEDIA_URL_TEMPLATE.format(token=token, path=path)
+            logging.info(f"media cross-bot translate ho gayi ({len(resolved)} char url)")
+    except Exception as ex:
+        logging.warning(f"media ko dusre bot ke liye translate nahi kar paye: {mask_secrets(ex)}")
+    _MEDIA_REF_CACHE[cache_key] = resolved
+    if len(_MEDIA_REF_CACHE) > 5000:
+        _MEDIA_REF_CACHE.clear()
+    return resolved
+
+
+async def translate_draft_for_bot(draft: Optional[dict], dest_bot, source_bot) -> dict:
+    """Draft ki copy jo `dest_bot` actually bhej sakta hai (cross-bot media fix)."""
+    draft = dict(draft or {})
+    if not source_bot or dest_bot is source_bot:
+        return draft
+    album = draft.get("album")
+    if isinstance(album, list) and album:
+        new_album = []
+        for it in album:
+            if isinstance(it, dict) and it.get("media"):
+                it = dict(it)
+                it["media"] = await sendable_media_id(dest_bot, it.get("media"), source_bot)
+            new_album.append(it)
+        draft["album"] = new_album
+    if draft.get("media"):
+        draft["media"] = await sendable_media_id(dest_bot, draft.get("media"), source_bot)
+    return draft
+
+
+def draft_items(draft: Optional[dict]) -> List[dict]:
+    """Flatten a broadcast/album draft into an ordered list of media items."""
+    draft = draft or {}
+    album = draft.get("album")
+    items: List[dict] = []
+    if isinstance(album, list) and album:
+        for it in album:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "media": it.get("media") or it.get("media_id"),
+                "media_type": it.get("media_type") or "text",
+                "text": it.get("text") or "",
+                "entities_json": it.get("entities_json"),
+                "file_name": it.get("file_name"),
+                "mime_type": it.get("mime_type"),
+            })
+        if items and not items[0]["text"] and draft.get("text"):
+            items[0]["text"] = draft.get("text")
+            items[0]["entities_json"] = draft.get("entities_json")
+        if items:
+            return items
+    return [{
+        "media": draft.get("media") or draft.get("media_id"),
+        "media_type": draft.get("media_type") or "text",
+        "text": draft.get("text") or "",
+        "entities_json": draft.get("entities_json"),
+        "file_name": draft.get("file_name"),
+        "mime_type": draft.get("mime_type"),
+    }]
+
+
+def make_media_item(extracted: dict) -> dict:
+    """One album/broadcast item from a MessageManager.extract_from_message() result."""
+    return {
+        "media": extracted.get("media_id"),
+        "media_type": extracted.get("media_type"),
+        "text": extracted.get("text") or "",
+        "entities_json": extracted.get("entities_json"),
+        "file_name": extracted.get("file_name"),
+        "mime_type": extracted.get("mime_type"),
+        "telegram_message_id": extracted.get("telegram_message_id"),
+    }
+
+
+async def send_buttons_after_album(bot, chat_id, text: str, markup):
+    """Telegram does not allow reply_markup on an album, so the buttons go into a
+    small follow-up message (this is how buttons on media groups work)."""
+    body = text or f"{pe('🔗')} <b>Links</b>"
+    try:
+        await send_user_message(bot, chat_id, body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return True
+    except Forbidden:
+        raise           # blocked user -> broadcast ise unreachable mark karega
+    except Exception as ex:
+        logging.error(f"album buttons message failed for {chat_id}: {ex}")
+        return False
+
+
+def album_caption_index(items: List[dict]) -> int:
+    """Album ka main caption = pehla item jiske paas text hai (-1 agar koi nahi)."""
+    for idx, it in enumerate(items or []):
+        if it.get("media") and it.get("media_type") in ALBUM_MEDIA_TYPES and (it.get("text") or "").strip():
+            return idx
+    return -1
+
+
+async def send_album(bot, chat_id, items: List[dict], markup=None, button_text: str = "",
+                     move_caption: bool = False) -> bool:
+    """Send 2..10 media items as one album, then the buttons (album + caption+buttons).
+
+    Telegram **album (media group) par inline buttons support nahi karta**
+    (send_media_group me reply_markup parameter hi nahi hai). Isliye buttons ek chhote
+    follow-up message me jate hain. `move_caption=True` hone par album ka main caption
+    bhi usi message me chala jata hai - users ko album ke turant neeche EK message
+    dikhta hai jisme text + buttons dono hote hain (orphan "Links" bubble nahi).
+    """
+    moved_caption = ""
+    skip_caption = -1
+    if move_caption and markup:
+        skip_caption = album_caption_index(items)
+        if skip_caption >= 0:
+            moved_caption = MessageManager.prepare_for_sending(items[skip_caption].get("text") or "",
+                                                               items[skip_caption].get("entities_json"))
+    group = []
+    for idx, it in enumerate(items):
+        media_id = it.get("media")
+        media_type = it.get("media_type")
+        if not media_id or media_type not in ALBUM_MEDIA_TYPES:
+            continue
+        if idx == skip_caption:
+            caption = None
+        else:
+            caption = MessageManager.prepare_for_sending(it.get("text") or "", it.get("entities_json")) if it.get("text") else None
+        media_kwargs = {"caption": caption, "parse_mode": ParseMode.HTML if caption else None}
+        if media_type == "photo":
+            group.append(InputMediaPhoto(media=media_id, **media_kwargs))
+        elif media_type == "video":
+            group.append(InputMediaVideo(media=media_id, **media_kwargs))
+        elif media_type == "document":
+            group.append(InputMediaDocument(media=media_id, **media_kwargs))
+        else:
+            group.append(InputMediaAudio(media=media_id, **media_kwargs))
+        if len(group) >= 10:
+            break
+    if len(group) < 2:
+        return False
+    try:
+        await bot.send_media_group(chat_id=chat_id, media=group)
+    except Forbidden:
+        # User ne bot block kiya / chat initiate nahi ho sakti -> items ek-ek karke
+        # bhejne ka koi fayda nahi (pehle ye album ke har item par retry karta tha,
+        # isi se "Cannot send media to X: bot blocked" 5-5 baar log hota tha).
+        raise
+    except BadRequest as ex:
+        # Permanent (jaise MEDIA_GROUPED_INVALID / media invalid) -> caller per-item
+        # fallback karega. NOTE: BadRequest NetworkError ka subclass hai, isliye ye
+        # check pehle hona zaroori hai warna neeche wala raise ise bhi le jayega.
+        logging.warning(f"send_media_group failed for {chat_id}: {ex}; sending items separately")
+        return False
+    except (NetworkError, TimedOut):
+        raise
+    except Exception as ex:
+        logging.warning(f"send_media_group failed for {chat_id}: {mask_secrets(ex)}; sending items separately")
+        return False
+    if markup:
+        await send_buttons_after_album(bot, chat_id, moved_caption or button_text, markup)
+    return True
+
+
+async def send_draft_message(bot_or_context, chat_id, draft: Optional[dict], markup=None,
+                             with_buttons: bool = True, button_text: str = "",
+                             move_caption: Optional[bool] = None, source_bot=None) -> bool:
+    """Send a broadcast draft: single media/text, or the whole album + buttons.
+
+    This is what makes grouped media (4-5 photos/videos with a caption) work in the
+    broadcast flows - previously only the first item of the album was ever sent.
+
+    Albums can't carry inline buttons (Telegram limit), so for an album the buttons
+    travel in a small follow-up message right below the album. By default the caption
+    stays ON the album; draft["caption_with_buttons"] = True karne par caption buttons
+    wale message me chala jata hai (dono ek saath).
+    """
+    bot = _resolve_bot(bot_or_context)
+    draft = draft or {}
+    if source_bot is not None and source_bot is not bot:
+        # Draft kisi dusre bot ne receive kiya tha -> media refs translate karo
+        draft = await translate_draft_for_bot(draft, bot, source_bot)
+    items = draft_items(draft)
+    if move_caption is None:
+        move_caption = bool(draft.get("caption_with_buttons", False))
+    usable = [it for it in items if it.get("media") and it.get("media_type") in ALBUM_MEDIA_TYPES]
+    if len(usable) >= 2:
+        sent = await send_album(bot, chat_id, items, markup=markup if with_buttons else None,
+                                button_text=button_text, move_caption=bool(move_caption and with_buttons))
+        if sent:
+            return True
+        # Album fail ho gaya -> items alag-alag bhejo. Buttons us aakhri media message
+        # par hi attach hote hain (album na hone par media message par markup allowed hai),
+        # aur moved caption bhi wahin jata hai.
+        cap_idx = album_caption_index(items) if move_caption else -1
+        cap_item = items[cap_idx] if 0 <= cap_idx < len(items) else None
+        moved = MessageManager.prepare_for_sending(cap_item.get("text") or "",
+                                                   cap_item.get("entities_json")) if cap_item else ""
+        degraded = False
+        for k, it in enumerate(usable):
+            last = k == len(usable) - 1
+            skip = it is cap_item
+            text = it.get("text") or ""
+            entities = it.get("entities_json")
+            if skip:
+                text, entities = "", None
+            if last and cap_item is not None and not skip:
+                text, entities = moved, cap_item.get("entities_json")
+            status = await send_media(bot, chat_id, it.get("media"), it.get("media_type") or "text",
+                                      text or "", markup if (last and with_buttons) else None,
+                                      entities_json=entities,
+                                      file_name=it.get("file_name"), mime_type=it.get("mime_type"),
+                                      raise_on_failure=True)
+            degraded = degraded or status == "degraded"
+        if degraded:
+            return "degraded"
+        if not usable and with_buttons and markup:
+            await send_buttons_after_album(bot, chat_id, button_text, markup)
+        return True
+    item = usable[0] if usable else (items[0] if items else {})
+    return await send_media(bot, chat_id, item.get("media"), item.get("media_type") or "text",
+                            item.get("text") or "", markup if with_buttons else None,
+                            entities_json=item.get("entities_json"),
+                            file_name=item.get("file_name"), mime_type=item.get("mime_type"),
+                            raise_on_failure=True)
 
 
 # ================= SAFE COPY MESSAGE =================
@@ -1517,6 +3041,37 @@ async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[
                     btn("Renew Now", f"https://t.me/{ADMIN_USERNAME.lstrip('@')}", "danger", "💰")
                 ]]))
+
+
+async def retry_inactive_userbots_job(context: ContextTypes.DEFAULT_TYPE):
+    """Har 10 min: jo userbot network hiccup ki wajah se start nahi ho paya use dobara
+    chalu karo (pehle wo agle manual restart tak band pada rehta tha)."""
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        return
+    attempted = 0
+    started = 0
+    for bot in bots:
+        bot_id = bot["bot_id"]
+        if is_account_running(bot_id):
+            continue
+        if not bot.get("bot_token"):
+            continue  # bina token wali purani rows skip (user-account system hata diya)
+        try:
+            has_sub = bool(db.get_active_subscription(bot_id))
+        except Exception:
+            has_sub = False
+        if not has_sub:
+            continue
+        attempted += 1
+        if await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0, quiet=True):
+            started += 1
+            try:
+                db.set_user_bot_active(bot_id, True)
+            except Exception:
+                pass
+    if attempted:
+        logging.info(f"userbot retry job: {started}/{attempted} inactive userbot start ho gaye")
 
 
 async def subscription_reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1574,7 +3129,7 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
         mime_type = row.get("mime_type")
 
         if media_group_id:
-            group_items = []
+            raw_items = []          # har media ka raw data (caption baad me decide hota hai)
             group_buttons_json = None
             group_caption_text = None
             j = i
@@ -1588,23 +3143,40 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                 if not group_caption_text and g_text:
                     group_caption_text = g_text
                 if g_media_id and g_media_type in ("photo", "video", "document", "audio"):
-                    display_text = MessageManager.prepare_for_sending(g_text, g.get("entities_json")) if g_text else None
-                    pm = ParseMode.HTML if display_text else None
-                    if g_media_type == "photo":
-                        group_items.append(InputMediaPhoto(media=g_media_id, caption=display_text or None, parse_mode=pm))
-                    elif g_media_type == "video":
-                        group_items.append(InputMediaVideo(media=g_media_id, caption=display_text or None, parse_mode=pm))
-                    elif g_media_type == "document":
-                        group_items.append(InputMediaDocument(media=g_media_id, caption=display_text or None, parse_mode=pm))
+                    raw_items.append({"media_id": g_media_id, "media_type": g_media_type,
+                                      "text": g_text, "entities_json": g.get("entities_json"),
+                                      "display": MessageManager.prepare_for_sending(g_text, g.get("entities_json")) if g_text else ""})
                 j += 1
-            if group_items:
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=group_items)
-                except BadRequest as ex:
-                    logging.error(f"send_media_group failed for {chat_id}: {ex}")
+            if raw_items:
                 group_markup = buttons_to_markup(group_buttons_json)
-                if group_markup:
-                    await send_user_message(context.bot, chat_id, group_caption_text or "Open links:", parse_mode=ParseMode.HTML, reply_markup=group_markup)
+                # Telegram album (media group) par inline buttons attach nahi hote, isliye:
+                # caption album par hi rehta hai aur buttons album ke turant neeche ek chhote
+                # follow-up message me jate hain.
+                group_items = []
+                for k, item in enumerate(raw_items):
+                    kwargs = {}
+                    if item["display"]:
+                        kwargs = {"caption": item["display"], "parse_mode": ParseMode.HTML}
+                    cls = {"photo": InputMediaPhoto, "video": InputMediaVideo,
+                           "document": InputMediaDocument, "audio": InputMediaAudio}[item["media_type"]]
+                    group_items.append(cls(media=item["media_id"], **kwargs))
+                try:
+                    await _resolve_bot(context).send_media_group(chat_id=chat_id, media=group_items)
+                except BadRequest as ex:
+                    # Album fail -> items alag-alag bhejo; buttons aakhri media message par
+                    # attach ho jate hain (tab wo album nahi, normal media message hai).
+                    logging.error(f"send_media_group failed for {chat_id}: {ex}; sending items separately")
+                    for k, item in enumerate(raw_items):
+                        try:
+                            last = k == len(raw_items) - 1
+                            await send_media(context, chat_id, item["media_id"], item["media_type"],
+                                             item["display"] or "", group_markup if last else None,
+                                             entities_json=None)
+                        except Exception as inner_ex:
+                            logging.error(f"album item fallback failed for {chat_id}: {inner_ex}")
+                else:
+                    if group_markup:
+                        await send_buttons_after_album(_resolve_bot(context), chat_id, "", group_markup)
             i = j
             continue
 
@@ -1636,16 +3208,52 @@ async def send_saved_welcome(bot_id: str, chat_id: int, context: ContextTypes.DE
         logging.error(f"send_saved_welcome error: {ex}")
 
 
+class _UserDataContext:
+    """Context proxy: sab kuch real context se, sirf user_data replace.
+
+    PTB me JobQueue callback ko `CallbackContext.from_job()` wala context deta hai
+    aur usme `user_data` **None** hota hai (job me user_id set nahi hota). Isi wajah
+    se album flush job me `context.user_data.pop(...)` crash ho jata tha
+    ("'NoneType' object has no attribute 'pop'") aur broadcast album save hi nahi hota.
+    Ab schedule karte waqt asli user_data dict job ke data me jaata hai."""
+
+    __slots__ = ("_wrapped", "_user_data")
+
+    def __init__(self, context, user_data: dict):
+        object.__setattr__(self, "_wrapped", context)
+        object.__setattr__(self, "_user_data", user_data)
+
+    @property
+    def user_data(self) -> dict:
+        return object.__getattribute__(self, "_user_data")
+
+    def __getattr__(self, item):
+        return getattr(object.__getattribute__(self, "_wrapped"), item)
+
+
+def _context_with_user_data(context, user_data):
+    """Job context (user_data None) ko live user_data ke saath usable banao."""
+    if isinstance(user_data, dict) and getattr(context, "user_data", None) is not user_data:
+        return _UserDataContext(context, user_data)
+    return context
+
+
 def _runtime_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict:
-    if key not in context.user_data:
-        context.user_data[key] = {}
-    return context.user_data[key]
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        # Never crash on a context without user_data (job contexts). Callers that can
+        # only work with real storage get an empty dict and simply skip the work.
+        logging.error("_runtime_store: is context me user_data available nahi hai")
+        return {}
+    if key not in user_data:
+        user_data[key] = {}
+    return user_data[key]
 
 
 async def sync_pending_join_requests_for_channel(bot_id: str, channel_id: int, bot):
     try:
         if not hasattr(bot, 'get_chat_join_requests'):
-            logging.info(f"get_chat_join_requests not available in this PTB version. Skipping sync.")
+            logging.info("get_chat_join_requests not available in this PTB version. Skipping sync.")
             return
         count = 0
         async for jr in bot.get_chat_join_requests(channel_id):
@@ -1668,11 +3276,12 @@ async def user_bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot
     # subscriber welcome flow instead of getting their bot management panel.
     # is_bot_owner() correctly covers "is admin OR is the owner of this bot_id".
     if is_bot_owner(bot_id, user.id):
-        bot_data = db.get_user_bot(bot_id)
-        bot_username = bot_data.get("bot_username") if bot_data else None
-        title = f"@{bot_username}" if bot_username else bot_id
+        bot_data = db.get_user_bot(bot_id) or {}
+        _icon = "🤖"
+        title = account_display_name(bot_data, bot_id)
         await send_premium_message(context.bot, user.id,
-            f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>\n\nBot: {title}\nBot ID: {bot_id}",
+            f"<blockquote>{pp(_icon)} <b>MANAGE BOT</b></blockquote>\n\n"
+            f"{_icon} {title}\nID: <code>{bot_id}</code>",
             parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, user.id))
         return
     start_param = context.args[0] if context.args else ""
@@ -1712,6 +3321,11 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML)
         return
 
+    # Easy button builder (➕ Add Button wizard)
+    if data and data.startswith("bwz_"):
+        await handle_button_wizard_callback(q, context, data)
+        return
+
     if data == "main_menu":
         user = q.from_user
         await safe_edit_message_text(q, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML,
@@ -1719,6 +3333,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     if data == f"back_to_manage_{bot_id}" or data == f"manage_bot_{bot_id}":
+        # leaving the panel drops any half-finished broadcast draft / button builder
+        for stale_key in (f"broadcast_stage_{bot_id}", f"broadcast_draft_{bot_id}", BUTTON_WIZARD_KEY):
+            context.user_data.pop(stale_key, None)
         await safe_edit_message_text(q, f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>", parse_mode=ParseMode.HTML,
             reply_markup=bot_management_kb(bot_id, uid))
         return
@@ -1767,7 +3384,9 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await safe_edit_message_text(q,
             f"<blockquote>{pp('📝')} <b>SET MESSAGES</b></blockquote>\n\n"
             "Send messages one by one.\n\n"
-            "Supported: text, photo, video, document, audio, sticker, media albums\n\n"
+            "Supported: text, photo, video, document, audio, sticker, media albums (4-5 media + caption)\n\n"
+            f"{pp('🔘')} Har message ke baad <b>Add Button</b> se buttons bana sakte ho "
+            "(naam bhejo → link bhejo → same row / new row).\n\n"
             "Placeholders: <code>{{first_name}}</code> <code>{{username}}</code> <code>{{user_id}}</code>\n\n"
             "Type <b>done</b> when finished.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")]]))
@@ -1847,15 +3466,34 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if data == f"ub_broadcast_{bot_id}":
         context.user_data[f"broadcast_stage_{bot_id}"] = "await_message"
         await safe_edit_message_text(q,
-            f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\nSend message to broadcast to all your users:",
+            f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\n"
+            "Jo message bhejna hai wo bhejo — text, photo, video, document ya poora "
+            "album (4-5 photo/video ek saath + caption).\n\n"
+            f"{pe('🔘')} Buttons add karne ka option uske baad milega.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")]]))
         return
 
     if data == f"bcast_add_btns_{bot_id}":
-        context.user_data[f"broadcast_stage_{bot_id}"] = "await_buttons"
-        await safe_edit_message_text(q,
-            f"{pe('🔘')} Send inline buttons (Text|https://link per line):",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+        if not context.user_data.get(f"broadcast_draft_{bot_id}"):
+            await safe_edit_message_text(q, f"{pe('❌')} Pehle broadcast message bhejo.", parse_mode=ParseMode.HTML,
+                                         reply_markup=bot_management_kb(bot_id, uid))
+            return
+        tid = register_button_target(context, user_broadcast_target(bot_id, uid))
+        await start_button_wizard(q, context, tid)
+        return
+
+    if data == f"bcast_capmode_{bot_id}":
+        draft = get_broadcast_draft(context, "user", bot_id)
+        if not draft:
+            await q.answer("Pehle album/message bhejo", show_alert=True)
+            return
+        draft["caption_with_buttons"] = not draft.get("caption_with_buttons", False)
+        save_broadcast_draft(context, "user", bot_id, draft)
+        await q.answer("Caption ab " + ("buttons ke saath (album ke neeche ek message me)" if draft["caption_with_buttons"] else "album par hi rahega"))
+        try:
+            await q.edit_message_reply_markup(reply_markup=user_broadcast_ready_kb(context, bot_id, uid))
+        except Exception as ex:
+            logging.warning(f"caption mode kb update failed: {ex}")
         return
 
     if data == f"bcast_send_{bot_id}":
@@ -1931,11 +3569,18 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         msg_id = _extract_last_id(parts)
         ud = _runtime_store(context, f"{uid}_{bot_id}")
         ud["editing_buttons_msg_id"] = msg_id
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, {"kind": "message", "msg_id": msg_id,
+                                         "back_cb": f"ubmm_{bot_id}_{msg_id}"}),
+            [btn("Cancel", f"ubmm_{bot_id}_{msg_id}", "danger", "❌")],
+        ])
         await safe_edit_message_text(q,
-            f"{pe('🔘')} <b>Send Inline Buttons</b>\n\n"
-            "• 1 button per row:\n  <code>Button Label|https://link</code>\n\n"
-            "• 2 buttons per row:\n  <code>Label One|https://link1 || Label Two|https://link2</code>",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Cancel", f"ub_manage_messages_{bot_id}", "danger", "❌")]]))
+            f"{pe('🔘')} <b>Edit Inline Buttons</b>\n\n"
+            "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
+            "<b>Paste Many</b> = purana format\n"
+            "<code>Button Label|https://link</code>\n"
+            "<code>Label One|https://link1 || Label Two|https://link2</code>",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if data.startswith(f"delmsg_{bot_id}_"):
@@ -1973,30 +3618,61 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if data.startswith(f"setbtn_addmore_{bot_id}_"):
         parts = data.split("_")
         msg_id = _extract_last_id(parts)
-        ud = _runtime_store(context, f"{uid}_{bot_id}")
-        ud["waiting_buttons"] = {"msg_id": msg_id, "append": True}
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, {"kind": "message", "msg_id": msg_id,
+                                         "back_cb": f"manage_bot_{bot_id}"}),
+            [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+        ])
         await safe_edit_message_text(q,
-            f"{pe('🔘')} Send more inline buttons to append:\n\n"
-            "<code>Button Label|https://link</code>",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+            f"{pe('🔘')} <b>Aur buttons add karo</b> — purane buttons already load ho chuke hain.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if data.startswith(f"setbtng_addmore_{bot_id}"):
         ud = _runtime_store(context, f"{uid}_{bot_id}")
-        grp = ud.get("pending_buttons_group_addmore")
-        if grp:
-            ud["waiting_buttons"] = {"msg_ids": grp.get("msg_ids"), "append": True}
+        grp = ud.get("pending_buttons_group_addmore") or {}
+        msg_ids = grp.get("msg_ids") or []
+        if not msg_ids:
+            await safe_edit_message_text(q, f"{pe('❌')} Album session nahi mila, album dobara bhejo.",
+                                         parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
+            return
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, {"kind": "messages", "msg_ids": msg_ids,
+                                         "back_cb": f"manage_bot_{bot_id}"}),
+            [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+        ])
         await safe_edit_message_text(q,
-            f"{pe('🔘')} Send more buttons to append:",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+            f"{pe('🔘')} <b>Aur buttons add karo</b> — purane buttons already load ho chuke hain.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if data == f"setbtng_{bot_id}" or data.startswith(f"setbtn_{bot_id}_"):
+        ud = _runtime_store(context, f"{uid}_{bot_id}")
+        if data == f"setbtng_{bot_id}":
+            grp = ud.get("pending_buttons_group") or {}
+            msg_ids = grp.get("msg_ids") or []
+            target = {"kind": "messages", "msg_ids": msg_ids, "back_cb": f"manage_bot_{bot_id}"}
+        else:
+            msg_id = _extract_last_id(data.split("_"))
+            target = {"kind": "message", "msg_id": msg_id, "back_cb": f"manage_bot_{bot_id}"}
+        kb = InlineKeyboardMarkup([
+            button_builder_row(context, target),
+            [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+        ])
+        await safe_edit_message_text(q,
+            f"{pe('🔘')} <b>Inline Buttons</b>\n\n"
+            "<b>Add Button</b> = easy (naam → link → row)\n"
+            "<b>Paste Many</b> = bulk format",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
 
 async def accept_all(q, bot_id: str, owner_id: int, context):
+    sender = get_account_sender(bot_id) or context.bot
     try:
         channels = db.get_bot_channels(bot_id) or []
         for ch in channels:
-            await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], context.bot)
+            await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], sender)
     except Exception:
         pass
     pending = db.get_pending_requests(bot_id)
@@ -2007,7 +3683,7 @@ async def accept_all(q, bot_id: str, owner_id: int, context):
     cleaned = 0
     for req in pending:
         try:
-            await context.bot.approve_chat_join_request(req["channel_id"], req["requester_id"])
+            await sender.approve_chat_join_request(req["channel_id"], req["requester_id"])
             db.mark_request_status(req["id"], 'approved')
             ok += 1
         except Exception as ex:
@@ -2050,18 +3726,25 @@ async def _flush_media_group(bot_id: str, actor_uid: int, managed_uid: int, chat
         saved_ids.append(msg_id)
     ud.pop(key, None)
     ud["pending_buttons_group"] = {"msg_ids": saved_ids}
-    await send_premium_message(context.bot, chat_id, f"{pe('✅')} Media group saved. Choose an option:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-        [btn("Set Inline Button", f"setbtng_{bot_id}", "primary", "🔘")],
-        [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
-        [btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
-        [btn("Done", f"setmsg_done_{bot_id}", "success", "✅")],
-    ]))
+    builder = button_builder_row(context, {"kind": "messages", "msg_ids": saved_ids,
+                                           "back_cb": f"manage_bot_{bot_id}"})
+    await send_premium_message(context.bot, chat_id,
+        f"{pe('✅')} <b>Album saved</b> ({len(saved_ids)} media).\n\n"
+        f"{pe('🔘')} Buttons add karo (album ke neeche ek chhote message me dikhenge):",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+            builder,
+            [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
+            [btn("Done", f"setmsg_done_{bot_id}", "success", "✅"),
+             btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
+        ]))
 
 
 async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
+    # Job context me user_data None hota hai - captured dict se replace karo
+    ctx = _context_with_user_data(context, data.get("user_data"))
     await _flush_media_group(data.get("bot_id"), data.get("actor_uid"), data.get("managed_uid"),
-                             data.get("chat_id"), context, data.get("media_group_id"))
+                             data.get("chat_id"), ctx, data.get("media_group_id"))
 
 
 async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -2095,7 +3778,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
     if uid != owner_id and not is_admin(uid):
         try:
             # Auto-start bot if needed
-            if bot_id not in user_bot_applications:
+            if not is_account_running(bot_id):
                 bot_data = db.get_user_bot(bot_id)
                 if bot_data:
                     sub = db.get_subscription_for_bot(bot_id)
@@ -2160,6 +3843,10 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
     ud = _runtime_store(context, f"{uid}_{bot_id}")
     extracted = MessageManager.extract_from_message(msg)
 
+    # Easy button builder (➕ Add Button wizard) has priority over the other flows
+    if await handle_button_wizard_message(msg, context):
+        return
+
     if ud.get("editing_text_msg_id"):
         mid = ud.pop("editing_text_msg_id")
         row = db.get_message_by_id(mid)
@@ -2177,7 +3864,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         mid = ud.pop("editing_buttons_msg_id")
         row = db.get_message_by_id(mid)
         if row and row["bot_id"] == bot_id:
-            btn_json = buttons_json_from_text(msg.text or "")
+            btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
             db.update_message_buttons(mid, btn_json or "[]")
             await reply_premium_message(msg, f"{pe('✅')} Buttons updated.", parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[btn(f"{pe('🔙')} Back to Messages", f"ubmm_{bot_id}_{row['channel_id']}", "primary", "🔙")]]))
@@ -2214,13 +3901,15 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         if channel_chat and channel_chat.type in ['channel', 'group', 'supergroup']:
             ch = channel_chat
             try:
+                checker = context.bot
                 try:
-                    member = await context.bot.get_chat_member(ch.id, context.bot.id)
+                    member = await checker.get_chat_member(ch.id, getattr(checker, "id", None))
                     if member.status not in ['administrator', 'creator']:
-                        await reply_premium_message(msg, f"{pe('❌')} Bot is not an admin in this channel!\n\nPlease add bot as admin first, then try again.", parse_mode=ParseMode.HTML)
+                        _who = "bot"
+                        await reply_premium_message(msg, f"{pe('❌')} Ye {_who} is channel me admin nahi hai!\n\nPehle ise admin banao, phir dobara try karo.", parse_mode=ParseMode.HTML)
                         return
                 except Exception as e:
-                    await reply_premium_message(msg, f"{pe('❌')} Cannot verify bot admin status: {str(e)}\n\nMake sure bot is admin in the channel.", parse_mode=ParseMode.HTML)
+                    await reply_premium_message(msg, f"{pe('❌')} Admin status verify nahi ho paya: {str(e)}\n\nMake sure account bot admin hai.", parse_mode=ParseMode.HTML)
                     return
 
                 sub = db.get_subscription_for_bot(bot_id)
@@ -2232,7 +3921,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                         return
 
                 db.add_channel(bot_id, ch.id, getattr(ch, 'username', None), ch.title or "Channel")
-                await sync_pending_join_requests_for_channel(bot_id, ch.id, context.bot)
+                _sync_sender = context.bot
+                await sync_pending_join_requests_for_channel(bot_id, ch.id, _sync_sender)
 
                 ud["adding_channel"] = False
                 context.user_data.pop(f"adding_channel_{bot_id}", None)
@@ -2241,7 +3931,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
             except Exception as ex:
                 await reply_premium_message(msg, f"{pe('❌')} Error adding channel: {str(ex)}", parse_mode=ParseMode.HTML)
         else:
-            await reply_premium_message(msg, f"{pe('🔽')} <b>How to add a channel:</b>\n\n1. Make sure this bot is <b>admin</b> in your channel\n2. Go to your channel\n3. <b>Forward ANY message</b> from that channel to this bot\n4. The channel will be added automatically\n\n⚠️ The message must be forwarded from the channel!", parse_mode=ParseMode.HTML)
+            _who = "ye <b>bot</b>"
+            await reply_premium_message(msg, f"{pe('🔽')} <b>How to add a channel:</b>\n\n1. Make sure {_who} <b>admin</b> hai us channel me\n2. Apna channel kholo\n3. Us channel se <b>koi bhi message forward</b> karke yahan bhejo\n4. Channel apne aap add ho jayega\n\n⚠️ Message channel se hi forward hona chahiye!", parse_mode=ParseMode.HTML)
         return
 
     if ud.get("waiting_buttons"):
@@ -2249,7 +3940,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         msg_id = info.get("msg_id")
         msg_ids = info.get("msg_ids") or ([] if msg_id is None else [msg_id])
         append_mode = info.get("append", False)
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             for _id in msg_ids:
                 if append_mode:
@@ -2267,12 +3958,17 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
             else:
                 more_btn_cb = f"setbtng_addmore_{bot_id}"
                 ud["pending_buttons_group_addmore"] = {"msg_ids": msg_ids}
-            await reply_premium_message(msg, f"{pe('✅')} Inline buttons saved! Choose next action:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Set More Inline Buttons", more_btn_cb, "primary", "🔘")],
-                [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
-                [btn("Done", f"setmsg_done_{bot_id}", "success", "✅")],
-                [btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
-            ]))
+            builder_target = ({"kind": "message", "msg_id": msg_ids[0]} if len(msg_ids) == 1
+                              else {"kind": "messages", "msg_ids": msg_ids})
+            builder_target["back_cb"] = f"manage_bot_{bot_id}"
+            await reply_premium_message(msg, f"{pe('✅')} Inline buttons saved!", parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    button_builder_row(context, builder_target),
+                    [btn("Set More Inline Buttons", more_btn_cb, "primary", "🔘")],
+                    [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
+                    [btn("Done", f"setmsg_done_{bot_id}", "success", "✅"),
+                     btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")],
+                ]))
         else:
             await reply_premium_message(msg, f"{pe('❌')} No valid buttons parsed.\n\nFormat:\n• 1 button: <code>Button Label|https://link</code>\n• 2 per row: <code>Label One|https://link1 || Label Two|https://link2</code>", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         ud.pop("waiting_buttons", None)
@@ -2316,7 +4012,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                     pass
             j = context.job_queue.run_once(_flush_media_group_job, when=1.2,
                 data={"bot_id": bot_id, "actor_uid": uid, "managed_uid": owner_id,
-                      "chat_id": msg.chat_id, "media_group_id": media_group_id})
+                      "chat_id": msg.chat_id, "media_group_id": media_group_id,
+                      "user_data": context.user_data})
             ud[job_key] = j
             return
 
@@ -2327,30 +4024,39 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
         if msg_id and extracted["emoji_map"]:
             db.save_user_emoji_map(bot_id, msg_id, extracted["emoji_map"])
         ud["pending_buttons"] = {"msg_id": msg_id, "channel_id": channel_id}
-        await reply_premium_message(msg, f"{pe('✅')} Message saved! Choose an option:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-            [btn("Set Inline Button", f"setbtn_{bot_id}_{msg_id}", "primary", "🔘")],
-            [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
-            [btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
-            [btn("Done", f"setmsg_done_{bot_id}", "success", "✅")],
-        ]))
+        builder = button_builder_row(context, {"kind": "message", "msg_id": msg_id,
+                                               "back_cb": f"manage_bot_{bot_id}"})
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Message saved!</b>\n\n"
+            f"{pe('🔘')} Buttons add karne ke liye <b>Add Button</b> dabao (naam → link → row), "
+            f"ya <b>Paste Many</b> se purana <code>Label|link</code> format use karo.",
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+                builder,
+                [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
+                [btn("Done", f"setmsg_done_{bot_id}", "success", "✅"),
+                 btn("Cancel", f"setmsg_cancel_{bot_id}", "danger", "❌")],
+            ]))
         return
 
     if context.user_data.get(f"broadcast_stage_{bot_id}") == "await_message":
+        # Albums arrive as separate updates - collect them all before saving the draft
+        if await collect_broadcast_album(context, "user", bot_id, msg, extracted):
+            return
         draft = {"text": extracted["text"], "media": extracted["media_id"], "media_type": extracted["media_type"],
                  "emoji_map": extracted["emoji_map"], "entities_json": extracted["entities_json"],
-                 "file_name": extracted.get("file_name"), "mime_type": extracted.get("mime_type")}
+                 "file_name": extracted.get("file_name"), "mime_type": extracted.get("mime_type"),
+                 "buttons_json": None, "caption_with_buttons": False, "target_bot": bot_id}
         context.user_data[f"broadcast_draft_{bot_id}"] = draft
         context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
-        await reply_premium_message(msg, f"{pe('✅')} Broadcast draft saved. Add inline buttons or send now?", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-            [btn("Add Inline Buttons", f"bcast_add_btns_{bot_id}", "primary", "🔘")],
-            [btn("Send Now", f"bcast_send_{bot_id}", "success", "🚀")],
-            [btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")],
-        ]))
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Broadcast draft saved.</b>\n\n"
+            f"{pe('🔘')} <b>Add Button</b> se buttons add karo, ya seedha <b>Send Now</b> dabao.",
+            parse_mode=ParseMode.HTML, reply_markup=user_broadcast_ready_kb(context, bot_id, owner_id))
         return
 
     if context.user_data.get(f"broadcast_stage_{bot_id}") == "await_buttons":
         draft = context.user_data.get(f"broadcast_draft_{bot_id}", {})
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             draft["buttons_json"] = btn_json
             context.user_data[f"broadcast_draft_{bot_id}"] = draft
@@ -2360,10 +4066,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                     await reply_premium_message(msg, f"{pe('👁')} <b>Button Preview</b> — yahi dikhega users ko:", parse_mode=ParseMode.HTML, reply_markup=preview_markup)
                 except Exception:
                     pass
-            await reply_premium_message(msg, f"{pe('✅')} Buttons saved. Ready to send?", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Send Now", f"bcast_send_{bot_id}", "success", "🚀")],
-                [btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")],
-            ]))
+            await reply_premium_message(msg, f"{pe('✅')} Buttons saved. Ready to send?", parse_mode=ParseMode.HTML,
+                                        reply_markup=user_broadcast_ready_kb(context, bot_id, owner_id))
         else:
             await reply_premium_message(msg, f"{pe('❌')} No valid buttons.\n\nFormat:\n• 1 button: <code>Button Label|https://link</code>\n• 2 per row: <code>Label One|https://link1 || Label Two|https://link2</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
         context.user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
@@ -2423,7 +4127,179 @@ async def delete_pending_leave_recovery_messages(bot_id: str, user_id: int, targ
     return deleted
 
 
+async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: int,
+                               chat_title: Optional[str] = None, chat_username: Optional[str] = None,
+                               sender=None, approve=None, auto: Optional[bool] = None):
+    """Join request aane par: default message + saved welcome (media/album) + approve."""
+    sender = sender or get_account_sender(bot_id)
+    if sender is None:
+        return
+
+    # Leave-recovery ka target channel? Wahan welcome nahi, sirf auto-approve + cleanup.
+    leave_cfg = db.get_leave_recovery_config() or {}
+    if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id")
+            and int(leave_cfg["target_channel_id"]) == int(chat_id)):
+        chan_enabled = (leave_cfg.get("channel_configs") or {}).get(str(chat_id), True)
+        if chan_enabled:
+            await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat_id), sender)
+        if approve is not None:
+            try:
+                await approve()
+            except Exception as ex:
+                if 'User_already_participant' not in str(ex) and 'USER_ALREADY_PARTICIPANT' not in str(ex):
+                    logging.error(f"Leave recovery target approve error: {mask_secrets(ex)}")
+        return
+
+    channel_row = db.get_channel_owner_data(chat_id, bot_id)
+    if not channel_row:
+        # Channel khud se add ho jaye agar is account ke paas admin rights hain
+        try:
+            member = await sender.get_chat_member(chat_id, getattr(sender, "id", None))
+            if getattr(member, "status", "") in ("administrator", "creator"):
+                db.add_channel(bot_id, chat_id, chat_username, chat_title or "Channel")
+                channel_row = db.get_channel_owner_data(chat_id, bot_id)
+        except Exception:
+            pass
+        if not channel_row:
+            return
+    if auto is None:
+        auto = int(channel_row.get("auto_approve", 0) or 0) == 1
+
+    default_msg_text = None
+    try:
+        default_msg_text = render_dynamic_text(db.get_default_first_message(), requester)
+    except Exception as ex:
+        logging.error(f"Default first message render error: {mask_secrets(ex)}")
+    if default_msg_text:
+        ok, err, _ = await send_dm_fallback(
+            bot_id, requester.id,
+            lambda snd: send_user_message(snd, requester.id, default_msg_text, parse_mode=ParseMode.HTML),
+            primary=sender, kind="Default first message")
+        if not ok:
+            stop = dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM")
+            if stop and isinstance(err, (Forbidden, BadRequest)) and is_user_gone_error(err) \
+                    and approve is not None and auto:
+                try:
+                    await approve()
+                except Exception:
+                    pass
+            if stop or isinstance(err, (NetworkError, TimedOut)):
+                return
+
+    msgs = db.get_messages(chat_id, bot_id)
+
+    async def _send_welcome(snd):
+        if msgs:
+            await _send_messages_with_media_groups(requester.id, msgs, snd, bot_id=bot_id,
+                                                   attach_start_button=True, placeholder_user=requester)
+        else:
+            wm = render_dynamic_text(channel_row.get("welcome_message") or DEFAULT_WELCOME_MESSAGE, requester)
+            wid = channel_row.get("welcome_media_id")
+            wtype = channel_row.get("welcome_media_type")
+            markup = buttons_to_markup(buttons_json_from_text(wm) or None)
+            if wid and wtype:
+                await send_media(snd, requester.id, wid, wtype, wm, markup)
+            elif wm:
+                await send_user_message(snd, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    ok, err, _ = await send_dm_fallback(
+        bot_id, requester.id, _send_welcome, primary=sender, kind="Welcome DM")
+    if ok:
+        db.mark_reachable(bot_id, requester.id)
+    else:
+        dm_failure_log_and_mark(bot_id, requester.id, err, "welcome DM")
+
+    db.add_join_request(bot_id, requester.id, chat_id, 'approved' if auto else 'pending')
+    if auto and approve is not None:
+        try:
+            await approve()
+        except Exception as ex:
+            if 'User_already_participant' not in str(ex) and 'USER_ALREADY_PARTICIPANT' not in str(ex):
+                logging.error(f"Approve error: {mask_secrets(ex)}")
+
+
+async def _send_leave_message(bot_id: str, user_id, owner_id, primary, do_send):
+    """Leave-recovery DM: bot se bhejo. Return (ok, sent_message, error, used_alt)."""
+    box = {"sent": None}
+
+    async def _wrapped(snd):
+        box["sent"] = await do_send(snd)
+
+    ok, err, used_alt = await send_dm_fallback(bot_id, user_id, _wrapped, primary=primary,
+                                               kind="leave recovery DM")
+    return ok, box["sent"], err, used_alt
+
+
+async def process_member_left(bot_id: str, member_user, chat_id: int,
+                              chat_title: Optional[str] = None, sender=None) -> None:
+    """Member ne channel leave kiya -> leave-recovery DM (blocked users ko yaad rakho)."""
+    channel_row = db.get_channel_owner_data(chat_id, bot_id)
+    if not channel_row:
+        return
+    sender = sender or get_account_sender(bot_id)
+    if sender is None:
+        return
+    db.mark_unreachable(bot_id, member_user.id)
+    try:
+        if db.is_permanently_unreachable(bot_id, member_user.id):
+            logging.info(f"leave recovery skip: user {member_user.id} pehle hi unreachable mark hai")
+            return
+    except Exception:
+        pass
+    leave_cfg = db.get_leave_recovery_config() or {}
+    target_channel_id = leave_cfg.get("target_channel_id")
+    target_link = (leave_cfg.get("target_channel_link") or "").strip()
+    if not leave_cfg.get("enabled") or not target_channel_id or not target_link \
+            or int(target_channel_id) == int(chat_id):
+        return
+    if not (leave_cfg.get("channel_configs") or {}).get(str(chat_id), True):
+        logging.info(f"Leave recovery disabled for channel {chat_id}, skipping.")
+        return
+    try:
+        await delete_pending_leave_recovery_messages(bot_id, member_user.id, int(target_channel_id), sender)
+        extra = {"source_channel_title": chat_title or str(chat_id), "source_channel_id": chat_id,
+                 "target_channel_link": target_link, "target_channel_id": target_channel_id}
+        leave_messages = leave_cfg.get("messages", [])
+        if not leave_messages and leave_cfg.get("message"):
+            leave_messages = [{"text": leave_cfg["message"], "buttons_json": leave_cfg.get("buttons_json", "")}]
+        if not leave_messages:
+            leave_messages = [{"text": "Hello {first_name}, aap channel se leave ho gaye. Wapas access ke liye neeche wale channel par request bheje.", "buttons_json": ""}]
+        for lm in leave_messages:
+            text = render_dynamic_text(lm.get("text", ""), member_user, extra)
+            lm_buttons = lm.get("buttons_json") or ""
+            if lm_buttons:
+                leave_markup = buttons_to_markup(lm_buttons)
+            else:
+                leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
+            owner_id = (db.get_user_bot(bot_id) or {}).get("user_id") or 0
+            try:
+                sent_ok, sent, err, _ = await _send_leave_message(
+                    bot_id, member_user.id, owner_id, sender,
+                    lambda snd: send_user_message(snd, member_user.id, text,
+                                                  parse_mode=ParseMode.HTML, reply_markup=leave_markup))
+                if not sent_ok:
+                    dm_failure_log_and_mark(bot_id, member_user.id, err, "leave recovery DM")
+                    break
+            except Exception as ex:
+                logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
+                break
+            if sent:
+                db.add_leave_recovery_message(bot_id, member_user.id, chat_id, int(target_channel_id), sent.message_id)
+    except Exception as ex:
+        logging.error(f"Leave recovery DM failed: {mask_secrets(ex)}", exc_info=True)
+
+
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
+    """PTB wrapper - asli kaam process_join_request karta hai."""
+    jr = update.chat_join_request
+    if not jr:
+        return
+    await process_join_request(bot_id, owner_id, jr.from_user, jr.chat.id,
+                               getattr(jr.chat, "title", None), getattr(jr.chat, "username", None),
+                               sender=context.bot, approve=jr.approve)
+
+
+async def _legacy_handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
     jr = update.chat_join_request
     if not jr:
         return
@@ -2517,8 +4393,19 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
     member_user = getattr(cmu.new_chat_member, "user", None)
     if not member_user or getattr(member_user, "is_bot", False):
         return
+    await process_member_left(bot_id, member_user, cmu.chat.id,
+                              getattr(cmu.chat, "title", None), sender=context.bot)
+    return
 
+    # (purana inline leave-recovery code - ab process_member_left me hai)
     db.mark_unreachable(bot_id, member_user.id)
+    try:
+        if db.is_permanently_unreachable(bot_id, member_user.id):
+            # Pehle hi block/can't-initiate nikla tha - dobara try karne ka fayda nahi
+            logging.info(f"leave recovery skip: user {member_user.id} pehle hi unreachable mark hai")
+            return
+    except Exception:
+        pass
     leave_cfg = db.get_leave_recovery_config()
     target_channel_id = leave_cfg.get("target_channel_id")
     target_link = (leave_cfg.get("target_channel_link") or "").strip()
@@ -2557,37 +4444,170 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
             else:
                 leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
 
-            sent = await send_user_message(context.bot, member_user.id, text,
+            try:
+                sent = await send_user_message(context.bot, member_user.id, text,
                                                parse_mode=ParseMode.HTML, reply_markup=leave_markup)
+            except Forbidden as ex:
+                # User ne bot block kiya / DM shuru nahi ho sakti -> aage ke messages bhi
+                # fail honge. Ek hi line log karo (ERROR spam nahi) + yaad rakho.
+                db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
+                logging.warning(f"leave recovery DM skip (user {member_user.id} reachable nahi): "
+                                f"{mask_secrets(ex)}")
+                break
+            except BadRequest as ex:
+                if is_user_gone_error(ex):
+                    db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
+                    logging.warning(f"leave recovery DM skip (user {member_user.id}): {mask_secrets(ex)}")
+                else:
+                    logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
+                break
+            except (NetworkError, TimedOut) as ex:
+                # Transient - agli member-update par dobara try ho jayega
+                logging.warning(f"leave recovery DM network hiccup (transient): {mask_secrets(ex)}")
+                break
             if sent:
                 db.add_leave_recovery_message(bot_id, member_user.id, cmu.chat.id, int(target_channel_id), sent.message_id)
 
     except Exception as ex:
-        logging.error(f"Leave recovery DM failed: {ex}")
+        logging.error(f"Leave recovery DM failed: {mask_secrets(ex)}", exc_info=True)
 
 
 # ================= USER BOT LIFECYCLE =================
-async def start_user_bot(token: str, bot_id: str, owner_id: int):
-    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
+TOKEN_FAILURES: List[Dict[str, Any]] = []
+
+
+def _tuned_request():
+    """Userbot apps ke liye bhi wahi network profile (warna default 5s timeout par
+    flaky VPS networks me httpx.ReadError aata rehta hai)."""
+    from telegram.request import HTTPXRequest
+    return HTTPXRequest(
+        connection_pool_size=100,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+
+
+async def _cleanup_failed_app(app):
+    """Aadhe initialize hue application ko safely band karo."""
+    for step in ("updater", "stop", "shutdown"):
+        try:
+            if step == "updater":
+                if app.updater:
+                    await app.updater.stop()
+            elif step == "stop":
+                await app.stop()
+            else:
+                await app.shutdown()
+        except Exception:
+            pass
+
+
+def remember_token_failure(bot_id: str, owner_id: int, reason: str = ""):
+    """Ek hi bot ke liye ek baar record karo (restart loop me spam na ho)."""
+    for fail in TOKEN_FAILURES:
+        if fail["bot_id"] == bot_id:
+            return
+    TOKEN_FAILURES.append({"bot_id": bot_id, "owner_id": owner_id or 0, "reason": mask_secrets(reason)})
+
+
+async def flush_token_failures(bot=None):
+    """Dead userbot token ki khabar owner + admin ko do (ek-ek baar)."""
+    if not bot or not TOKEN_FAILURES:
+        return
+    pending = list(TOKEN_FAILURES)
+    TOKEN_FAILURES.clear()
+    for fail in pending:
+        text = (f"<blockquote>{pp('⚠️')} <b>USERBOT TOKEN INVALID</b></blockquote>\n\n"
+                f"{pp('🤖')} Bot ID: <code>{fail['bot_id']}</code>\n"
+                f"{pp('❌')} Telegram ne is bot ka token reject kar diya (revoke/delete ho gaya lagta hai).\n\n"
+                "BotFather -> /mybots -> apna bot -> API Token -> <b>Revoke</b> se naya token lo,\n"
+                "phir panel se purana bot hata ke naya token dobara add karo.")
+        targets = {int(x) for x in ADMIN_USER_IDS}
+        if fail.get("owner_id"):
+            targets.add(int(fail["owner_id"]))
+        for uid in targets:
+            try:
+                await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+            except Exception as ex:
+                logging.warning(f"Token warning owner {uid} ko nahi bhej paye: {mask_secrets(ex)}")
+
+
+USERBOT_START_ATTEMPTS = 3          # network hiccup par itni baar try karo
+USERBOT_RETRY_DELAY = 1.5           # attempt ke beech base delay (test me patch hota hai)
+
+
+def _build_userbot_app(token: str, bot_id: str, owner_id: int):
+    app = ApplicationBuilder().token(token).concurrent_updates(True).request(_tuned_request()).build()
     app.bot_data["bot_id"] = bot_id
     app.bot_data["owner_id"] = owner_id
     app.add_handler(CommandHandler("start", lambda u, c: user_bot_start(u, c, bot_id, owner_id)))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_public_userbot_callback(u, c, bot_id), pattern=r'^(start_now|live_chat_support)$'))
-    app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|bwz_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: userbot_wizard_callback(u, c, bot_id, owner_id), pattern=r"^bwz_"))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_set_buttons_callback(u, c, bot_id, owner_id), pattern=f"^setbtn_{bot_id}_"))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
-    user_bot_applications[bot_id] = app
-    try:
-        for ch in db.get_bot_channels(bot_id) or []:
-            await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], app.bot)
-    except Exception as ex:
-        logging.error(f"Startup pending sync failed: {ex}")
-    return True
+    return app
+
+
+async def start_user_bot(token: str, bot_id: str, owner_id: int, quiet: bool = False):
+    """Userbot start karo.
+
+    Network hiccup (httpx.ReadError / TimedOut) par 2 baar dobara try hota hai - VPS ki
+    link kabhi-kabhi toot jati hai aur pehle ek hi ReadError par userbot band pada rehta
+    tha jab tak dobara restart na ho ("Failed to start user bot ... httpx.ReadError:").
+    Permanent errors (revoked token / blocked) par turant band.
+    """
+    fail_log = logging.warning if quiet else logging.error
+    for attempt in range(1, USERBOT_START_ATTEMPTS + 1):
+        try:
+            app = _build_userbot_app(token, bot_id, owner_id)
+        except Exception as ex:
+            fail_log(f"{pp('❌')} User bot {bot_id} bana nahi paya: {mask_secrets(ex)}")
+            return False
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+        except (InvalidToken, Forbidden) as ex:
+            # Token revoke/delete ho gaya - retry karne ka koi fayda nahi. Sirf is bot ko
+            # band karo, main bot chalta rahe (pehle ye poore bot ko restart loop me daal deta tha).
+            fail_log(f"{pp('❌')} User bot {bot_id} ka token Telegram ne reject kar diya "
+                     f"({mask_secrets(ex)}) - is bot ko band kiya, naya token chahiye")
+            await _cleanup_failed_app(app)
+            try:
+                db.set_user_bot_active(bot_id, False)
+            except Exception:
+                pass
+            remember_token_failure(bot_id, owner_id, str(ex))
+            return False
+        except (NetworkError, TimedOut) as ex:
+            await _cleanup_failed_app(app)
+            if attempt < USERBOT_START_ATTEMPTS:
+                (logging.debug if quiet else logging.warning)(
+                    f"userbot {bot_id}: attempt {attempt} par network error "
+                    f"({mask_secrets(ex)}) - dobara try kar rahe hain")
+                await asyncio.sleep(USERBOT_RETRY_DELAY * attempt)
+                continue
+            fail_log(f"{pp('⚠️')} User bot {bot_id} {USERBOT_START_ATTEMPTS} attempts ke baad bhi "
+                     f"start nahi ho paya (network: {mask_secrets(ex)}) - retry job ~10 min me "
+                     f"dobara koshish karega")
+            return False
+        except Exception as ex:
+            fail_log(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
+            await _cleanup_failed_app(app)
+            return False
+        user_bot_applications[bot_id] = app
+        try:
+            for ch in db.get_bot_channels(bot_id) or []:
+                await sync_pending_join_requests_for_channel(bot_id, ch["channel_id"], app.bot)
+        except Exception as ex:
+            logging.error(f"Startup pending sync failed: {mask_secrets(ex)}")
+        return True
+    return False
 
 
 async def stop_user_bot(bot_id: str):
@@ -2602,21 +4622,380 @@ async def stop_user_bot(bot_id: str):
         user_bot_applications.pop(bot_id, None)
         db.set_user_bot_active(bot_id, False)
 
+# ================= DM HELPERS (BOT-ONLY) =================
+# Pehle yahan MTProto user-account system tha (UserAccountSender, Telethon login, Saved
+# Messages forward) - use poori tarah hata diya. Ab saare DM sirf bot se jate hain.
+_DM_INITIATE_WARNED: set = set()
+
+DM_INITIATE_MARKERS = ("can't initiate conversation", "cant initiate conversation",
+                       "initiate conversation with a user", "bot can't initiate")
+
+
+def is_dm_initiate_blocked(ex) -> bool:
+    """Bot ne DM shuru nahi kar paya (user ne bot ko /start nahi kiya)."""
+    text = str(ex or "").lower()
+    return any(m in text for m in DM_INITIATE_MARKERS)
+
+
+PLAIN_RETRY_SKIP_MARKERS = (
+    "could not find the input entity",
+    "failed to convert",
+    "wrong file_id",
+    "not an existing file",
+    "file is temporarily unavailable",
+)
+
+
+def _should_plain_retry(ex) -> bool:
+    """Plain text se retry karne se kaam banega? (entity/file ki galti me nahi)"""
+    text = str(ex or "").lower()
+    if any(m in text for m in PLAIN_RETRY_SKIP_MARKERS):
+        return False
+    return True
+
+
+async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, kind: str = "DM"):
+    """`do_send(sender)` ko bot sender par try karo.
+
+    Return: (ok, error, used_alt)
+      * ok=True  -> message chala gaya
+      * ok=False -> send fail; error me exception
+    (Naam me "fallback" purana hai - ab ek hi sender hota hai: bot.)
+    """
+    sender = primary if primary is not None else get_account_sender(bot_id)
+    if sender is None:
+        return False, BadRequest("koi sender available nahi (bot band hai)"), False
+    try:
+        await do_send(sender)
+    except (NetworkError, TimedOut) as ex:
+        return False, ex, False
+    except (Forbidden, BadRequest) as ex:
+        return False, ex, False
+    except Exception as ex:
+        return False, ex, False
+    return True, None, False
+
+
+def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str) -> bool:
+    """Ek jagah DM failure ka faisla: log + (permanent) unreachable marking.
+
+    Return True = caller yahin ruk jaye (aage ke messages bhejne ka fayda nahi).
+    """
+    if isinstance(ex, (NetworkError, TimedOut)):
+        logging.warning(f"{kind} network hiccup (transient): {mask_secrets(ex)}")
+        return True
+    if is_dm_initiate_blocked(ex):
+        # Bot DM shuru nahi kar sakta (user ne /start nahi kiya). Permanent mark NAHI
+        # karte: user ke /start karte hi ye DM ja sakti hai.
+        db.mark_unreachable(bot_id, user_id)
+        key = (bot_id, user_id, "initiate")
+        if key not in _DM_INITIATE_WARNED:
+            _DM_INITIATE_WARNED.add(key)
+            logging.warning(f"{kind} skip (user {user_id}): {mask_secrets(ex)} - "
+                            f"user ne bot ko /start nahi kiya (user /start kare to DM ja sakti hai)")
+        return True
+    if is_user_gone_error(ex) or isinstance(ex, Forbidden):
+        db.mark_unreachable(bot_id, user_id)
+        db.mark_permanently_unreachable(bot_id, user_id, str(ex))
+        logging.warning(f"{kind} skip (user {user_id} reachable nahi): "
+                        f"{type(ex).__name__}: {mask_secrets(ex)}")
+        return True
+    logging.error(f"{kind} error: {type(ex).__name__}: {mask_secrets(ex)}")
+    return False
+
+
+def is_account_running(bot_id: str) -> bool:
+    return bot_id in user_bot_applications
+
+
+def get_account_sender(bot_id: str):
+    """Is bot_id ka live sender: PTB bot application ka bot."""
+    app = user_bot_applications.get(bot_id)
+    if app is not None:
+        return app.bot
+    return None
+
+
+def account_display_name(row: dict, bot_id: str = "") -> str:
+    """Panel me dikhane ke liye naam: @username, warna id."""
+    if not row:
+        return f"<code>{bot_id}</code>"
+    username = row.get("bot_username")
+    if username:
+        return f"@{username}"
+    return f"<code>{row.get('bot_id') or bot_id}</code>"
+
 
 # ================= BROADCAST FUNCTIONS =================
+def _broadcast_draft_key(scope: str, bot_id: Optional[str] = None) -> str:
+    return f"broadcast_draft_{bot_id}" if scope == "user" else "admin_broadcast_draft"
+
+
+def _broadcast_stage_key(scope: str, bot_id: Optional[str] = None) -> str:
+    return f"broadcast_stage_{bot_id}" if scope == "user" else "admin_broadcast_stage"
+
+
+def get_broadcast_draft(context, scope: str, bot_id: Optional[str] = None) -> dict:
+    draft = context.user_data.get(_broadcast_draft_key(scope, bot_id))
+    return draft if isinstance(draft, dict) else {}
+
+
+def save_broadcast_draft(context, scope: str, bot_id: Optional[str], draft: dict):
+    context.user_data[_broadcast_draft_key(scope, bot_id)] = draft
+
+
+def user_broadcast_target(bot_id: str, owner_id: int) -> dict:
+    return {"kind": "draft_user", "bot_id": bot_id, "owner_id": owner_id,
+            "back_cb": f"manage_bot_{bot_id}"}
+
+
+def admin_broadcast_target() -> dict:
+    return {"kind": "draft_admin", "back_cb": "admin_panel"}
+
+
+def broadcast_caption_mode_label(draft: dict) -> str:
+    """Button tap karne par kya hoga, wahi label (toggle = action)."""
+    if draft.get("caption_with_buttons", False):
+        return "📝 Caption: Album par"
+    return "📝 Caption: Buttons ke saath"
+
+
+def broadcast_caption_mode_row(draft: dict, cb: str) -> List[InlineKeyboardButton]:
+    """Album + buttons wale draft ke liye ek toggle row.
+
+    Telegram albums par buttons attach nahi hote (send_media_group me reply_markup hi
+    nahi hai), isliye buttons album ke turant neeche ek chhote message me jate hain.
+    Default me caption ALBUM par hi rehta hai; is toggle se caption us buttons wale
+    message me bhi le jaya ja sakta hai (dono ek saath dikhte hain)."""
+    if len(draft_items(draft)) < 2:
+        return []
+    return [btn(broadcast_caption_mode_label(draft), cb, "primary")]
+
+
+def user_broadcast_ready_kb(context, bot_id: str, owner_id: int) -> InlineKeyboardMarkup:
+    draft = get_broadcast_draft(context, "user", bot_id)
+    rows = [button_builder_row(context, user_broadcast_target(bot_id, owner_id))]
+    mode_row = broadcast_caption_mode_row(draft, f"bcast_capmode_{bot_id}")
+    if mode_row:
+        rows.append(mode_row)
+    rows.append([btn("Send Now", f"bcast_send_{bot_id}", "success", "🚀"),
+                 btn("Cancel", f"manage_bot_{bot_id}", "danger", "❌")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_broadcast_ready_kb(context) -> InlineKeyboardMarkup:
+    draft = get_broadcast_draft(context, "admin")
+    rows = [button_builder_row(context, admin_broadcast_target())]
+    mode_row = broadcast_caption_mode_row(draft, "admin_bcast_capmode")
+    if mode_row:
+        rows.append(mode_row)
+    rows.append([btn("Send Now", "admin_bcast_send", "success", "🚀"),
+                 btn("Cancel", "admin_panel", "danger", "❌")])
+    return InlineKeyboardMarkup(rows)
+
+
+def broadcast_selected_ids(context) -> List[str]:
+    selected = context.user_data.get("admin_bcast_selected") or []
+    return [str(b) for b in selected if b]
+
+
+def broadcast_target_label(draft: dict) -> str:
+    ids = [str(b) for b in (draft.get("target_bots") or []) if b]
+    if not ids and draft.get("target_bot"):
+        ids = [str(draft["target_bot"])]
+    if not ids:
+        return "ALL userbots"
+    if len(ids) == 1:
+        return f"userbot {ids[0]}"
+    return f"{len(ids)} userbots ({', '.join(ids[:5])}{'…' if len(ids) > 5 else ''})"
+
+
+def make_broadcast_draft(extracted: dict, target_bots: Optional[List[str]] = None,
+                         target_bot: Optional[str] = None) -> dict:
+    return {
+        "text": extracted.get("text") or "",
+        "media": extracted.get("media_id"),
+        "media_type": extracted.get("media_type") or "text",
+        "entities_json": extracted.get("entities_json"),
+        "file_name": extracted.get("file_name"),
+        "mime_type": extracted.get("mime_type"),
+        "buttons_json": None,
+        "caption_with_buttons": False,
+        "target_bots": list(target_bots) if target_bots else None,
+        "target_bot": target_bot,
+    }
+
+
+def _broadcast_album_key(scope: str, bot_id: Optional[str], media_group_id) -> str:
+    return f"bcast_album_{scope}_{bot_id or 'admin'}_{media_group_id}"
+
+
+# strong references so fire-and-forget flush tasks are never garbage collected
+_PENDING_TASKS: set = set()
+
+
+def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1.4):
+    """Wait a moment for the rest of an album, then save the draft.
+
+    Uses the JobQueue when available and falls back to an asyncio task, so album
+    broadcasts keep working even without the job-queue extra.
+
+    IMPORTANT: the live `user_data` dict is carried inside the job data. PTB's job
+    context has `user_data = None`, so without this the flush crashed with
+    "'NoneType' object has no attribute 'pop'" and the draft was never saved.
+    """
+    data = dict(data or {})
+    if not isinstance(data.get("user_data"), dict):
+        user_data = getattr(context, "user_data", None)
+        if isinstance(user_data, dict):
+            data["user_data"] = user_data
+
+    if getattr(context, "job_queue", None):
+        context.user_data[job_key] = context.job_queue.run_once(_flush_broadcast_album_job, when=when, data=data)
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(when)
+            await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
+                                        data.get("chat_id"), data.get("media_group_id"),
+                                        user_data=data.get("user_data"))
+        except Exception as ex:
+            logging.error(f"broadcast album flush task failed: {mask_secrets(ex)}")
+
+    task = asyncio.ensure_future(_runner())
+    _PENDING_TASKS.add(task)
+    task.add_done_callback(_PENDING_TASKS.discard)
+    context.user_data[job_key] = task
+
+
+async def collect_broadcast_album(context, scope: str, bot_id: Optional[str], msg,
+                                  extracted: dict) -> bool:
+    """Collect an album (media group) sent while composing a broadcast.
+
+    Telegram delivers every photo/video of an album as a separate update; before this
+    only the first one ever reached the draft, so users got a single media instead of
+    the whole album with its caption.
+    """
+    media_group_id = extracted.get("media_group_id")
+    if not media_group_id:
+        return False
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        logging.error("broadcast album collect: user_data available nahi hai")
+        return False
+    key = _broadcast_album_key(scope, bot_id, media_group_id)
+    items = user_data.setdefault(key, [])
+    first = len(items) == 0
+    items.append(make_media_item(extracted))
+    if first:
+        try:
+            await reply_premium_message(msg, f"{pe('📸')} Album mil gaya, process kar raha hoon…",
+                                        parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    job_key = f"{key}_job"
+    old_job = context.user_data.get(job_key)
+    if old_job is not None:
+        try:
+            old_job.schedule_removal()
+        except Exception:
+            try:
+                old_job.cancel()
+            except Exception:
+                pass
+    _schedule_broadcast_flush(context, job_key,
+                              {"scope": scope, "bot_id": bot_id, "chat_id": msg.chat_id,
+                               "media_group_id": media_group_id})
+    return True
+
+
+async def _flush_broadcast_album_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
+                                data.get("chat_id"), data.get("media_group_id"),
+                                user_data=data.get("user_data"))
+
+
+async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
+                                chat_id, media_group_id, user_data: Optional[dict] = None):
+    ctx = _context_with_user_data(context, user_data)
+    user_data = getattr(ctx, "user_data", None)
+    if not isinstance(user_data, dict):
+        logging.error(f"album flush: user_data available nahi hai (scope={scope}, bot={bot_id})")
+        return
+    key = _broadcast_album_key(scope, bot_id, media_group_id)
+    items = user_data.pop(key, None) or []
+    user_data.pop(f"{key}_job", None)
+    if not items or not chat_id:
+        return
+    first = items[0]
+    draft = {
+        "text": first.get("text") or "",
+        "media": first.get("media"),
+        "media_type": first.get("media_type") or "text",
+        "entities_json": first.get("entities_json"),
+        "file_name": first.get("file_name"),
+        "mime_type": first.get("mime_type"),
+        "album": items,
+        "buttons_json": None,
+        "caption_with_buttons": False,
+    }
+    if scope == "admin":
+        draft["target_bots"] = broadcast_selected_ids(ctx) or None
+        draft["target_bot"] = None
+        user_data["admin_broadcast_draft"] = draft
+        user_data["admin_broadcast_stage"] = "buttons_or_send"
+        user_data.pop("admin_broadcast", None)
+        kb = admin_broadcast_ready_kb(ctx)
+        label = broadcast_target_label(draft)
+    else:
+        draft["target_bot"] = bot_id
+        user_data[f"broadcast_draft_{bot_id}"] = draft
+        user_data[f"broadcast_stage_{bot_id}"] = "buttons_or_send"
+        kb = user_broadcast_ready_kb(ctx, bot_id, 0)
+        label = "your users"
+    await send_premium_message(ctx.bot, chat_id,
+                               f"{pe('✅')} <b>Album saved</b> ({len(items)} media) — target: {label}\n\n"
+                               f"{pe('📝')} Caption album par hi rahega aur {pe('🔘')} buttons album ke "
+                               f"turant neeche ek chhote message me jayenge (Telegram album par buttons "
+                               f"attach nahi hota). Chaaho to neeche wale {pe('📝')} button se caption "
+                               f"bhi buttons ke saath le ja sakte ho.",
+                               parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
 async def preview_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
     draft = context.user_data.get(f"broadcast_draft_{bot_id}", {})
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft found.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
+    preview_sender = await resolve_own_sender(bot_id, fallback=context.bot)
     try:
-        await send_media(context, owner_id, draft.get("media"), draft.get("media_type") or "text",
-                         draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                         entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+        await send_draft_message(preview_sender, owner_id, draft,
+                                 markup=buttons_to_markup(draft.get("buttons_json")),
+                                 source_bot=context.bot if preview_sender is not context.bot else None)
     except Exception as ex:
         await safe_edit_message_text(q, f"{pe('❌')} Preview failed: {str(ex)}", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
     await safe_edit_message_text(q, f"{pe('✅')} Preview sent above. Confirm to broadcast?", parse_mode=ParseMode.HTML, reply_markup=confirm_kb(f"bcast_confirm_{bot_id}", f"manage_bot_{bot_id}"))
+
+
+async def resolve_own_sender(bot_id: str, fallback=None, start_if_needed: bool = False):
+    """Owner ke bot ka sender do (chal raha na ho to chalu karne ki koshish)."""
+    sender = get_account_sender(bot_id)
+    if sender is not None:
+        return sender
+    if start_if_needed:
+        row = db.get_user_bot(bot_id) or {}
+        try:
+            if await start_user_bot(row.get("bot_token") or "", bot_id, row.get("user_id") or 0, quiet=True):
+                db.set_user_bot_active(bot_id, True)
+                sender = get_account_sender(bot_id)
+                if sender is not None:
+                    return sender
+        except Exception as ex:
+            logging.warning(f"{bot_id} broadcast ke liye start nahi ho paya: {mask_secrets(ex)}")
+    return fallback
 
 
 async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -2625,42 +5004,255 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft to send.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
-    reqs = db.get_requesters_for_bot(bot_id)
+    reqs = list(dict.fromkeys(db.get_requesters_for_bot(bot_id) or []))
     if not reqs:
         await safe_edit_message_text(q, f"{pe('❌')} No users to broadcast to.", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
         return
+    sender = await resolve_own_sender(bot_id, fallback=None, start_if_needed=True)
+    if sender is None:
+        await safe_edit_message_text(q, f"{pe('❌')} Aapka bot abhi chal nahi raha. Thodi der me "
+                                        f"dobara try karo (subscription activate hone par apne aap chalu ho jata hai).",
+                                     parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
+        return
     await safe_edit_message_text(q, f"{pe('✈️')} Broadcasting...", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", f"manage_bot_{bot_id}", "primary", "🔙")]]))
+    markup = buttons_to_markup(draft.get("buttons_json"))
     sent = 0
     fail = 0
+    gone = 0
+    degraded = 0
+    reasons: Dict[str, int] = {}
     for r in reqs:
         try:
-            await send_media(context, r, draft.get("media"), draft.get("media_type") or "text",
-                             draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                             entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+            status = await send_draft_message(sender, r, draft, markup=markup, source_bot=context.bot)
             db.mark_reachable(bot_id, r)
             sent += 1
-        except Forbidden:
+            if status == "degraded":
+                degraded += 1
+        except Forbidden as ex:
+            gone += 1
             db.mark_unreachable(bot_id, r)
-            fail += 1
+            db.mark_permanently_unreachable(bot_id, r, str(ex))
+        except BadRequest as ex:
+            if is_user_gone_error(ex):
+                gone += 1
+                db.mark_unreachable(bot_id, r)
+                db.mark_permanently_unreachable(bot_id, r, str(ex))
+            else:
+                fail += 1
+                key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
+                reasons[key] = reasons.get(key, 0) + 1
+        except RetryAfter as ex:
+            # Telegram flood-wait - ruk jao, warna aur limit lagegi
+            wait = getattr(ex, "retry_after", "?")
+            logging.warning(f"user broadcast {bot_id}: flood-wait ({wait}s) - broadcast rok diya, "
+                            f"thodi der baad dobara try karo")
+            reasons["flood-wait"] = reasons.get("flood-wait", 0) + 1
+            break
         except Exception as ex:
             fail += 1
-        if (sent + fail) % 30 == 0:
+            key = mask_secrets(ex)[:60]
+            reasons[key] = reasons.get(key, 0) + 1
+        if (sent + fail + gone) % 30 == 0:
             try:
                 await q.message.edit_text(f"{pe('✈️')} Broadcasting... Sent: {sent}, Failed: {fail}", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
+    if reasons:
+        logging.warning(f"user broadcast {bot_id}: {fail} failed — " +
+                        ", ".join(f"{k} x{v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]))
+    logging.info(f"user broadcast {bot_id}: sent={sent} unreachable={gone} failed={fail} "
+                 f"media_issues={degraded}")
     await safe_edit_message_text(q, UIFormatter.broadcast_confirm(sent, fail), parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
     context.user_data.pop(f"broadcast_draft_{bot_id}", None)
 
 
+async def ensure_broadcast_subscription(bot_id: str, bot_token: Optional[str] = None,
+                                        owner_id: Optional[int] = None) -> bool:
+    """Agar userbot ke paas koi active subscription nahi hai to broadcast ke liye
+    1 din ka Basic khud se add karo aur bot ko (best effort) chalu kar do."""
+    added = db.grant_broadcast_subscription(bot_id, days=1, sub_type="Basic")
+    if not added:
+        return False
+    try:
+        if not is_account_running(bot_id):
+            if await start_user_bot(bot_token or "", bot_id, owner_id or 0):
+                db.set_user_bot_active(bot_id, True)
+            else:
+                logging.warning(f"{bot_id}: trial subscription added but bot start nahi ho paya")
+    except Exception as ex:
+        logging.error(f"auto-start after trial subscription failed for {bot_id}: {mask_secrets(ex)}")
+    return True
+
+
 # ================= ADMIN PANEL FUNCTIONS =================
+async def _try_delete_message(msg):
+    """Secret wala message (bot token / phone) chat se hata do - best effort."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+ADMIN_ADD_ACCOUNT_KEY = "admin_add_account"
+
+
+def _admin_add_state(context) -> Optional[Dict[str, Any]]:
+    st = context.user_data.get(ADMIN_ADD_ACCOUNT_KEY)
+    return st if isinstance(st, dict) else None
+
+
+def _admin_add_set(context, kind: str, step: str, user_id: Optional[int] = None):
+    st = _admin_add_state(context) or {}
+    st.update({"kind": kind, "step": step})
+    if user_id is not None:
+        st["user_id"] = int(user_id)
+    context.user_data[ADMIN_ADD_ACCOUNT_KEY] = st
+    return st
+
+
+def _admin_add_clear(context):
+    context.user_data.pop(ADMIN_ADD_ACCOUNT_KEY, None)
+
+
+def admin_add_kb(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(list(rows) + [[btn("❌ Cancel", "admin_add_cancel", "danger", "❌")]])
+
+
+async def show_admin_sub_picker(q, context=None):
+    """ADD SUBSCRIPTION: pehle account choose (button), phir sirf "30 Basic" bhejna hai."""
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        await safe_edit_message_text(q, f"{pe('❌')} Koi bot/account nahi mila. Pehle ➕ Add Account karo.",
+                                     parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        return
+    rows = []
+    for b in bots:
+        bot_id = str(b.get("bot_id"))
+        sub = None
+        try:
+            sub = db.get_subscription_for_bot(bot_id)
+        except Exception:
+            pass
+        icon = "🤖"
+        name = b.get("bot_username") or bot_id
+        label = f"{icon} {name}"
+        if sub:
+            label += f" ✅ {sub.get('subscription_type') or 'active'}"
+        rows.append([btn(label[:60], f"admin_quick_sub_{bot_id}", "primary", "⭐️")])
+    rows.append([btn("⌨️ Khud type karo (bot_id days Plan)", "admin_add_sub_manual", "success", "⌨️")])
+    rows.append([btn("Back", "admin_panel", "primary", "🔙")])
+    await safe_edit_message_text(
+        q,
+        f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\n"
+        f"Kis account ko subscription deni hai? Button dabao — phir sirf <b>days aur plan</b> "
+        f"bhejna hoga (jaise <code>30 Basic</code>).\n\n"
+        f"{pe('ℹ️')} ✅ = pehle se active subscription",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
+def admin_add_user_id_text(kind: str = "bot") -> str:
+    return (f"<blockquote>{pp('🆔')} <b>USER ID (1/3)</b></blockquote>\n\n"
+            f"Jis client ka bot add karna hai uska <b>Telegram user ID</b> bhejo (sirf numbers).\n\n"
+            "Example: <code>123456789</code>")
+
+
+def admin_add_token_text() -> str:
+    return ("<blockquote>🤖 <b>BOT TOKEN (2/3)</b></blockquote>\n\n"
+            "Ab <b>BotFather</b> wala token bhejo.\n"
+            "Format: <code>123456789:ABCdef...</code>\n\n"
+            "BotFather -> /mybots -> apna bot -> API Token")
+
+
+def _known_user_hint(user_id: int) -> str:
+    try:
+        if db.get_user(user_id):
+            return ""
+    except Exception:
+        return ""
+    return (f"\n\n{pe('ℹ️')} Note: is user_id ka record DB me nahi mila (client ne shayad kabhi main bot "
+            f"start nahi kiya) — phir bhi account add ho jayega.")
+
+
+async def _admin_add_finish_bot(msg, context, target: int, token: str):
+    """Token check karo, bot add karo, phir subscription ka rasta dikhao."""
+    try:
+        test_bot = Bot(token=token)
+        bot_info = await test_bot.get_me()
+        bot_id = db.add_user_bot(target, token, bot_info.username)
+    except Exception as ex:
+        await reply_premium_message(msg, f"{pe('❌')} Token check fail hua: {mask_secrets(ex)}\n\n"
+                                        f"Sahi token dobara bhejo (yehi step chalu rahega).",
+                                    parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+        return
+    _admin_add_clear(context)
+    # token wala message chat me na rahe (leak se bachav) - response ke baad delete
+    await _try_delete_message(msg)
+    await reply_premium_message(
+        msg,
+        f"<blockquote>{pp('✅')} <b>BOT ACCOUNT ADDED</b></blockquote>\n\n"
+        f"{pp('🤖')} @{bot_info.username}\n"
+        f"{pp('🆔')} <code>{bot_id}</code>\n"
+        f"{pp('👤')} Owner: <code>{target}</code>\n\n"
+        f"{pe('⚠️')} Ab is bot ko <b>subscription</b> do - tabhi ye chalu hoga.\n"
+        f"{pe('📌')} Aur bot ko apne channel me <b>admin</b> banana padega.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [btn("💰 Add Subscription (30 days Basic)", f"admin_quick_sub_{bot_id}", "success", "💰")],
+            [btn("➕ Add Another Account", "admin_add_userbot", "primary", "➕")],
+            [btn("👑 Admin Panel", "admin_panel", "primary", "👑")]]))
+    logging.info(f"admin: bot account {bot_id} (@{bot_info.username}) user {target} ke liye add hua")
+
+
+async def admin_add_account_message(msg, context, user) -> bool:
+    """ADD ACCOUNT wizard: user_id -> token (purana ek-line format bhi chalta hai)."""
+    st = _admin_add_state(context)
+    if not st or not is_admin(user.id):
+        return False
+    text = (msg.text or msg.caption or "").strip()
+    if not text:
+        await reply_premium_message(msg, f"{pe('❌')} Text bhejo.", parse_mode=ParseMode.HTML,
+                                    reply_markup=admin_add_kb())
+        return True
+    step = st.get("step") or "user_id"
+
+    if step == "user_id":
+        parts = text.split()
+        # purana format bhi support: "user_id bot_token"
+        if len(parts) >= 2 and parts[0].isdigit() and ":" in parts[1]:
+            await _admin_add_finish_bot(msg, context, int(parts[0]), parts[1])
+            return True
+        digits = re.sub(r"\D", "", text)
+        if len(digits) < 5:
+            await reply_premium_message(msg, f"{pe('❌')} Ye user ID nahi lag rahi — sirf numbers bhejo "
+                                            f"(jaise <code>123456789</code>).",
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+            return True
+        target = int(digits)
+        _admin_add_set(context, "bot", "token", target)
+        await reply_premium_message(msg, admin_add_token_text() + _known_user_hint(target),
+                                    parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+        return True
+
+    if step == "token":
+        token = text
+        if ":" not in token or len(token) < 20:
+            await reply_premium_message(msg, f"{pe('❌')} Token galat format me hai. BotFather se poora token "
+                                            f"copy karke bhejo (jaise <code>123456789:ABCdef...</code>).",
+                                        parse_mode=ParseMode.HTML, reply_markup=admin_add_kb())
+            return True
+        await _admin_add_finish_bot(msg, context, int(st.get("user_id") or 0), token)
+        return True
+
+    return False
+
+
 async def show_admin_userbot_control(q, context: ContextTypes.DEFAULT_TYPE):
     bots = db.get_all_user_bots()
     if not bots:
         await safe_edit_message_text(q, f"{pe('‼️')} No user bots found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
 
-    running_count = sum(1 for bot in bots if bot["bot_id"] in user_bot_applications)
+    running_count = sum(1 for bot in bots if is_account_running(bot["bot_id"]))
     premium_count = sum(1 for bot in bots if db.get_subscription_for_bot(bot["bot_id"]))
     stopped_count = max(len(bots) - running_count, 0)
 
@@ -2670,19 +5262,20 @@ async def show_admin_userbot_control(q, context: ContextTypes.DEFAULT_TYPE):
              f"{pp('📌')} <b>Bot List</b>"]
 
     for bot in bots:
-        is_running = bot["bot_id"] in user_bot_applications
+        is_running = is_account_running(bot["bot_id"])
         sub = db.get_subscription_for_bot(bot["bot_id"])
         status_icon = pe('🟢') if is_running else pe('🔴')
         plan_text = sub["subscription_type"] if sub else "No active plan"
         plan_icon = pe('⭐️') if sub else pe('❌')
-        lines.append(f"{status_icon} <b>@{bot['bot_username'] or 'N/A'}</b>\n   <code>{bot['bot_id']}</code> • {'Running' if is_running else 'Stopped'} • {plan_icon} {plan_text}")
+        kind = "🤖 bot"
+        lines.append(f"{status_icon} <b>{account_display_name(bot, bot['bot_id'])}</b> ({kind})\n   <code>{bot['bot_id']}</code> • {'Running' if is_running else 'Stopped'} • {plan_icon} {plan_text}")
 
     kb = []
     for bot in bots:
-        is_running = bot["bot_id"] in user_bot_applications
+        is_running = is_account_running(bot["bot_id"])
         row = []
         if is_running:
-            row.append(btn(f"Stop @{bot['bot_username'] or bot['bot_id']}", f"admin_ub_stop_{bot['bot_id']}", "danger", "🛑"))
+            row.append(btn(f"Stop {bot['bot_username'] or bot['bot_id']}", f"admin_ub_stop_{bot['bot_id']}", "danger", "🛑"))
         else:
             row.append(btn(f"Start @{bot['bot_username'] or bot['bot_id']}", f"admin_ub_start_{bot['bot_id']}", "success", "🚀"))
         row.append(btn("Info", f"admin_ub_info_{bot['bot_id']}", "primary", "📊"))
@@ -2700,7 +5293,7 @@ async def show_admin_ub_info(q, bot_id_target: str, context: ContextTypes.DEFAUL
             return
         sub = db.get_subscription_for_bot(bot_id_target)
         user_doc = db.get_user(bot_data["user_id"]) or {}
-        is_running = bot_id_target in user_bot_applications
+        is_running = is_account_running(bot_id_target)
         lines = [f"<blockquote>{pp('🔎')} <b>USERBOT INFO</b></blockquote>\n"]
         lines.append(f"{pp('👤')} <b>User:</b> {user_doc.get('first_name', '')} @{user_doc.get('username', '') or 'N/A'} ({bot_data['user_id']})")
         lines.append(f"{pp('🤖')} <b>Bot:</b> @{bot_data['bot_username'] or 'N/A'}")
@@ -2765,12 +5358,12 @@ async def show_stats(q):
     users = db.get_all_users()
     bots = db.get_all_user_bots()
     subs = db.get_all_subscriptions()
-    running = len(user_bot_applications)
+    running = sum(1 for b in bots if is_account_running(b["bot_id"]))
     userbot_counts = db.get_userbot_user_counts()
     total_userbot_users = sum(row["users"] for row in userbot_counts)
     count_lines = []
     for row in userbot_counts[:25]:
-        status = pe('🟢') if row["bot_id"] in user_bot_applications else pe('🔴')
+        status = pe('🟢') if is_account_running(row["bot_id"]) else pe('🔴')
         count_lines.append(f"{status} <b>@{row['bot_username'] or 'N/A'}</b> — <code>{row['bot_id']}</code> — <b>{row['users']}</b> users")
     if len(userbot_counts) > 25:
         count_lines.append(f"<i>…and {len(userbot_counts) - 25} more userbots</i>")
@@ -2806,7 +5399,7 @@ async def start_all_userbots(q):
     skipped = 0
     for bot in bots:
         bot_id = bot["bot_id"]
-        if bot_id in user_bot_applications:
+        if is_account_running(bot_id):
             skipped += 1
             continue
         sub = db.get_subscription_for_bot(bot_id)
@@ -2819,7 +5412,9 @@ async def start_all_userbots(q):
         except Exception:
             continue
         try:
-            await start_user_bot(bot["bot_token"], bot_id, bot["user_id"])
+            if not await start_user_bot(bot["bot_token"], bot_id, bot["user_id"]):
+                failed += 1
+                continue
             db.set_user_bot_active(bot_id, True)
             started += 1
         except Exception:
@@ -2933,6 +5528,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
 
     try:
+        # Easy button builder (➕ Add Button wizard) - handled before everything else
+        if data and data.startswith("bwz_"):
+            await handle_button_wizard_callback(q, context, data)
+            return
+
         if data == "main_menu":
             user = q.from_user
             await safe_edit_message_text(q, UIFormatter.main_menu(user.first_name), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
@@ -2941,7 +5541,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop(key, None)
             return
 
-        if data == "add_new_bot":
+        if data == "add_new_bot" or data == "add_bot_token":
             await safe_edit_message_text(q, f"<blockquote>{pp('🔐')} <b>ADD YOUR BOT</b></blockquote>\n\nSend your BotFather API token to link your bot:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "main_menu", "primary", "🔙")]]))
             context.user_data["waiting_token"] = True
             return
@@ -2953,10 +5553,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_edit_message_text(q, f"{pe('❌')} Bot not found!", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
             # Check if user is owner OR admin
-            if bot_data.get("user_id") != uid and not is_admin(uid):
+            if not is_bot_owner(bot_id, uid):
                 await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(uid))
                 return
-            await safe_edit_message_text(q, f"<blockquote>{pp('🤖')} <b>MANAGE BOT</b></blockquote>\n\nBot: @{bot_data['bot_username']}\nBot ID: {bot_id}", parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
+            _icon = "🤖"
+            _kind = "BOT"
+            await safe_edit_message_text(q, f"<blockquote>{pp(_icon)} <b>MANAGE {_kind}</b></blockquote>\n\n"
+                                            f"{_icon} {account_display_name(bot_data, bot_id)}\n"
+                                            f"ID: <code>{bot_id}</code>",
+                                         parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, uid))
+            return
+
+        # ---- userbot manage panel opened from the MAIN bot ----
+        if data and data.startswith(USERBOT_PANEL_PREFIXES):
+            panel_bot = resolve_managed_bot_id(uid, data)
+            if not panel_bot:
+                return
+            if not is_bot_owner(panel_bot, uid):
+                await safe_edit_message_text(q, f"{pe('❌')} You don't have permission to manage this bot.", parse_mode=ParseMode.HTML)
+                return
+            if data.startswith(READONLY_PANEL_PREFIXES):
+                # read-only panels main bot se hi chalte hain - isliye wahi handlers yahan
+                # bhi lagte hain jo userbot app me lagte hain.
+                await user_bot_callback(update, context, panel_bot, uid)
+                if data.startswith(("setbtn_", "setbtng_")):
+                    await handle_set_buttons_callback(update, context, panel_bot, uid)
+            else:
+                await show_manage_from_bot_help(q, panel_bot)
             return
 
         if data.startswith("sub_for_bot_"):
@@ -2971,10 +5594,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message_text(q, f"<blockquote>{pp('💰') if plan == 'Basic' else pp('⚡️')} <b>{plan} PLAN SELECTED</b></blockquote>\n\n{'Rs2599/month — 1 channel' if plan == 'Basic' else 'Rs3999/month — 5 channels'}\n\n{pp('📞')} Contact {ADMIN_USERNAME} to complete payment.", parse_mode=ParseMode.HTML, reply_markup=subscription_plans_kb(bot_id))
             return
 
+        if data == "admin_diag":
+            if not is_admin(uid):
+                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
+                return
+            text = build_diag_text()
+            logging.info(f"diag ({uid}):\n{strip_premium_emojis(text)}")
+            await safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+            return
+
+        if data == "diag_reset_unreachable":
+            if not is_admin(uid):
+                await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
+                return
+            try:
+                cleared = db.clear_initiate_blocked_unreachable()
+                note = (f"{pe('🧹')} {cleared} users ke purane \"bot can't initiate conversation\" "
+                        f"marks saaf kiye - user ke /start karne par inhe DM ja sakti hai."
+                        if cleared else
+                        f"{pe('ℹ️')} Koi purana initiate-blocked mark nahi mila - kuch karne ki "
+                        f"zarurat nahi thi.")
+            except Exception as ex:
+                note = f"{pe('❌')} Reset fail hua: {mask_secrets(ex)}"
+            logging.info(f"diag reset unreachable ({uid}): {strip_premium_emojis(note)}")
+            await safe_edit_message_text(q, note + "\n\n" + build_diag_text(),
+                                         parse_mode=ParseMode.HTML, reply_markup=diag_kb())
+            return
+
         if data == "admin_panel":
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
                 return
+            # leaving the panel drops any half-finished broadcast (avoids a stale draft)
+            for stale_key in ("admin_broadcast", "admin_broadcast_stage", "admin_broadcast_draft",
+                              "admin_bcast_selected", "admin_broadcast_target"):
+                context.user_data.pop(stale_key, None)
+            context.user_data.pop(BUTTON_WIZARD_KEY, None)
             await safe_edit_message_text(q, f"<blockquote>{pp('👑')} <b>ADMIN PANEL</b></blockquote>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             return
 
@@ -2993,14 +5648,65 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_add_userbot":
             if not is_admin(uid):
                 return
-            await safe_edit_message_text(q, f"<blockquote>{pp('🚀')} <b>ADD USERBOT</b></blockquote>\n\nSend: <code>user_id bot_token</code>\nExample: <code>123456789 123456:ABCdef...</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
-            context.user_data["admin_add_userbot"] = True
+            _admin_add_clear(context)
+            _admin_add_set(context, "bot", "user_id")
+            await safe_edit_message_text(q, admin_add_user_id_text(), parse_mode=ParseMode.HTML,
+                                         reply_markup=admin_add_kb())
+            return
+
+        if data == "admin_add_bot":
+            if not is_admin(uid):
+                return
+            _admin_add_set(context, "bot", "user_id")
+            await safe_edit_message_text(q, admin_add_user_id_text("bot"), parse_mode=ParseMode.HTML,
+                                         reply_markup=admin_add_kb())
+            return
+
+        if data == "admin_add_cancel":
+            if not is_admin(uid):
+                return
+            _admin_add_clear(context)
+            context.user_data.pop("admin_add_sub", None)
+            context.user_data.pop("admin_add_sub_bot", None)
+            await safe_edit_message_text(q, f"{pe('❌')} Add-account cancel kar diya.",
+                                         parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            return
+
+        if data.startswith("admin_quick_sub_"):
+            # ADD ACCOUNT ke turant baad: bot_id pehle se pata hai -> "days Plan" kaafi hai
+            if not is_admin(uid):
+                return
+            bot_id = data.replace("admin_quick_sub_", "")
+            row = db.get_user_bot(bot_id) or {}
+            context.user_data["admin_add_sub"] = True
+            context.user_data["admin_add_sub_bot"] = bot_id
+            await safe_edit_message_text(
+                q,
+                f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\n"
+                f"{pp('🤖')} {account_display_name(row, bot_id) if row else bot_id}\n"
+                f"{pp('🆔')} <code>{bot_id}</code>\n\n"
+                "Ab sirf <b>days aur plan</b> bhejo:\n"
+                "<code>30 Basic</code>  ya  <code>90 Pro</code>",
+                parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             return
 
         if data == "admin_add_sub":
             if not is_admin(uid):
                 return
-            await safe_edit_message_text(q, f"<blockquote>{pp('⭐️')} <b>ADD SUBSCRIPTION</b></blockquote>\n\nSend: <code>@bot_username days Plan</code>\nExample: <code>@KALAKAAR_xBOT 30 Basic</code>\n\nOr: <code>bot_id days Plan</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
+            context.user_data.pop("admin_add_sub_bot", None)
+            context.user_data.pop("admin_add_sub", None)
+            await show_admin_sub_picker(q, context)
+            return
+
+        if data == "admin_add_sub_manual":
+            if not is_admin(uid):
+                return
+            await safe_edit_message_text(q,
+                                         f"<blockquote>{pp('⌨️')} <b>ADD SUBSCRIPTION (manual)</b></blockquote>\n\n"
+                                         "Bhejo: <code>@username days Plan</code> ya <code>bot_id days Plan</code>\n"
+                                         "Example: <code>b1 30 Basic</code>",
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_add_sub", "primary", "🔙")]]))
             context.user_data["admin_add_sub"] = True
             return
 
@@ -3150,14 +5856,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             idx = int(data.replace("admin_leave_set_btns_", ""))
-            context.user_data["admin_set_leave_btns_idx"] = idx
+            kb = InlineKeyboardMarkup([
+                button_builder_row(context, {"kind": "leave_msg", "idx": idx,
+                                             "back_cb": "admin_leave_msgs"}),
+                [btn("Back", "admin_leave_msgs", "primary", "🔙")],
+            ])
             await safe_edit_message_text(q,
-                f"<blockquote>{pp('🔘')} <b>SET BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
-                "Send button lines.\n\nFormat:\n"
-                "• <code>Button Label|https://link</code>\n"
-                "• <code>Label1|https://url1 || Label2|https://url2</code>\n\n"
-                "Multiple buttons per row use <code> || </code> separator.",
-                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_leave_msgs", "primary", "🔙")]]))
+                f"<blockquote>{pp('🔘')} <b>BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
+                "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
+                "<b>Paste Many</b> = bulk format (premium emoji supported)\n"
+                "<code>Button Label|https://link</code>\n"
+                "<code>Label1|https://url1 || Label2|https://url2</code>",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
         if data == "admin_leave_channels":
@@ -3214,7 +5924,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST</b></blockquote>\n\nChoose target:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-                [btn("Specific UserBot", "admin_bcast_target_select", "primary", "🎯")],
+                [btn("Select UserBots (multi)", "admin_bcast_target_select", "primary", "🎯")],
                 [btn("All UserBots", "admin_bcast_target_all", "success", "🌐")],
                 [btn("Back", "admin_panel", "primary", "🔙")],
             ]))
@@ -3225,19 +5935,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data["admin_broadcast"] = True
             context.user_data["admin_broadcast_target"] = None
-            await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO ALL</b></blockquote>\n\nSend text or media to broadcast to all userbots' users.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
+            context.user_data.pop("admin_bcast_selected", None)
+            await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO ALL</b></blockquote>\n\nSend text, media ya album (4-5 photo/video + caption) — buttons baad me add kar sakte ho.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
             return
 
         if data == "admin_bcast_target_select":
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data.startswith("admin_bcast_tog_"):
             if not is_admin(uid):
                 return
-            bots = db.get_all_user_bots() or []
-            if not bots:
-                await safe_edit_message_text(q, f"{pe('❌')} No userbots found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            bot_id = data.replace("admin_bcast_tog_", "")
+            selected = broadcast_selected_ids(context)
+            if bot_id in selected:
+                selected = [b for b in selected if b != bot_id]
+            else:
+                selected.append(bot_id)
+            context.user_data["admin_bcast_selected"] = selected
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data == "admin_bcast_sel_all":
+            if not is_admin(uid):
                 return
-            kb = [[btn(f"@{bot['bot_username']} ({bot['bot_id']})", f"admin_bcast_pick_{bot['bot_id']}", "primary", "🤖")] for bot in bots]
-            kb.append([btn("Back", "admin_broadcast", "primary", "🔙")])
-            await safe_edit_message_text(q, f"{pe('🤖')} Select userbot:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            context.user_data["admin_bcast_selected"] = [str(b["bot_id"]) for b in (db.get_all_user_bots() or [])]
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data == "admin_bcast_sel_none":
+            if not is_admin(uid):
+                return
+            context.user_data["admin_bcast_selected"] = []
+            await render_admin_bcast_targets(q, context)
+            return
+
+        if data == "admin_bcast_sel_done":
+            if not is_admin(uid):
+                return
+            selected = broadcast_selected_ids(context)
+            if not selected:
+                await safe_edit_message_text(q, f"{pe('⚠️')} Kam se kam ek userbot select karo.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_bcast_target_select", "primary", "🔙")]]))
+                return
+            context.user_data["admin_broadcast"] = True
+            context.user_data["admin_broadcast_target"] = None
+            await safe_edit_message_text(q,
+                f"<blockquote>{pp('✈️')} <b>BROADCAST → {len(selected)} USERBOT(S)</b></blockquote>\n\n"
+                f"Ab message bhejo — text, photo, video, document ya album (4-5 media + caption).\n\n"
+                f"{pe('🔘')} Buttons add karne ka option draft save hone ke baad milega.\n"
+                f"{pe('⚠️')} Jis userbot ka subscription nahi hai, usme 1 din ka Basic khud add ho jayega.",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_bcast_target_select", "primary", "🔙")]]))
             return
 
         if data.startswith("admin_bcast_pick_"):
@@ -3246,6 +5993,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_id = data.replace("admin_bcast_pick_", "")
             context.user_data["admin_broadcast"] = True
             context.user_data["admin_broadcast_target"] = bot_id
+            context.user_data["admin_bcast_selected"] = [bot_id]
             await safe_edit_message_text(q, f"<blockquote>{pp('✈️')} <b>BROADCAST TO USERBOT {bot_id}</b></blockquote>\n\nSend text or media to broadcast.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
             return
 
@@ -3253,11 +6001,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(uid):
                 return
             draft = context.user_data.get("admin_broadcast_draft", {})
-            if draft:
-                context.user_data["admin_broadcast_stage"] = "await_buttons"
-                await safe_edit_message_text(q, f"{pe('🔘')} Send button lines (Text|https://link per line):", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
-            else:
+            if not draft:
                 await safe_edit_message_text(q, f"{pe('❌')} No draft found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            tid = register_button_target(context, admin_broadcast_target())
+            await start_button_wizard(q, context, tid)
+            return
+
+        if data == "admin_bcast_capmode":
+            if not is_admin(uid):
+                return
+            draft = get_broadcast_draft(context, "admin")
+            if not draft:
+                await q.answer("Pehle album/message bhejo", show_alert=True)
+                return
+            draft["caption_with_buttons"] = not draft.get("caption_with_buttons", False)
+            save_broadcast_draft(context, "admin", None, draft)
+            await q.answer("Caption ab " + ("buttons ke saath (album ke neeche ek message me)" if draft["caption_with_buttons"] else "album par hi rahega"))
+            try:
+                await q.edit_message_reply_markup(reply_markup=admin_broadcast_ready_kb(context))
+            except Exception as ex:
+                logging.warning(f"caption mode kb update failed: {ex}")
             return
 
         if data == "admin_bcast_send":
@@ -3314,7 +6078,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         exp = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
                         if exp > now_aware():
-                            await start_user_bot(bot_data["bot_token"], bot_id, bot_data["user_id"])
+                            if not await start_user_bot(bot_data["bot_token"], bot_id, bot_data["user_id"]):
+                                await safe_edit_message_text(q, f"{pe('❌')} Bot start nahi ho paya - token invalid lagta hai (naya token add karo).", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                                return
                             await safe_edit_message_text(q, f"{pe('✅')} Bot @{bot_data['bot_username']} started.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
                         else:
                             await safe_edit_message_text(q, f"{pe('❌')} Subscription expired.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
@@ -3366,62 +6132,158 @@ async def preview_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = q.from_user.id
     try:
-        await send_media(context, uid, draft.get("media"), draft.get("media_type") or "text",
-                         draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                         entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+        await send_draft_message(context, uid, draft, markup=buttons_to_markup(draft.get("buttons_json")))
     except Exception as ex:
         await safe_edit_message_text(q, f"{pe('❌')} Preview failed: {str(ex)}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
-    target_bot = draft.get("target_bot")
-    target_label = f"userbot {target_bot}" if target_bot else "ALL userbots"
-    await safe_edit_message_text(q, f"{pe('✅')} Preview sent above.\n{pe('✈️')} Confirm broadcast to <b>{target_label}</b>?", parse_mode=ParseMode.HTML, reply_markup=confirm_kb("admin_bcast_confirm", "admin_panel"))
+    await safe_edit_message_text(q, f"{pe('✅')} Preview sent above.\n{pe('✈️')} Confirm broadcast to <b>{broadcast_target_label(draft)}</b>?",
+                                 parse_mode=ParseMode.HTML, reply_markup=confirm_kb("admin_bcast_confirm", "admin_panel"))
 
 
 async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
     draft = context.user_data.get("admin_broadcast_draft", {})
-    for key in ["admin_broadcast", "admin_broadcast_stage", "admin_broadcast_target"]:
+    selected = [str(b) for b in ((draft.get("target_bots") or broadcast_selected_ids(context))) if b]
+    if not selected and draft.get("target_bot"):
+        selected = [str(draft["target_bot"])]
+    for key in ["admin_broadcast", "admin_broadcast_stage", "admin_broadcast_target", "admin_bcast_selected"]:
         context.user_data.pop(key, None)
     if not draft:
         await safe_edit_message_text(q, f"{pe('❌')} No draft to send.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
-    bots = db.get_all_user_bots()
-    if draft.get("target_bot"):
-        bots = [b for b in bots if b["bot_id"] == draft["target_bot"]]
-    await safe_edit_message_text(q, f"{pe('✈️')} Admin broadcast started...", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+    all_bots = db.get_all_user_bots() or []
+    bots = [b for b in all_bots if str(b["bot_id"]) in selected] if selected else all_bots
+    if not bots:
+        await safe_edit_message_text(q, f"{pe('❌')} Selected userbot(s) not found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        context.user_data.pop("admin_broadcast_draft", None)
+        return
+    await safe_edit_message_text(q, f"{pe('✈️')} Admin broadcast started — {len(bots)} userbot(s)…", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+    markup = buttons_to_markup(draft.get("buttons_json"))
     total_sent = 0
     total_fail = 0
+    auto_subs: List[str] = []
+    per_bot_lines: List[str] = []
     for bot in bots:
         bot_id = bot["bot_id"]
-        sub = db.get_subscription_for_bot(bot_id)
-        if not sub:
-            continue
-        try:
-            exp = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
-            if exp < now_aware():
-                continue
-        except Exception:
-            continue
-        if bot_id in user_bot_applications:
-            bot_instance = user_bot_applications[bot_id].bot
-        else:
+        # Agar subscription nahi hai to 1 din ka Basic khud se add karo, warna broadcast
+        # us userbot ke users tak kabhi nahi pahunchta.
+        if await ensure_broadcast_subscription(bot_id, bot.get("bot_token"), bot.get("user_id")):
+            auto_subs.append(bot_id)
+        bot_instance = get_account_sender(bot_id)
+        if bot_instance is None:
             try:
                 bot_instance = Bot(token=bot["bot_token"])
-            except Exception:
+            except Exception as ex:
+                logging.error(f"admin broadcast: bad token for {bot_id}: {mask_secrets(ex)}")
+                per_bot_lines.append(f"❌ {bot.get('bot_username') or bot_id}: bot start nahi hua")
                 continue
-        recipients = db.get_requesters_for_bot(bot_id)
+        recipients = list(dict.fromkeys(db.get_requesters_for_bot(bot_id) or []))
+        bot_sent = 0
+        bot_fail = 0
+        bot_gone = 0
+        bot_degraded = 0
+        reasons: Dict[str, int] = {}
+        # Media main bot ne receive ki hoti hai -> is userbot ke liye refs translate karo
+        # (warna har user par "wrong file identifier/http url specified" aata hai)
+        bot_draft = await translate_draft_for_bot(draft, bot_instance, context.bot)
+        media_translated = any(
+            isinstance(m, str) and m.startswith("http")
+            for m in ([i.get("media") for i in (bot_draft.get("album") or [])] or [bot_draft.get("media")])
+            if m)
         for r in recipients:
             try:
-                await send_media(bot_instance, r, draft.get("media"), draft.get("media_type") or "text",
-                                 draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                                 entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
-                total_sent += 1
-            except Forbidden:
-                total_fail += 1
-            except Exception:
-                total_fail += 1
-    target_label = f"userbot {draft['target_bot']}" if draft.get("target_bot") else "ALL userbots"
-    await safe_edit_message_text(q, f"<blockquote>{pp('✅')} <b>ADMIN BROADCAST COMPLETE</b></blockquote>\n\n{pp('📤')} Target: {target_label}\n{pp('✅')} Sent: {total_sent}\n{pp('❌')} Failed: {total_fail}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                status = await send_draft_message(bot_instance, r, bot_draft, markup=markup)
+                bot_sent += 1
+                if status == "degraded":
+                    bot_degraded += 1
+                db.mark_reachable(bot_id, r)
+            except Forbidden as ex:
+                # blocked by user / "Bot can't initiate conversation with a user"
+                bot_gone += 1
+                db.mark_unreachable(bot_id, r)
+                db.mark_permanently_unreachable(bot_id, r, str(ex))
+            except BadRequest as ex:
+                if is_user_gone_error(ex):
+                    bot_gone += 1
+                    db.mark_unreachable(bot_id, r)
+                    db.mark_permanently_unreachable(bot_id, r, str(ex))
+                else:
+                    bot_fail += 1
+                    key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
+                    reasons[key] = reasons.get(key, 0) + 1
+            except RetryAfter as ex:
+                wait = getattr(ex, "retry_after", "?")
+                logging.warning(f"admin broadcast {bot_id}: flood-wait ({wait}s) - is bot ko rok diya")
+                reasons["flood-wait"] = reasons.get("flood-wait", 0) + 1
+                break
+            except Exception as ex:
+                bot_fail += 1
+                key = mask_secrets(ex)[:60]
+                reasons[key] = reasons.get(key, 0) + 1
+        if bot_degraded:
+            logging.warning(f"admin broadcast {bot_id}: {bot_degraded} users ko media ke bina "
+                            f"caption+buttons mila (media file issue - naya media bhej ke retry karo)")
+        if reasons:
+            logging.warning(f"admin broadcast {bot_id}: {bot_fail} failed — " +
+                            ", ".join(f"{k} x{v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]))
+        logging.info(f"admin broadcast {bot_id}: recipients={len(recipients)} sent={bot_sent} "
+                     f"unreachable={bot_gone} failed={bot_fail} media_issues={bot_degraded} "
+                     f"media_translated={media_translated}")
+        total_sent += bot_sent
+        total_fail += bot_gone + bot_fail
+        per_bot_lines.append(f"• @{bot.get('bot_username') or bot_id}: {bot_sent} sent, "
+                             f"{bot_gone + bot_fail} failed ({bot_gone} unreachable)"
+                             + (f", {bot_degraded} media-issue" if bot_degraded else "")
+                             + ("  (1d Basic auto-added)" if bot_id in auto_subs else ""))
+    summary = "\n".join(per_bot_lines[-15:])
+    auto_line = ""
+    if auto_subs:
+        auto_line = f"\n{pp('⭐️')} 1-day Basic auto-added: {len(auto_subs)} userbot(s)"
+    await safe_edit_message_text(q,
+                                 f"<blockquote>{pp('✅')} <b>ADMIN BROADCAST COMPLETE</b></blockquote>\n\n"
+                                 f"{pp('📤')} Target: {broadcast_target_label(draft)}\n"
+                                 f"{pp('✅')} Sent: {total_sent}\n"
+                                 f"{pp('❌')} Failed: {total_fail}{auto_line}\n\n{summary}",
+                                 parse_mode=ParseMode.HTML, reply_markup=admin_kb())
     context.user_data.pop("admin_broadcast_draft", None)
+
+
+async def render_admin_bcast_targets(q, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-select list: har userbot ko tick karke Done dabao."""
+    if not is_admin(q.from_user.id):
+        return
+    bots = db.get_all_user_bots() or []
+    if not bots:
+        await safe_edit_message_text(q, f"{pe('❌')} No userbots found.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+        return
+    selected = set(broadcast_selected_ids(context))
+    rows: List[List[InlineKeyboardButton]] = [[
+        btn("Select All", "admin_bcast_sel_all", "primary", "✅"),
+        btn("Clear", "admin_bcast_sel_none", "danger", "🗑"),
+    ]]
+    for bot in bots:
+        bot_id = str(bot["bot_id"])
+        sub = db.get_active_subscription(bot_id)
+        if sub:
+            try:
+                expiry = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
+                days_left = max((expiry - now_aware()).days, 0)
+            except Exception:
+                days_left = 0
+            status = f"{sub['subscription_type']} {days_left}d"
+        else:
+            status = "no sub → 1d Basic auto"
+        mark = "☑️" if bot_id in selected else "⬜"
+        label = f"{mark} @{bot.get('bot_username') or bot_id} • {status}"
+        rows.append([btn(label[:60], f"admin_bcast_tog_{bot_id}", "primary", "🤖")])
+    rows.append([btn(f"Done ({len(selected)} selected)", "admin_bcast_sel_done", "success", "✅")])
+    rows.append([btn("Back", "admin_broadcast", "primary", "🔙")])
+    await safe_edit_message_text(q,
+                                 f"<blockquote>{pp('✈️')} <b>SELECT USERBOTS</b></blockquote>\n\n"
+                                 "Jitne userbots ko select karna hai unhe tick karo (ek-ek karke, ya Select All), "
+                                 "phir <b>Done</b> dabao.\n\n"
+                                 f"{pe('ℹ️')} Jis userbot ka subscription nahi hai, usme 1 din ka Basic khud add ho jayega.\n\n"
+                                 f"<b>Selected:</b> {len(selected)}",
+                                 parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ================= MAIN MESSAGE HANDLER =================
@@ -3431,6 +6293,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     if not msg:
+        return
+
+    # Easy button builder (➕ Add Button wizard) has priority over everything else
+    if await handle_button_wizard_message(msg, context):
         return
 
     if context.user_data.get("waiting_token") and not is_admin(user.id):
@@ -3446,6 +6312,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_premium_message(msg, f"{pe('❌')} Invalid token or bot error: {ex}\n\nPlease try again.", parse_mode=ParseMode.HTML)
         else:
             await reply_premium_message(msg, f"{pe('❌')} Invalid token format. Please send the correct BotFather token.", parse_mode=ParseMode.HTML)
+        return
+
+    # ADD ACCOUNT wizard (bot) - step by step
+    if _admin_add_state(context) and await admin_add_account_message(msg, context, user):
         return
 
     if context.user_data.get("admin_add_userbot") and is_admin(user.id):
@@ -3467,6 +6337,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_add_sub") and is_admin(user.id):
         parts = msg.text.strip().split()
+        _prefill = context.user_data.get("admin_add_sub_bot")
+        if _prefill and len(parts) == 2 and parts[0].isdigit():
+            parts = [str(_prefill)] + parts  # "30 Basic" -> "bot_id 30 Basic"
         if len(parts) >= 3:
             bot_identifier = parts[0]
             days = int(parts[1])
@@ -3486,16 +6359,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             db.add_subscription_for_bot(bot["bot_id"], plan, days)
             context.user_data.pop("admin_add_sub", None)
+            context.user_data.pop("admin_add_sub_bot", None)
             await reply_premium_message(msg, f"{pe('✅')} Subscription added!\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             try:
-                await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"])
+                started = await start_user_bot(bot.get("bot_token"), bot["bot_id"], bot["user_id"])
+                if started is False:
+                    raise RuntimeError("token invalid - naya token add karo")
                 db.set_user_bot_active(bot["bot_id"], True)
                 await send_premium_message(context.bot, bot["user_id"], f"<blockquote>{pp('✅')} <b>BOT ACTIVATED</b></blockquote>\n\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days\n\nYour bot is now running!", parse_mode=ParseMode.HTML)
             except Exception as e:
                 logging.error(f"Auto-start failed: {e}")
                 await send_premium_message(context.bot, bot["user_id"], f"<blockquote>{pp('✅')} <b>SUBSCRIPTION ACTIVATED</b></blockquote>\n\n{pp('🤖')} @{bot['bot_username']}\n{pp('⭐️')} {plan}\n{pp('📅')} {days} days\n\nUse /start to access your bot panel.", parse_mode=ParseMode.HTML)
         else:
-            await reply_premium_message(msg, f"{pe('❌')} Format: <code>@bot_username days Plan</code> or <code>bot_id days Plan</code>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            _hint = ("<code>days Plan</code> (jaise <code>30 Basic</code>)"
+                     if context.user_data.get("admin_add_sub_bot") else
+                     "<code>@bot_username days Plan</code> or <code>bot_id days Plan</code>")
+            await reply_premium_message(msg, f"{pe('❌')} Format: {_hint}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
         return
 
     if context.user_data.get("admin_set_leave_target") and is_admin(user.id):
@@ -3552,7 +6431,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_set_leave_btns_idx") is not None and is_admin(user.id):
         idx = context.user_data.pop("admin_set_leave_btns_idx")
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             cfg = db.get_leave_recovery_config()
             messages = cfg.get("messages", [])
@@ -3589,27 +6468,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("admin_broadcast") and is_admin(user.id):
         extracted = MessageManager.extract_from_message(msg)
-        draft = {
-            "text": msg.text or msg.caption or "",
-            "media": msg.photo[-1].file_id if msg.photo else (msg.video.file_id if msg.video else (msg.document.file_id if msg.document else None)),
-            "media_type": "photo" if msg.photo else ("video" if msg.video else ("document" if msg.document else "text")),
-            "entities_json": extracted["entities_json"],
-            "file_name": extracted.get("file_name"),
-            "mime_type": extracted.get("mime_type"),
-            "target_bot": context.user_data.get("admin_broadcast_target"),
-        }
+        # An album arrives as many updates - collect all of them first
+        if await collect_broadcast_album(context, "admin", None, msg, extracted):
+            return
+        if not (msg.text or msg.caption or extracted.get("media_id")):
+            await reply_premium_message(msg, f"{pe('⚠️')} Text, photo, video, document ya album bhejo.", parse_mode=ParseMode.HTML)
+            return
+        draft = make_broadcast_draft(extracted,
+                                     target_bots=broadcast_selected_ids(context) or None,
+                                     target_bot=context.user_data.get("admin_broadcast_target"))
         context.user_data["admin_broadcast_draft"] = draft
-        context.user_data["admin_broadcast_stage"] = "await_buttons"
-        await reply_premium_message(msg, f"{pe('✅')} Broadcast draft saved. Add buttons or send now?", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
-            [btn("Add Inline Buttons", "admin_bcast_add_btns", "primary", "🔘")],
-            [btn("Send Now", "admin_bcast_send", "success", "🚀")],
-            [btn("Cancel", "admin_panel", "danger", "❌")],
-        ]))
+        context.user_data["admin_broadcast_stage"] = "buttons_or_send"
+        context.user_data.pop("admin_broadcast", None)
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Broadcast draft saved.</b>\n"
+            f"{pe('📤')} Target: {broadcast_target_label(draft)}\n\n"
+            f"{pe('🔘')} <b>Add Button</b> se buttons banao, ya <b>Send Now</b> dabao.",
+            parse_mode=ParseMode.HTML, reply_markup=admin_broadcast_ready_kb(context))
         return
 
     if context.user_data.get("admin_broadcast_stage") == "await_buttons" and is_admin(user.id):
         draft = context.user_data.get("admin_broadcast_draft", {})
-        btn_json = buttons_json_from_text(msg.text or "")
+        btn_json = buttons_json_from_text(msg.text or "", msg.entities or msg.caption_entities)
         if btn_json:
             draft["buttons_json"] = btn_json
             context.user_data["admin_broadcast_draft"] = draft
@@ -3687,17 +6567,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err_str = str(context.error)
-    logging.error(f"Update {update} caused error {err_str}")
-    if "Message is not modified" in err_str:
-        return
-    if "Query is too old" in err_str:
+    err_str = mask_secrets(str(context.error))
+    if "Message is not modified" in err_str or "Query is too old" in err_str:
         return
     if "Forbidden" in err_str:
+        logging.warning(f"Forbidden (bot blocked / no rights): {err_str}")
         return
     if "NetworkError" in err_str or "ReadError" in err_str:
         logging.warning(f"Network error (will retry later): {err_str}")
         return
+    # Real bug: full traceback log karo, warna sirf "Update None caused error xxx"
+    # dikhta hai aur debug karna mushkil ho jata hai.
+    logging.error(f"Update {update} caused error {err_str}", exc_info=context.error)
 
 
 # ================= START / ADMIN COMMANDS =================
@@ -3728,9 +6609,62 @@ async def proof_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ================= MAIN =================
+async def start_bots_on_boot():
+    """Boot par pehle se saved userbots ko chalu karo (isolated - koi bhi error
+    main bot ko nahi rokta)."""
+    bots = db.get_all_user_bots()
+    if bots:
+        logging.info(f"Found {len(bots)} user bots to start")
+        for bot in bots:
+            bot_id = bot["bot_id"]
+            if not bot.get("bot_token"):
+                continue  # bina token wali purani rows skip (user-account system hata diya)
+            reason = ""
+            sub = db.get_subscription_for_bot(bot_id)
+            if not sub:
+                reason = "no subscription"
+            else:
+                try:
+                    expiry = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
+                    if expiry < now_aware():
+                        reason = "subscription expired"
+                except Exception as ex:
+                    logging.error(f"Error checking expiry for {bot_id}: {ex}")
+                    continue
+            if reason:
+                logging.info(f"Skipping {bot_id} - {reason}")
+                db.set_user_bot_active(bot_id, False)
+                continue
+            try:
+                if not await start_user_bot(bot.get("bot_token"), bot_id, bot.get("user_id") or 0):
+                    continue
+                db.set_user_bot_active(bot_id, True)
+                kind = f"user bot @{bot.get('bot_username')}"
+                logging.info(f"{pp('✅')} Started {kind} for {bot_id}")
+            except Exception as ex:
+                logging.error(f"{pp('❌')} Failed to start user bot {bot_id}: {mask_secrets(ex)}")
+    else:
+        logging.info("No user bots found in database")
+
+
 async def main():
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+    logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+    install_log_masking()
+    if install_force_ipv4():
+        logging.info(f"{pp('🌐')} FORCE_IPV4=1 - sirf IPv4 use hoga (IPv6 route ki wajah se "
+                     f"aane wale httpx.ReadError ke liye)")
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
+    logging.info(f"{pp('🏷')} build {BUILD_TAG} (agar ye line purani dikhe to ./start dobara "
+                 f"chalao - purana process chal raha hai)")
+    # Purane "bot can't initiate conversation" wale unreachable marks saaf karo: wo sach me
+    # permanent nahi hain (user ke /start karne par DM ja sakti hai).
+    try:
+        cleared = db.clear_initiate_blocked_unreachable()
+        if cleared:
+            logging.info(f"{pp('🧹')} {cleared} users ke purane \"bot can't initiate conversation\" "
+                         f"marks saaf kiye - user ke /start karne par inhe DM ja sakti hai")
+    except Exception as ex:
+        logging.warning(f"unreachable cleanup skip: {mask_secrets(ex)}")
 
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:
@@ -3748,46 +6682,16 @@ async def main():
                 user_bot_applications.pop(bot_id, None)
             db.set_user_bot_active(bot_id, False)
 
-    bots = db.get_all_user_bots()
-    if bots:
-        logging.info(f"Found {len(bots)} user bots to start")
-        for bot in bots:
-            sub = db.get_subscription_for_bot(bot["bot_id"])
-            if not sub:
-                logging.info(f"Skipping {bot['bot_id']} - no subscription")
-                db.set_user_bot_active(bot["bot_id"], False)
-                continue
-            try:
-                expiry = make_aware(sub["expiry_date"]) if isinstance(sub["expiry_date"], datetime) else sub["expiry_date"]
-                if expiry < now_aware():
-                    logging.info(f"Skipping {bot['bot_id']} - subscription expired")
-                    db.set_user_bot_active(bot["bot_id"], False)
-                    continue
-            except Exception as ex:
-                logging.error(f"Error checking expiry for {bot['bot_id']}: {ex}")
-                continue
-            try:
-                await start_user_bot(bot["bot_token"], bot["bot_id"], bot["user_id"])
-                db.set_user_bot_active(bot["bot_id"], True)
-                logging.info(f"{pp('✅')} Started user bot @{bot['bot_username']} for {bot['bot_id']}")
-            except Exception as ex:
-                logging.error(f"{pp('❌')} Failed to start user bot {bot['bot_id']}: {ex}")
-    else:
-        logging.info("No user bots found in database")
+    try:
+        await start_bots_on_boot()
+    except Exception as ex:  # userbot problem se main bot kabhi rukna nahi chahiye
+        logging.error(f"{pp('❌')} Userbot startup error (main bot phir bhi chalu hoga): {mask_secrets(ex)}")
 
-    from telegram.request import HTTPXRequest
-    request = HTTPXRequest(
-        connection_pool_size=100,
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=10.0,
-    )
-
-    app = ApplicationBuilder().token(MAIN_BOT_TOKEN).concurrent_updates(True).request(request).build()
+    app = ApplicationBuilder().token(MAIN_BOT_TOKEN).concurrent_updates(True).request(_tuned_request()).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("diag", diag_command))
     app.add_handler(CommandHandler("proof", proof_text_command))
     app.add_handler(CommandHandler("prooftext", proof_text_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
@@ -3796,11 +6700,20 @@ async def main():
 
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")
     app.job_queue.run_repeating(check_expired_subscriptions_job, interval=3600, first=120, name="expired_subscriptions_check")
+    app.job_queue.run_repeating(retry_inactive_userbots_job, interval=600, first=180, name="retry_inactive_userbots")
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
+    except (InvalidToken, Forbidden) as ex:
+        # Token revoked/leaked -> restart loop me bot ko jalao mat, seedha saaf message do.
+        logging.error(f"{pp('❌')} MAIN BOT TOKEN reject ho gaya ({mask_secrets(ex)}).\n"
+                      "Ye token leak ho chuka hai (public repo/chat), isliye Telegram ne revoke kar diya.\n"
+                      f"{MAIN_BOT_TOKEN_HINT}")
+        raise SystemExit(2)
     logging.info(f"{pp('✅')} Main bot started successfully")
+    await flush_token_failures(app.bot)
 
     try:
         await asyncio.Event().wait()
@@ -3818,13 +6731,24 @@ async def main():
 
 
 if __name__ == "__main__":
+    if not MAIN_BOT_TOKEN:
+        logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
+        install_log_masking()
+        logging.error(f"{pp('❌')} MAIN_BOT_TOKEN set nahi hai!\n{MAIN_BOT_TOKEN_HINT}")
+        raise SystemExit(1)
+
     while True:
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
             logging.info(f"{pp('🛑')} Stopped by user")
             break
+        except SystemExit as ex:
+            logging.error(f"{pp('❌')} Bot band (exit code {ex.code}) - upar wala message padho, "
+                          "config theek karke ./start dobara chalao")
+            # Non-zero exit: launcher/monitoring ko pata chale ki config galat hai
+            raise SystemExit(ex.code if isinstance(ex.code, int) and ex.code else 1)
         except Exception as ex:
-            logging.error(f"{pp('❌')} Fatal error: {ex}")
+            logging.exception(f"{pp('❌')} Fatal error: {mask_secrets(ex)}")
             logging.info(f"{pp('🔄')} Restarting in 10 seconds...")
             time.sleep(10)
