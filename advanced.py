@@ -8,6 +8,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from functools import wraps
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import user_sender as user_sender_mod
+from user_sender import UserAccountSender
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -81,7 +90,9 @@ def make_aware(dt):
     return dt
 
 # ================= CONFIG =================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7687421668:AAFzEsDO2L2EVkCm4MxhzSo8oGD0-8t5GKE")
+# Saare secrets/config .env se aate hain (kuch bhi hardcoded nahi).
+# Zaroori vars dekhein: .env.example
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "").strip()
 ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
@@ -403,268 +414,454 @@ def _extract_last_id(parts: list) -> int:
             return v
     return 0
 
-# ================= DATABASE =================
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/advanced_bot"
+# ================= DATABASE (MongoDB) =================
+# Poora database layer MongoDB par hai (pehle PostgreSQL tha). Koi ORM nahi —
+# seedha pymongo. Method names wahi rakhe gaye hain jo purane Database class me
+# the, isliye baaki application code unchanged chalta hai.
+#
+# Collections:
+#   users, user_bots, bot_subscriptions, user_bot_channels, user_bot_messages,
+#   join_requests, reachable_users, user_emoji_maps, system_settings,
+#   leave_recovery_messages, counters
+#
+# Config: MONGO_URI / MONGO_DB env vars (.env file se).
 
-try:
-    import psycopg2
-    from psycopg2.extras import Json, RealDictCursor
-except Exception:
-    psycopg2 = None
+import certifi
+import pymongo
+from pymongo import ReturnDocument
+
+MONGO_URI = os.getenv("MONGO_URI", "").strip() or "mongodb://127.0.0.1:27017"
+MONGO_DB_NAME = os.getenv("MONGO_DB", "").strip() or "advacc_bot"
+
+
+def _utc(dt):
+    """DB se aaya koi bhi datetime -> timezone-aware UTC (ya None)."""
+    if dt is None:
+        return None
+    return make_aware(dt) if isinstance(dt, datetime) else dt
+
+
+def _awareify(v):
+    """Recursive: dict/list ke andar ke saare datetime ko aware UTC banao."""
+    if isinstance(v, datetime):
+        return _utc(v)
+    if isinstance(v, dict):
+        return {k: _awareify(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_awareify(x) for x in v]
+    return v
 
 
 class Database:
-    def __init__(self):
-        if psycopg2 is None:
-            raise RuntimeError("PostgreSQL driver missing. Install: pip install psycopg2-binary")
-        self.conn = psycopg2.connect(DATABASE_URL)
-        self.conn.autocommit = True
+    def __init__(self, client=None):
+        if client is None:
+            kwargs = {"serverSelectionTimeoutMS": 15000, "tz_aware": True}
+            if MONGO_URI.startswith("mongodb+srv"):
+                kwargs["tlsCAFile"] = certifi.where()
+            client = pymongo.MongoClient(MONGO_URI, **kwargs)
+        self.client = client
+        self.db = client[MONGO_DB_NAME]
         self.init_db()
-        logging.info("PostgreSQL connected")
+        logging.info("MongoDB connected (db=%s)", MONGO_DB_NAME)
 
-    def _execute(self, sql: str, params: tuple = ()):
-        with self.conn.cursor() as cur:
-            cur.execute(sql, params)
+    # ── collections shortcuts ──────────────────────────────────────────
+    @property
+    def users(self):
+        return self.db.users
 
-    def _fetchone(self, sql: str, params: tuple = ()):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            return cur.fetchone()
+    @property
+    def user_bots(self):
+        return self.db.user_bots
 
-    def _fetchall(self, sql: str, params: tuple = ()):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
+    @property
+    def bot_subscriptions(self):
+        return self.db.bot_subscriptions
+
+    @property
+    def user_bot_channels(self):
+        return self.db.user_bot_channels
+
+    @property
+    def user_bot_messages(self):
+        return self.db.user_bot_messages
+
+    @property
+    def join_requests(self):
+        return self.db.join_requests
+
+    @property
+    def reachable_users(self):
+        return self.db.reachable_users
+
+    @property
+    def user_emoji_maps(self):
+        return self.db.user_emoji_maps
+
+    @property
+    def system_settings(self):
+        return self.db.system_settings
+
+    @property
+    def leave_recovery_messages(self):
+        return self.db.leave_recovery_messages
+
+    def _next_id(self, name: str) -> int:
+        """Auto-increment integer id (PostgreSQL SERIAL jaisa) via counters."""
+        doc = self.db.counters.find_one_and_update(
+            {"_id": name}, {"$inc": {"seq": 1}}, upsert=True,
+            return_document=ReturnDocument.AFTER)
+        return int(doc["seq"])
+
+    @staticmethod
+    def _doc(doc):
+        if not doc:
+            return None
+        d = dict(doc)
+        d.pop("_id", None)
+        return _awareify(d)
 
     def init_db(self):
-        statements = [
-            """CREATE TABLE IF NOT EXISTS users (\n                user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,\n                verified BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now()\n            )""",
-            """CREATE TABLE IF NOT EXISTS user_bots (\n                bot_id TEXT PRIMARY KEY, user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,\n                bot_token TEXT UNIQUE, bot_username TEXT, is_active INT DEFAULT 0,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
-            """CREATE TABLE IF NOT EXISTS bot_subscriptions (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                subscription_type TEXT, expiry_date TIMESTAMPTZ, max_channels INT DEFAULT 1,\n                reminder_3d_sent BOOLEAN DEFAULT FALSE, reminder_1d_sent BOOLEAN DEFAULT FALSE,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
-            """CREATE TABLE IF NOT EXISTS user_bot_channels (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                channel_id BIGINT, channel_username TEXT, channel_title TEXT,\n                welcome_message TEXT, welcome_media_id TEXT, welcome_media_type TEXT,\n                auto_approve INT DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, channel_id)\n            )""",
-            """CREATE TABLE IF NOT EXISTS user_bot_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                channel_id BIGINT, content_text TEXT, media_id TEXT, media_type TEXT,\n                file_name TEXT, mime_type TEXT, telegram_message_id BIGINT,\n                media_group_id TEXT, buttons_json TEXT, entities_json TEXT,\n                created_at TIMESTAMPTZ DEFAULT now()\n            )""",
-            """CREATE TABLE IF NOT EXISTS join_requests (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, channel_id BIGINT, status TEXT,\n                request_date TIMESTAMPTZ DEFAULT now(), approved_date TIMESTAMPTZ,\n                UNIQUE(bot_id, requester_id, channel_id)\n            )""",
-            """CREATE TABLE IF NOT EXISTS reachable_users (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                requester_id BIGINT, last_ok_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, requester_id)\n            )""",
-            """CREATE TABLE IF NOT EXISTS user_emoji_maps (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                msg_id BIGINT, emoji_map JSONB DEFAULT '{}',\n                updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (bot_id, msg_id)\n            )""",
-            """CREATE TABLE IF NOT EXISTS system_settings (\n                key TEXT PRIMARY KEY, value_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT now()\n            )""",
-            """CREATE TABLE IF NOT EXISTS leave_recovery_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT, user_id BIGINT,\n                source_channel_id BIGINT, target_channel_id BIGINT, message_id BIGINT,\n                sent_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ\n            )""",
-            "CREATE INDEX IF NOT EXISTS idx_bot_subscriptions ON bot_subscriptions(bot_id, expiry_date)",
-            "CREATE INDEX IF NOT EXISTS idx_join_requests ON join_requests(bot_id, status)",
-            "CREATE INDEX IF NOT EXISTS idx_user_bots_user ON user_bots(user_id)",
-            "CREATE INDEX IF NOT EXISTS idx_messages_bot ON user_bot_messages(bot_id, channel_id)",
-            "CREATE INDEX IF NOT EXISTS idx_reachable_bot ON reachable_users(bot_id, last_ok_at DESC)",
+        specs = [
+            (self.users, [("user_id", 1)], True),
+            (self.user_bots, [("bot_id", 1)], True),
+            (self.user_bots, [("bot_token", 1)], True),
+            (self.user_bots, [("user_id", 1)], False),
+            (self.bot_subscriptions, [("bot_id", 1), ("expiry_date", -1)], False),
+            (self.user_bot_channels, [("bot_id", 1), ("channel_id", 1)], True),
+            (self.user_bot_messages, [("bot_id", 1), ("channel_id", 1), ("id", 1)], False),
+            (self.join_requests, [("bot_id", 1), ("requester_id", 1), ("channel_id", 1)], True),
+            (self.join_requests, [("bot_id", 1), ("status", 1)], False),
+            (self.reachable_users, [("bot_id", 1), ("requester_id", 1)], True),
+            (self.reachable_users, [("bot_id", 1), ("last_ok_at", -1)], False),
+            (self.user_emoji_maps, [("bot_id", 1), ("msg_id", 1)], True),
+            (self.system_settings, [("key", 1)], True),
+            (self.leave_recovery_messages, [("bot_id", 1), ("user_id", 1), ("target_channel_id", 1)], False),
         ]
-        with self.conn.cursor() as cur:
-            for stmt in statements:
-                try:
-                    cur.execute(stmt)
-                except Exception as e:
-                    logging.warning(f"Table creation warning: {e}")
+        for coll, keys, unique in specs:
+            try:
+                coll.create_index(keys, unique=unique)
+            except Exception as e:
+                logging.warning("Index creation warning: %s", e)
 
+    # ── users ──────────────────────────────────────────────────────────
     def add_user(self, user_id, username, first_name, last_name):
-        self._execute("""INSERT INTO users (user_id, username, first_name, last_name)\n               VALUES (%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE\n               SET username=COALESCE(EXCLUDED.username, users.username),\n                   first_name=COALESCE(EXCLUDED.first_name, users.first_name),\n                   last_name=COALESCE(EXCLUDED.last_name, users.last_name)""",
-            (user_id, username, first_name, last_name))
+        updates = {}
+        if username is not None:
+            updates["username"] = username
+        if first_name is not None:
+            updates["first_name"] = first_name
+        if last_name is not None:
+            updates["last_name"] = last_name
+        self.users.update_one(
+            {"user_id": user_id},
+            {"$set": updates,
+             "$setOnInsert": {"verified": False, "created_at": now_aware()}},
+            upsert=True)
 
     def get_user(self, user_id):
-        return self._fetchone("SELECT * FROM users WHERE user_id=%s", (user_id,)) or {}
+        return self._doc(self.users.find_one({"user_id": user_id})) or {}
 
     def mark_user_verified(self, user_id: int):
-        self._execute("UPDATE users SET verified=TRUE WHERE user_id=%s", (user_id,))
+        self.users.update_one({"user_id": user_id}, {"$set": {"verified": True}})
 
     def is_user_verified(self, user_id: int) -> bool:
-        row = self._fetchone("SELECT verified FROM users WHERE user_id=%s", (user_id,))
-        return bool(row and row["verified"])
+        row = self.users.find_one({"user_id": user_id}, {"verified": 1})
+        return bool(row and row.get("verified"))
 
     def get_all_users(self):
-        rows = self._fetchall("SELECT DISTINCT user_id, username, first_name, last_name, created_at FROM users ORDER BY user_id")
-        return [dict(r) for r in rows]
+        rows = self.users.find({}, {"_id": 0}).sort("user_id", 1)
+        return [self._doc(r) for r in rows]
 
+    # ── user bots ──────────────────────────────────────────────────────
     def get_next_bot_id(self, user_id: int) -> str:
-        rows = self._fetchall("SELECT bot_id FROM user_bots WHERE user_id=%s", (user_id,))
         numbers = []
-        for row in rows:
-            parts = row["bot_id"].split("_")
+        for row in self.user_bots.find({"user_id": user_id}, {"bot_id": 1}):
+            parts = str(row.get("bot_id", "")).split("_")
             if len(parts) == 2 and parts[1].isdigit():
                 numbers.append(int(parts[1]))
         next_num = max(numbers) + 1 if numbers else 1
         return f"{user_id}_{next_num}"
 
     def add_user_bot(self, user_id, token, username):
+        # Token pehle se linked hai to wahi bot_id wapas (naya id mat banao)
+        existing = self.user_bots.find_one({"bot_token": token})
+        if existing:
+            self.user_bots.update_one(
+                {"bot_token": token},
+                {"$set": {"bot_username": username, "is_active": 1}})
+            return existing["bot_id"]
         bot_id = self.get_next_bot_id(user_id)
         self.add_user(user_id, None, f"User{user_id}", None)
-        self._execute("""INSERT INTO user_bots (bot_id, user_id, bot_token, bot_username, is_active)\n               VALUES (%s,%s,%s,%s,1) ON CONFLICT (bot_token) DO UPDATE\n               SET bot_username=EXCLUDED.bot_username, is_active=1""",
-            (bot_id, user_id, token, username))
+        self.user_bots.insert_one({
+            "bot_id": bot_id, "user_id": user_id, "bot_token": token,
+            "bot_username": username, "is_active": 1, "created_at": now_aware()})
         return bot_id
 
     def get_user_bot(self, bot_id: str):
-        b = self._fetchone("SELECT * FROM user_bots WHERE bot_id=%s", (bot_id,))
-        return dict(b) if b else None
+        return self._doc(self.user_bots.find_one({"bot_id": bot_id}))
 
     def get_user_bots_by_owner(self, user_id: int):
-        rows = self._fetchall("SELECT * FROM user_bots WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
-        return [dict(r) for r in rows]
+        rows = self.user_bots.find({"user_id": user_id}).sort("created_at", -1)
+        return [dict(self._doc(r)) for r in rows]
 
     def get_all_user_bots(self):
-        rows = self._fetchall("SELECT * FROM user_bots ORDER BY user_id, created_at")
-        return [dict(r) for r in rows]
+        rows = self.user_bots.find({}).sort([("user_id", 1), ("created_at", 1)])
+        return [self._doc(r) for r in rows]
 
     def get_bot_by_username(self, username: str):
-        return self._fetchone("SELECT * FROM user_bots WHERE bot_username=%s", (username,))
+        return self._doc(self.user_bots.find_one({"bot_username": username}))
 
     def set_user_bot_active(self, bot_id: str, active):
-        self._execute("UPDATE user_bots SET is_active=%s WHERE bot_id=%s", (1 if active else 0, bot_id))
+        self.user_bots.update_one({"bot_id": bot_id}, {"$set": {"is_active": 1 if active else 0}})
 
     def remove_user_bot(self, bot_id: str):
-        self._execute("DELETE FROM user_bots WHERE bot_id=%s", (bot_id,))
+        # No FK cascades in MongoDB — related docs khud delete karo
+        self.user_bots.delete_one({"bot_id": bot_id})
+        self.bot_subscriptions.delete_many({"bot_id": bot_id})
+        self.user_bot_channels.delete_many({"bot_id": bot_id})
+        msg_ids = [m["id"] for m in self.user_bot_messages.find({"bot_id": bot_id}, {"id": 1})]
+        self.user_bot_messages.delete_many({"bot_id": bot_id})
+        if msg_ids:
+            self.user_emoji_maps.delete_many({"bot_id": bot_id, "msg_id": {"$in": msg_ids}})
+        else:
+            self.user_emoji_maps.delete_many({"bot_id": bot_id})
+        self.join_requests.delete_many({"bot_id": bot_id})
+        self.reachable_users.delete_many({"bot_id": bot_id})
 
+    # ── subscriptions ──────────────────────────────────────────────────
     def get_subscription_for_bot(self, bot_id: str):
-        s = self._fetchone("SELECT * FROM bot_subscriptions WHERE bot_id=%s ORDER BY expiry_date DESC LIMIT 1", (bot_id,))
-        return dict(s) if s else None
+        row = self.bot_subscriptions.find_one({"bot_id": bot_id}, sort=[("expiry_date", -1)])
+        return self._doc(row)
 
     def add_subscription_for_bot(self, bot_id: str, sub_type, days):
-        max_channels = 1 if sub_type.lower() == "basic" else 5
-        expiry_date = now_aware() + timedelta(days=days)
-        self._execute("""INSERT INTO bot_subscriptions (bot_id, subscription_type, expiry_date, max_channels)\n               VALUES (%s,%s,%s,%s)""", (bot_id, sub_type, expiry_date, max_channels))
+        max_channels = 1 if str(sub_type).lower() == "basic" else 5
+        self.bot_subscriptions.insert_one({
+            "id": self._next_id("bot_subscriptions"),
+            "bot_id": bot_id, "subscription_type": sub_type,
+            "expiry_date": now_aware() + timedelta(days=days),
+            "max_channels": max_channels,
+            "reminder_3d_sent": False, "reminder_1d_sent": False,
+            "created_at": now_aware()})
 
     def update_subscription_expiry(self, bot_id: str, new_expiry):
-        row = self._fetchone("SELECT id FROM bot_subscriptions WHERE bot_id=%s ORDER BY expiry_date DESC LIMIT 1", (bot_id,))
+        row = self.get_subscription_for_bot(bot_id)
         if row:
-            self._execute("UPDATE bot_subscriptions SET expiry_date=%s, reminder_3d_sent=FALSE, reminder_1d_sent=FALSE WHERE id=%s", (new_expiry, row["id"]))
+            self.bot_subscriptions.update_one(
+                {"id": row["id"]},
+                {"$set": {"expiry_date": _utc(new_expiry),
+                          "reminder_3d_sent": False, "reminder_1d_sent": False}})
 
     def get_expiring_subscriptions(self, days_threshold: int):
         reminder = "reminder_3d_sent" if days_threshold == 3 else "reminder_1d_sent"
-        rows = self._fetchall(f"""SELECT bot_id, subscription_type, expiry_date FROM bot_subscriptions\n                WHERE expiry_date BETWEEN now() AND now() + interval '%s days'\n                AND {reminder}=FALSE ORDER BY expiry_date""", (days_threshold,))
-        return [dict(r) for r in rows]
+        now = now_aware()
+        until = now + timedelta(days=days_threshold)
+        out = []
+        for s in self.bot_subscriptions.find({reminder: {"$ne": True}}):
+            exp = _utc(s.get("expiry_date"))
+            if exp and now <= exp <= until:
+                out.append({"bot_id": s.get("bot_id"),
+                            "subscription_type": s.get("subscription_type"),
+                            "expiry_date": exp})
+        out.sort(key=lambda r: r["expiry_date"])
+        return out
 
     def get_expired_subscriptions(self):
-        rows = self._fetchall("""SELECT DISTINCT bot_id FROM bot_subscriptions s\n               WHERE NOT EXISTS (SELECT 1 FROM bot_subscriptions live\n               WHERE live.bot_id=s.bot_id AND live.expiry_date >= now())""")
-        return [r["bot_id"] for r in rows]
+        # Bots jinke paas koi bhi live (expiry >= now) subscription nahi hai
+        by_bot = {}
+        for s in self.bot_subscriptions.find({}):
+            by_bot.setdefault(s.get("bot_id"), []).append(_utc(s.get("expiry_date")))
+        now = now_aware()
+        expired = []
+        for bot_id, expiries in by_bot.items():
+            if not any(e and e >= now for e in expiries):
+                expired.append(bot_id)
+        return expired
 
     def mark_reminder_sent(self, bot_id: str, days: int):
         field = "reminder_3d_sent" if days == 3 else "reminder_1d_sent"
-        self._execute(f"UPDATE bot_subscriptions SET {field}=TRUE WHERE bot_id=%s AND expiry_date >= now()", (bot_id,))
+        self.bot_subscriptions.update_many(
+            {"bot_id": bot_id, "expiry_date": {"$gte": now_aware()}},
+            {"$set": {field: True}})
 
     def get_all_subscriptions(self):
-        rows = self._fetchall("""SELECT s.bot_id, s.subscription_type, s.expiry_date, s.max_channels,\n               b.user_id, b.bot_username, COALESCE(b.is_active, 0) AS bot_active,\n               u.username as owner_username, u.first_name as owner_name\n               FROM bot_subscriptions s LEFT JOIN user_bots b ON b.bot_id=s.bot_id\n               LEFT JOIN users u ON u.user_id=b.user_id ORDER BY s.expiry_date DESC""")
-        return [dict(r) for r in rows]
+        rows = []
+        subs = list(self.bot_subscriptions.find({}).sort("expiry_date", -1))
+        for s in subs:
+            b = self.user_bots.find_one({"bot_id": s.get("bot_id")}) or {}
+            u = self.users.find_one({"user_id": b.get("user_id")}) or {} if b else {}
+            rows.append({
+                "bot_id": s.get("bot_id"),
+                "subscription_type": s.get("subscription_type"),
+                "expiry_date": _utc(s.get("expiry_date")),
+                "max_channels": s.get("max_channels"),
+                "user_id": b.get("user_id"),
+                "bot_username": b.get("bot_username"),
+                "bot_active": int(b.get("is_active") or 0),
+                "owner_username": u.get("username"),
+                "owner_name": u.get("first_name"),
+            })
+        return rows
 
+    # ── channels ───────────────────────────────────────────────────────
     def add_channel(self, bot_id: str, channel_id, username, title):
-        self._execute("""INSERT INTO user_bot_channels (bot_id, channel_id, channel_username, channel_title)\n               VALUES (%s,%s,%s,%s) ON CONFLICT (bot_id, channel_id) DO UPDATE\n               SET channel_username=EXCLUDED.channel_username, channel_title=EXCLUDED.channel_title""",
-            (bot_id, channel_id, username, title))
+        self.user_bot_channels.update_one(
+            {"bot_id": bot_id, "channel_id": channel_id},
+            {"$set": {"channel_username": username, "channel_title": title},
+             "$setOnInsert": {"welcome_message": None, "welcome_media_id": None,
+                              "welcome_media_type": None, "auto_approve": 0,
+                              "created_at": now_aware()}},
+            upsert=True)
 
     def get_bot_channels(self, bot_id: str):
-        rows = self._fetchall("SELECT * FROM user_bot_channels WHERE bot_id=%s ORDER BY channel_id", (bot_id,))
-        return [dict(r) for r in rows]
+        rows = self.user_bot_channels.find({"bot_id": bot_id}).sort("channel_id", 1)
+        return [self._doc(r) for r in rows]
 
     def set_auto_approve(self, bot_id: str, channel_id, val):
-        self._execute("UPDATE user_bot_channels SET auto_approve=%s WHERE bot_id=%s AND channel_id=%s", (1 if val else 0, bot_id, channel_id))
+        self.user_bot_channels.update_one(
+            {"bot_id": bot_id, "channel_id": channel_id},
+            {"$set": {"auto_approve": 1 if val else 0}})
 
     def get_channel_owner_data(self, channel_id, bot_id=None):
         if bot_id:
-            r = self._fetchone("SELECT * FROM user_bot_channels WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
+            row = self.user_bot_channels.find_one({"bot_id": bot_id, "channel_id": channel_id})
         else:
-            r = self._fetchone("SELECT * FROM user_bot_channels WHERE channel_id=%s ORDER BY created_at DESC LIMIT 1", (channel_id,))
-        return dict(r) if r else None
+            row = self.user_bot_channels.find_one(
+                {"channel_id": channel_id}, sort=[("created_at", -1)])
+        return self._doc(row)
 
     def clear_messages(self, bot_id: str, channel_id):
-        msgs = self._fetchall("SELECT id FROM user_bot_messages WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
+        msgs = list(self.user_bot_messages.find(
+            {"bot_id": bot_id, "channel_id": channel_id}, {"id": 1}))
         for msg in msgs:
             self.delete_user_emoji_map(bot_id, msg["id"])
-        self._execute("DELETE FROM user_bot_messages WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
-        self._execute("UPDATE user_bot_channels SET welcome_message=NULL, welcome_media_id=NULL, welcome_media_type=NULL WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
+        self.user_bot_messages.delete_many({"bot_id": bot_id, "channel_id": channel_id})
+        self.user_bot_channels.update_one(
+            {"bot_id": bot_id, "channel_id": channel_id},
+            {"$set": {"welcome_message": None, "welcome_media_id": None,
+                      "welcome_media_type": None}})
 
     def remove_channel(self, bot_id: str, channel_id):
         self.clear_messages(bot_id, channel_id)
-        self._execute("DELETE FROM user_bot_channels WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
-        self._execute("DELETE FROM join_requests WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
+        self.user_bot_channels.delete_one({"bot_id": bot_id, "channel_id": channel_id})
+        self.join_requests.delete_many({"bot_id": bot_id, "channel_id": channel_id})
         return True
 
     def _refresh_channel_welcome(self, bot_id: str, channel_id):
-        first = self._fetchone("SELECT * FROM user_bot_messages WHERE bot_id=%s AND channel_id=%s ORDER BY id LIMIT 1", (bot_id, channel_id))
+        first = self.user_bot_messages.find_one(
+            {"bot_id": bot_id, "channel_id": channel_id}, sort=[("id", 1)])
         if first:
-            self._execute("UPDATE user_bot_channels SET welcome_message=%s, welcome_media_id=%s, welcome_media_type=%s WHERE bot_id=%s AND channel_id=%s",
-                (first["content_text"], first["media_id"], first["media_type"], bot_id, channel_id))
+            self.user_bot_channels.update_one(
+                {"bot_id": bot_id, "channel_id": channel_id},
+                {"$set": {"welcome_message": first.get("content_text"),
+                          "welcome_media_id": first.get("media_id"),
+                          "welcome_media_type": first.get("media_type")}})
         else:
-            self._execute("UPDATE user_bot_channels SET welcome_message=NULL, welcome_media_id=NULL, welcome_media_type=NULL WHERE bot_id=%s AND channel_id=%s",
-                (bot_id, channel_id))
+            self.user_bot_channels.update_one(
+                {"bot_id": bot_id, "channel_id": channel_id},
+                {"$set": {"welcome_message": None, "welcome_media_id": None,
+                          "welcome_media_type": None}})
 
-    def add_message(self, bot_id: str, channel_id, text, media_id, media_type, media_group_id=None, entities_json=None, file_name=None, mime_type=None, telegram_message_id=None):
-        with self.conn.cursor() as cur:
-            cur.execute("""INSERT INTO user_bot_messages\n                   (bot_id, channel_id, content_text, media_id, media_type, file_name, mime_type, media_group_id, entities_json, telegram_message_id)\n                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (bot_id, channel_id, text, media_id, media_type, file_name, mime_type, media_group_id, entities_json, telegram_message_id))
-            msg_id = cur.fetchone()[0]
+    # ── messages ───────────────────────────────────────────────────────
+    def add_message(self, bot_id: str, channel_id, text, media_id, media_type,
+                    media_group_id=None, entities_json=None, file_name=None,
+                    mime_type=None, telegram_message_id=None):
+        msg_id = self._next_id("user_bot_messages")
+        self.user_bot_messages.insert_one({
+            "id": msg_id, "bot_id": bot_id, "channel_id": channel_id,
+            "content_text": text, "media_id": media_id, "media_type": media_type,
+            "file_name": file_name, "mime_type": mime_type,
+            "telegram_message_id": telegram_message_id,
+            "media_group_id": media_group_id, "buttons_json": None,
+            "entities_json": entities_json, "created_at": now_aware()})
         self._refresh_channel_welcome(bot_id, channel_id)
         return msg_id
 
     def update_message_text(self, msg_id, text, entities_json=None):
         row = self.get_message_by_id(msg_id)
         if row:
-            self._execute("UPDATE user_bot_messages SET content_text=%s, entities_json=COALESCE(%s, entities_json) WHERE id=%s", (text, entities_json, int(msg_id)))
+            updates = {"content_text": text}
+            if entities_json is not None:
+                updates["entities_json"] = entities_json
+            self.user_bot_messages.update_one({"id": int(msg_id)}, {"$set": updates})
             self._refresh_channel_welcome(row["bot_id"], row["channel_id"])
 
-    def update_message_media(self, msg_id, media_id, media_type, text=None, entities_json=None, file_name=None, mime_type=None, telegram_message_id=None):
+    def update_message_media(self, msg_id, media_id, media_type, text=None,
+                             entities_json=None, file_name=None, mime_type=None,
+                             telegram_message_id=None):
         row = self.get_message_by_id(msg_id)
         if row:
-            self._execute("""UPDATE user_bot_messages SET media_id=%s, media_type=%s,\n                   content_text=COALESCE(%s, content_text), entities_json=COALESCE(%s, entities_json),\n                   file_name=COALESCE(%s, file_name), mime_type=COALESCE(%s, mime_type),\n                   telegram_message_id=COALESCE(%s, telegram_message_id) WHERE id=%s""",
-                (media_id, media_type, text, entities_json, file_name, mime_type, telegram_message_id, int(msg_id)))
+            updates = {"media_id": media_id, "media_type": media_type}
+            if text is not None:
+                updates["content_text"] = text
+            if entities_json is not None:
+                updates["entities_json"] = entities_json
+            if file_name is not None:
+                updates["file_name"] = file_name
+            if mime_type is not None:
+                updates["mime_type"] = mime_type
+            if telegram_message_id is not None:
+                updates["telegram_message_id"] = telegram_message_id
+            self.user_bot_messages.update_one({"id": int(msg_id)}, {"$set": updates})
             self._refresh_channel_welcome(row["bot_id"], row["channel_id"])
 
     def delete_message(self, msg_id):
         row = self.get_message_by_id(msg_id)
         if row:
-            self._execute("DELETE FROM user_bot_messages WHERE id=%s", (int(msg_id),))
+            self.user_bot_messages.delete_one({"id": int(msg_id)})
             self.delete_user_emoji_map(row["bot_id"], int(msg_id))
             self._refresh_channel_welcome(row["bot_id"], row["channel_id"])
             return True
         return False
 
     def delete_message_by_telegram_id(self, bot_id: str, telegram_message_id: int):
-        row = self._fetchone("SELECT id, channel_id FROM user_bot_messages WHERE bot_id=%s AND telegram_message_id=%s", (bot_id, telegram_message_id))
+        row = self.user_bot_messages.find_one(
+            {"bot_id": bot_id, "telegram_message_id": telegram_message_id})
         if row:
-            self._execute("DELETE FROM user_bot_messages WHERE id=%s", (row["id"],))
+            self.user_bot_messages.delete_one({"id": row["id"]})
             self.delete_user_emoji_map(bot_id, row["id"])
             self._refresh_channel_welcome(bot_id, row["channel_id"])
             return True
         return False
 
     def delete_media_group_messages(self, bot_id: str, media_group_id):
-        first = self._fetchone("SELECT channel_id FROM user_bot_messages WHERE bot_id=%s AND media_group_id=%s LIMIT 1", (bot_id, media_group_id))
+        first = self.user_bot_messages.find_one(
+            {"bot_id": bot_id, "media_group_id": media_group_id})
         if first:
-            ids = [r["id"] for r in self._fetchall("SELECT id FROM user_bot_messages WHERE bot_id=%s AND media_group_id=%s", (bot_id, media_group_id))]
-            self._execute("DELETE FROM user_bot_messages WHERE bot_id=%s AND media_group_id=%s", (bot_id, media_group_id))
+            ids = [r["id"] for r in self.user_bot_messages.find(
+                {"bot_id": bot_id, "media_group_id": media_group_id}, {"id": 1})]
+            self.user_bot_messages.delete_many(
+                {"bot_id": bot_id, "media_group_id": media_group_id})
             for msg_id in ids:
                 self.delete_user_emoji_map(bot_id, msg_id)
             self._refresh_channel_welcome(bot_id, first["channel_id"])
 
     def get_message_count(self, channel_id, bot_id=None):
+        q = {"channel_id": channel_id}
         if bot_id:
-            row = self._fetchone("SELECT COUNT(*) as count FROM user_bot_messages WHERE bot_id=%s AND channel_id=%s", (bot_id, channel_id))
-        else:
-            row = self._fetchone("SELECT COUNT(*) as count FROM user_bot_messages WHERE channel_id=%s", (channel_id,))
-        return int(row["count"]) if row else 0
+            q["bot_id"] = bot_id
+        return self.user_bot_messages.count_documents(q)
 
     def get_messages(self, channel_id, bot_id=None):
+        q = {"channel_id": channel_id}
         if bot_id:
-            rows = self._fetchall("SELECT * FROM user_bot_messages WHERE bot_id=%s AND channel_id=%s ORDER BY id", (bot_id, channel_id))
-        else:
-            rows = self._fetchall("SELECT * FROM user_bot_messages WHERE channel_id=%s ORDER BY id", (channel_id,))
-        return [dict(r) for r in rows]
+            q["bot_id"] = bot_id
+        rows = self.user_bot_messages.find(q).sort("id", 1)
+        return [self._doc(r) for r in rows]
 
     def get_message_by_id(self, msg_id):
-        r = self._fetchone("SELECT * FROM user_bot_messages WHERE id=%s", (int(msg_id),))
-        return dict(r) if r else None
+        return self._doc(self.user_bot_messages.find_one({"id": int(msg_id)}))
 
     def get_message_by_telegram_id(self, bot_id: str, telegram_message_id: int):
-        r = self._fetchone("SELECT * FROM user_bot_messages WHERE bot_id=%s AND telegram_message_id=%s", (bot_id, telegram_message_id))
-        return dict(r) if r else None
+        return self._doc(self.user_bot_messages.find_one(
+            {"bot_id": bot_id, "telegram_message_id": telegram_message_id}))
 
     def update_message_buttons(self, msg_id, buttons_json):
-        self._execute("UPDATE user_bot_messages SET buttons_json=%s WHERE id=%s", (buttons_json, int(msg_id)))
+        self.user_bot_messages.update_one({"id": int(msg_id)}, {"$set": {"buttons_json": buttons_json}})
 
     def append_message_buttons(self, msg_id, new_buttons_json):
-        row = self._fetchone("SELECT buttons_json FROM user_bot_messages WHERE id=%s", (int(msg_id),))
+        row = self.user_bot_messages.find_one({"id": int(msg_id)}, {"buttons_json": 1})
         existing = []
-        if row and row["buttons_json"]:
+        if row and row.get("buttons_json"):
             try:
                 existing = json.loads(row["buttons_json"]) or []
             except Exception:
@@ -676,66 +873,108 @@ class Database:
             except Exception:
                 new_btns = []
         combined = existing + new_btns
-        self._execute("UPDATE user_bot_messages SET buttons_json=%s WHERE id=%s", (json.dumps(combined), int(msg_id)))
+        self.user_bot_messages.update_one(
+            {"id": int(msg_id)}, {"$set": {"buttons_json": json.dumps(combined)}})
 
+    # ── emoji maps ─────────────────────────────────────────────────────
     def save_user_emoji_map(self, bot_id: str, msg_id: int, emoji_map: dict):
         if emoji_map:
-            self._execute("""INSERT INTO user_emoji_maps (bot_id, msg_id, emoji_map, updated_at)\n                   VALUES (%s,%s,%s,now()) ON CONFLICT (bot_id, msg_id) DO UPDATE\n                   SET emoji_map=EXCLUDED.emoji_map, updated_at=now()""",
-                (bot_id, msg_id, Json(emoji_map)))
+            self.user_emoji_maps.update_one(
+                {"bot_id": bot_id, "msg_id": int(msg_id)},
+                {"$set": {"emoji_map": dict(emoji_map), "updated_at": now_aware()}},
+                upsert=True)
 
     def get_user_emoji_map(self, bot_id: str, msg_id: int) -> dict:
-        row = self._fetchone("SELECT emoji_map FROM user_emoji_maps WHERE bot_id=%s AND msg_id=%s", (bot_id, msg_id))
-        return dict(row["emoji_map"]) if row and row["emoji_map"] else {}
+        row = self.user_emoji_maps.find_one({"bot_id": bot_id, "msg_id": int(msg_id)})
+        return dict(row.get("emoji_map") or {}) if row else {}
 
     def delete_user_emoji_map(self, bot_id: str, msg_id: int):
-        self._execute("DELETE FROM user_emoji_maps WHERE bot_id=%s AND msg_id=%s", (bot_id, int(msg_id)))
+        self.user_emoji_maps.delete_one({"bot_id": bot_id, "msg_id": int(msg_id)})
 
+    # ── join requests ──────────────────────────────────────────────────
     def add_join_request(self, bot_id: str, requester_id, channel_id, status):
-        self._execute("""INSERT INTO join_requests (bot_id, requester_id, channel_id, status, approved_date)\n               VALUES (%s,%s,%s,%s,%s) ON CONFLICT (bot_id, requester_id, channel_id) DO UPDATE\n               SET status=CASE WHEN join_requests.status='approved' AND EXCLUDED.status='pending'\n               THEN join_requests.status ELSE EXCLUDED.status END,\n               approved_date=CASE WHEN EXCLUDED.status='approved' THEN now() ELSE join_requests.approved_date END""",
-            (bot_id, requester_id, channel_id, status, now_aware() if status == "approved" else None))
+        key = {"bot_id": bot_id, "requester_id": requester_id, "channel_id": channel_id}
+        existing = self.join_requests.find_one(key)
+        if existing:
+            # approved kabhi pending me downgrade nahi hota (purane SQL jaisa)
+            new_status = status
+            if existing.get("status") == "approved" and status == "pending":
+                new_status = "approved"
+            updates = {"status": new_status}
+            if status == "approved":
+                updates["approved_date"] = now_aware()
+            self.join_requests.update_one({"id": existing["id"]}, {"$set": updates})
+        else:
+            self.join_requests.insert_one({
+                "id": self._next_id("join_requests"), **key,
+                "status": status,
+                "request_date": now_aware(),
+                "approved_date": now_aware() if status == "approved" else None})
 
     def get_pending_requests(self, bot_id: str):
-        rows = self._fetchall("SELECT id, requester_id, channel_id FROM join_requests WHERE bot_id=%s AND status='pending' ORDER BY request_date", (bot_id,))
-        return [dict(r) for r in rows]
+        rows = self.join_requests.find(
+            {"bot_id": bot_id, "status": "pending"}).sort("request_date", 1)
+        return [{"id": r["id"], "requester_id": r["requester_id"],
+                 "channel_id": r["channel_id"]} for r in rows]
 
     def mark_request_status(self, request_id, status):
-        self._execute("UPDATE join_requests SET status=%s, approved_date=CASE WHEN %s='approved' THEN now() ELSE approved_date END WHERE id=%s", (status, status, int(request_id)))
+        updates = {"status": status}
+        if status == "approved":
+            updates["approved_date"] = now_aware()
+        self.join_requests.update_one({"id": int(request_id)}, {"$set": updates})
 
     def get_pending_count(self, bot_id: str):
-        row = self._fetchone("SELECT COUNT(*) as count FROM join_requests WHERE bot_id=%s AND status='pending'", (bot_id,))
-        return int(row["count"]) if row else 0
+        return self.join_requests.count_documents({"bot_id": bot_id, "status": "pending"})
 
+    # ── reachability ───────────────────────────────────────────────────
     def mark_reachable(self, bot_id: str, requester_id):
-        self._execute("INSERT INTO reachable_users (bot_id, requester_id, last_ok_at) VALUES (%s,%s,now()) ON CONFLICT (bot_id, requester_id) DO UPDATE SET last_ok_at=now()", (bot_id, requester_id))
+        self.reachable_users.update_one(
+            {"bot_id": bot_id, "requester_id": requester_id},
+            {"$set": {"last_ok_at": now_aware()}}, upsert=True)
 
     def mark_unreachable(self, bot_id: str, requester_id):
-        self._execute("DELETE FROM reachable_users WHERE bot_id=%s AND requester_id=%s", (bot_id, requester_id))
+        self.reachable_users.delete_one({"bot_id": bot_id, "requester_id": requester_id})
 
     def get_requesters_for_bot(self, bot_id: str):
-        rows = self._fetchall("SELECT requester_id FROM reachable_users WHERE bot_id=%s ORDER BY last_ok_at DESC", (bot_id,))
+        rows = list(self.reachable_users.find(
+            {"bot_id": bot_id}, {"requester_id": 1}).sort("last_ok_at", -1))
         if rows:
             return [r["requester_id"] for r in rows]
-        rows = self._fetchall("SELECT DISTINCT requester_id FROM join_requests WHERE bot_id=%s AND status='approved'", (bot_id,))
-        return [r["requester_id"] for r in rows]
+        seen = []
+        for r in self.join_requests.find(
+                {"bot_id": bot_id, "status": "approved"}, {"requester_id": 1}):
+            if r["requester_id"] not in seen:
+                seen.append(r["requester_id"])
+        return seen
 
     def get_total_requesters_count(self, bot_id: str):
-        row = self._fetchone("SELECT COUNT(DISTINCT requester_id) as count FROM join_requests WHERE bot_id=%s", (bot_id,))
-        return int(row["count"]) if row else 0
+        return len(self.join_requests.distinct("requester_id", {"bot_id": bot_id}))
 
     def get_reachable_requesters_count(self, bot_id: str):
-        row = self._fetchone("SELECT COUNT(DISTINCT requester_id) as count FROM reachable_users WHERE bot_id=%s", (bot_id,))
-        return int(row["count"]) if row else 0
+        return self.reachable_users.count_documents({"bot_id": bot_id})
 
     def get_userbot_user_counts(self):
-        rows = self._fetchall("""SELECT b.bot_id, b.bot_username, b.user_id, COUNT(DISTINCT j.requester_id) as users,\n               COALESCE(s.subscription_type, 'None') as plan,\n               COALESCE(s.expiry_date < now(), true) as expired\n               FROM user_bots b LEFT JOIN join_requests j ON j.bot_id=b.bot_id\n               LEFT JOIN bot_subscriptions s ON s.bot_id=b.bot_id\n               GROUP BY b.bot_id, b.bot_username, b.user_id, s.subscription_type, s.expiry_date\n               ORDER BY b.user_id""")
-        return [dict(r) for r in rows]
+        rows = []
+        for b in self.get_all_user_bots():
+            users = len(self.join_requests.distinct("requester_id", {"bot_id": b["bot_id"]}))
+            sub = self.get_subscription_for_bot(b["bot_id"])
+            plan = sub.get("subscription_type") if sub else "None"
+            exp = _utc(sub.get("expiry_date")) if sub else None
+            expired = (exp < now_aware()) if exp else True
+            rows.append({"bot_id": b["bot_id"], "bot_username": b.get("bot_username"),
+                         "user_id": b.get("user_id"), "users": users,
+                         "plan": plan or "None", "expired": bool(expired)})
+        return rows
 
+    # ── settings ───────────────────────────────────────────────────────
     def get_setting(self, key: str, default=None):
-        row = self._fetchone("SELECT value_json FROM system_settings WHERE key=%s", (key,))
-        return row["value_json"] if row else default
+        row = self.system_settings.find_one({"key": key})
+        return row.get("value") if row else default
 
     def set_setting(self, key: str, value: dict):
-        self._execute("INSERT INTO system_settings (key, value_json, updated_at) VALUES (%s,%s,now()) ON CONFLICT (key) DO UPDATE SET value_json=EXCLUDED.value_json, updated_at=now()", (key, Json(value)))
+        self.system_settings.update_one(
+            {"key": key},
+            {"$set": {"value": value, "updated_at": now_aware()}}, upsert=True)
 
     def get_leave_recovery_config(self) -> dict:
         cfg = self.get_setting("leave_recovery", {}) or {}
@@ -752,25 +991,56 @@ class Database:
         self.set_setting("leave_recovery", cfg)
 
     def get_default_first_message(self) -> str:
-        return self.get_setting("default_first_message", None) or "Hello {first_name},\n\nAapki request mil gayi hai, jaldi hi accept ho jayegi.\n\nTab tak aap niche diye hue video dekh lo ⚠️ Miss mat karna — properly follow karna!"
+        return self.get_setting("default_first_message", None) or (
+            "Hello {first_name},\n\nAapki request mil gayi hai, jaldi hi accept ho jayegi.\n\n"
+            "Tab tak aap niche diye hue video dekh lo ⚠️ Miss mat karna — properly follow karna!")
 
     def set_default_first_message(self, text: str):
         self.set_setting("default_first_message", text)
 
-    def add_leave_recovery_message(self, bot_id: str, user_id, source_channel_id, target_channel_id, message_id):
-        self._execute("INSERT INTO leave_recovery_messages (bot_id, user_id, source_channel_id, target_channel_id, message_id) VALUES (%s,%s,%s,%s,%s)", (bot_id, user_id, source_channel_id, target_channel_id, message_id))
+    # ── leave recovery tracking ────────────────────────────────────────
+    def add_leave_recovery_message(self, bot_id: str, user_id, source_channel_id,
+                                   target_channel_id, message_id):
+        self.leave_recovery_messages.insert_one({
+            "id": self._next_id("leave_recovery_messages"),
+            "bot_id": bot_id, "user_id": user_id,
+            "source_channel_id": source_channel_id,
+            "target_channel_id": target_channel_id,
+            "message_id": message_id,
+            "sent_at": now_aware(), "deleted_at": None})
 
     def get_pending_leave_recovery_messages(self, bot_id: str, user_id, target_channel_id):
-        rows = self._fetchall("SELECT id, message_id FROM leave_recovery_messages WHERE bot_id=%s AND user_id=%s AND target_channel_id=%s AND deleted_at IS NULL ORDER BY sent_at DESC", (bot_id, user_id, target_channel_id))
+        rows = self.leave_recovery_messages.find({
+            "bot_id": bot_id, "user_id": user_id,
+            "target_channel_id": target_channel_id,
+            "deleted_at": None}).sort("sent_at", -1)
         return [(r["id"], r["message_id"]) for r in rows]
 
     def mark_leave_recovery_deleted(self, row_id):
-        self._execute("UPDATE leave_recovery_messages SET deleted_at=now() WHERE id=%s", (row_id,))
+        self.leave_recovery_messages.update_one(
+            {"id": int(row_id)}, {"$set": {"deleted_at": now_aware()}})
+
+    def clear_pending_leave_recovery(self):
+        self.leave_recovery_messages.update_many(
+            {"deleted_at": None}, {"$set": {"deleted_at": now_aware()}})
 
 
 # ================= GLOBALS =================
-db = Database()
+# Database MongoDB par hai — module import par connect NAHI hota (tests aur
+# tooling ke liye lazy). init_database() main() aur tests dono use karte hain.
+db: Optional[Database] = None
 user_bot_applications: Dict[str, Application] = {}
+
+# User-account sender ka singleton (user_sender.py) — saari user-facing
+# delivery isi ke through hoti hai, bot sirf fallback hai.
+user_account: UserAccountSender = user_sender_mod.user_sender
+
+
+def init_database(client=None) -> Database:
+    """MongoDB Database init karo (injectable client ke saath tests ke liye)."""
+    global db
+    db = Database(client)
+    return db
 
 
 # ================= EMOJI MANAGER =================
@@ -1400,7 +1670,8 @@ async def send_media(bot_or_context, chat_id: int, media_id, media_type: str,
                      text: str = "", markup=None, emoji_map: dict = None,
                      entities_json: Optional[str] = None, file_name: Optional[str] = None,
                      mime_type: Optional[str] = None):
-    bot = bot_or_context if isinstance(bot_or_context, Bot) else bot_or_context.bot
+    # PTB Bot/ExtBot ya koi bhi duck-typed bot object (tests) — dono chalte hain
+    bot = bot_or_context if hasattr(bot_or_context, "send_message") else bot_or_context.bot
     kwargs = {}
     if markup:
         kwargs["reply_markup"] = markup
@@ -1497,6 +1768,55 @@ async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: in
         return None
 
 
+# ================= USER-ACCOUNT DELIVERY =================
+# User-facing messages ab BOT se nahi, USER ACCOUNT se jaate hain (user_sender.py).
+# Agar user-account unavailable/fail ho to BOT fallback use hota hai.
+async def deliver_text(user_id: int, text: str, bot, reply_markup=None,
+                       parse_mode=ParseMode.HTML, use_user_account: bool = True) -> Optional[int]:
+    """Text deliver karo: pehle user-account, phir bot fallback. message_id return."""
+    if use_user_account and user_account.available():
+        try:
+            mid = await user_account.send_text(user_id, text, reply_markup)
+            if mid:
+                return mid
+        except Exception as ex:
+            logging.warning(f"user-account text delivery failed for {user_id}: {ex}")
+    try:
+        sent = await send_user_message(bot, user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return sent.message_id if sent else None
+    except Exception as ex:
+        logging.error(f"deliver_text bot fallback failed for {user_id}: {ex}")
+        return None
+
+
+async def deliver_media(user_id: int, media_id, media_type, text: str, bot, markup=None,
+                        entities_json: Optional[str] = None, file_name: Optional[str] = None,
+                        mime_type: Optional[str] = None, use_user_account: bool = True) -> bool:
+    """Media deliver karo: pehle user-account (bot se download + re-upload), phir bot fallback."""
+    is_media = bool(media_id) and media_type not in (None, "text")
+    if use_user_account and user_account.available():
+        try:
+            mid = None
+            if is_media:
+                display_caption = MessageManager.prepare_for_sending(text, entities_json) if text else ""
+                mid = await user_account.send_media(user_id, media_id, media_type, display_caption or "",
+                                                    markup, file_name, mime_type, bot)
+            elif (text or "").strip():
+                display_text = MessageManager.prepare_for_sending(text, entities_json)
+                mid = await user_account.send_text(user_id, display_text, markup)
+            if mid:
+                return True
+        except Exception as ex:
+            logging.warning(f"user-account media delivery failed for {user_id}: {ex}")
+    try:
+        await send_media(bot, user_id, media_id, media_type or "text", text or "", markup,
+                         entities_json=entities_json, file_name=file_name, mime_type=mime_type)
+        return True
+    except Exception as ex:
+        logging.error(f"deliver_media bot fallback failed for {user_id}: {ex}")
+        return False
+
+
 # ================= SUBSCRIPTION JOBS =================
 async def check_expired_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
     expired_bots = db.get_expired_subscriptions()
@@ -1574,7 +1894,9 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
         mime_type = row.get("mime_type")
 
         if media_group_id:
-            group_items = []
+            group_items = []          # bot fallback ke liye InputMedia list
+            group_rows = []           # user-account path ke liye raw rows
+            extra_captions = []
             group_buttons_json = None
             group_caption_text = None
             j = i
@@ -1585,11 +1907,16 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                 g_media_type = g.get("media_type")
                 if not group_buttons_json and g.get("buttons_json"):
                     group_buttons_json = g.get("buttons_json")
-                if not group_caption_text and g_text:
-                    group_caption_text = g_text
                 if g_media_id and g_media_type in ("photo", "video", "document", "audio"):
                     display_text = MessageManager.prepare_for_sending(g_text, g.get("entities_json")) if g_text else None
                     pm = ParseMode.HTML if display_text else None
+                    if display_text:
+                        if not group_caption_text:
+                            group_caption_text = display_text
+                        else:
+                            extra_captions.append(display_text)
+                    group_rows.append({"media_id": g_media_id, "media_type": g_media_type,
+                                       "file_name": g.get("file_name")})
                     if g_media_type == "photo":
                         group_items.append(InputMediaPhoto(media=g_media_id, caption=display_text or None, parse_mode=pm))
                     elif g_media_type == "video":
@@ -1597,14 +1924,30 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                     elif g_media_type == "document":
                         group_items.append(InputMediaDocument(media=g_media_id, caption=display_text or None, parse_mode=pm))
                 j += 1
-            if group_items:
+
+            delivered = False
+            if group_rows and user_account.available():
+                try:
+                    ids = await user_account.send_media_group(
+                        chat_id, group_rows, context.bot,
+                        caption=group_caption_text,
+                        markup=buttons_to_markup(group_buttons_json))
+                    delivered = bool(ids)
+                except Exception as ex:
+                    logging.warning(f"user-account media group failed for {chat_id}: {ex}")
+            if not delivered and group_items:
                 try:
                     await context.bot.send_media_group(chat_id=chat_id, media=group_items)
+                    delivered = True
                 except BadRequest as ex:
                     logging.error(f"send_media_group failed for {chat_id}: {ex}")
-                group_markup = buttons_to_markup(group_buttons_json)
-                if group_markup:
-                    await send_user_message(context.bot, chat_id, group_caption_text or "Open links:", parse_mode=ParseMode.HTML, reply_markup=group_markup)
+            if delivered and extra_captions:
+                for cap in extra_captions:
+                    await deliver_text(chat_id, strip_premium_emojis(cap), context.bot)
+            group_markup = buttons_to_markup(group_buttons_json)
+            if group_markup:
+                await deliver_text(chat_id, strip_premium_emojis(group_caption_text) or "Open links:",
+                                   context.bot, reply_markup=group_markup)
             i = j
             continue
 
@@ -1615,8 +1958,8 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                 markup = InlineKeyboardMarkup(combined_rows)
             else:
                 markup = live_chat_markup
-        await send_media(context, chat_id, media_id, media_type or "text", text or "", markup,
-                         entities_json=entities_json, file_name=file_name, mime_type=mime_type)
+        await deliver_media(chat_id, media_id, media_type, text or "", context.bot, markup,
+                            entities_json=entities_json, file_name=file_name, mime_type=mime_type)
         i += 1
 
 
@@ -1624,12 +1967,12 @@ async def send_saved_welcome(bot_id: str, chat_id: int, context: ContextTypes.DE
     try:
         channels = db.get_bot_channels(bot_id) or []
         if not channels:
-            await send_user_message(context.bot, chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), parse_mode=ParseMode.HTML)
+            await deliver_text(chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), context.bot)
             return
         channel_id = channels[0]["channel_id"]
         msgs = db.get_messages(channel_id, bot_id) or []
         if not msgs:
-            await send_user_message(context.bot, chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), parse_mode=ParseMode.HTML)
+            await deliver_text(chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), context.bot)
             return
         await _send_messages_with_media_groups(chat_id, msgs, context, bot_id=bot_id, placeholder_user=user)
     except Exception as ex:
@@ -2414,7 +2757,12 @@ async def delete_pending_leave_recovery_messages(bot_id: str, user_id: int, targ
     deleted = 0
     for row_id, message_id in db.get_pending_leave_recovery_messages(bot_id, user_id, target_channel_id):
         try:
-            await bot.delete_message(chat_id=user_id, message_id=message_id)
+            # Message user-account se gaya tha to usi se delete hoga
+            ok = False
+            if user_account.available():
+                ok = await user_account.delete_message(user_id, message_id)
+            if not ok:
+                await bot.delete_message(chat_id=user_id, message_id=message_id)
             deleted += 1
         except Exception:
             pass
@@ -2461,7 +2809,8 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         default_msg_text = db.get_default_first_message()
         default_msg_text = render_dynamic_text(default_msg_text, requester)
-        await send_user_message(context.bot, requester.id, default_msg_text, parse_mode=ParseMode.HTML)
+        # USER-ACCOUNT se bhejo (bot fallback deliver_text ke andar hai)
+        await deliver_text(requester.id, default_msg_text, context.bot)
     except Exception as ex:
         logging.error(f"Default first message send error: {ex}")
 
@@ -2476,9 +2825,9 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             wtype = channel_row.get("welcome_media_type") if channel_row else None
             markup = buttons_to_markup(buttons_json_from_text(wm) or None)
             if wid and wtype:
-                await send_media(context, requester.id, wid, wtype, wm, markup)
+                await deliver_media(requester.id, wid, wtype, wm, context.bot, markup)
             elif wm:
-                await send_user_message(context.bot, requester.id, wm, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await deliver_text(requester.id, wm, context.bot, reply_markup=markup)
         db.mark_reachable(bot_id, requester.id)
     except Exception as ex:
         logging.error(f"Send welcome error: {ex}")
@@ -2557,10 +2906,9 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
             else:
                 leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
 
-            sent = await send_user_message(context.bot, member_user.id, text,
-                                               parse_mode=ParseMode.HTML, reply_markup=leave_markup)
-            if sent:
-                db.add_leave_recovery_message(bot_id, member_user.id, cmu.chat.id, int(target_channel_id), sent.message_id)
+            sent_mid = await deliver_text(member_user.id, text, context.bot, reply_markup=leave_markup)
+            if sent_mid:
+                db.add_leave_recovery_message(bot_id, member_user.id, cmu.chat.id, int(target_channel_id), sent_mid)
 
     except Exception as ex:
         logging.error(f"Leave recovery DM failed: {ex}")
@@ -2634,11 +2982,15 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
     fail = 0
     for r in reqs:
         try:
-            await send_media(context, r, draft.get("media"), draft.get("media_type") or "text",
-                             draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                             entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
-            db.mark_reachable(bot_id, r)
-            sent += 1
+            ok = await deliver_media(r, draft.get("media"), draft.get("media_type") or "text",
+                                     draft.get("text", ""), context.bot, buttons_to_markup(draft.get("buttons_json")),
+                                     entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+            if ok:
+                db.mark_reachable(bot_id, r)
+                sent += 1
+            else:
+                db.mark_unreachable(bot_id, r)
+                fail += 1
         except Forbidden:
             db.mark_unreachable(bot_id, r)
             fail += 1
@@ -3191,7 +3543,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_leave_clear_pending":
             if not is_admin(uid):
                 return
-            db._execute("UPDATE leave_recovery_messages SET deleted_at=now() WHERE deleted_at IS NULL")
+            db.clear_pending_leave_recovery()
             await show_leave_recovery_panel(q)
             return
 
@@ -3411,10 +3763,13 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         recipients = db.get_requesters_for_bot(bot_id)
         for r in recipients:
             try:
-                await send_media(bot_instance, r, draft.get("media"), draft.get("media_type") or "text",
-                                 draft.get("text", ""), buttons_to_markup(draft.get("buttons_json")),
-                                 entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
-                total_sent += 1
+                ok = await deliver_media(r, draft.get("media"), draft.get("media_type") or "text",
+                                         draft.get("text", ""), bot_instance, buttons_to_markup(draft.get("buttons_json")),
+                                         entities_json=draft.get("entities_json"), file_name=draft.get("file_name"), mime_type=draft.get("mime_type"))
+                if ok:
+                    total_sent += 1
+                else:
+                    total_fail += 1
             except Forbidden:
                 total_fail += 1
             except Exception:
@@ -3732,6 +4087,19 @@ async def main():
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
     logging.info(f"{pp('🚀')} Starting Premium Bot System...")
 
+    # ── Config checks ──────────────────────────────────────────────────
+    if not MAIN_BOT_TOKEN:
+        raise SystemExit("MAIN_BOT_TOKEN set nahi hai. .env.example dekhein aur .env banayein.")
+
+    # ── MongoDB connect (new database setup) ───────────────────────────
+    init_database()
+
+    # ── User-account sender start (messages ab user account se jayenge) ─
+    await user_account.start()
+    if not user_account.available():
+        logging.warning("User-account delivery OFF — bot fallback use hoga. "
+                        "Session banane ke liye: python3 login_userbot.py")
+
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:
         bot_data = db.get_user_bot(bot_id)
@@ -3814,6 +4182,7 @@ async def main():
                 logging.info(f"{pp('✅')} Stopped user bot {bot_id}")
             except Exception:
                 pass
+        await user_account.stop()
         logging.info(f"{pp('✅')} All bots stopped")
 
 

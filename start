@@ -134,7 +134,7 @@ else
     
     # Install common dependencies if requirements.txt doesn't exist
     log_info "Installing common dependencies..."
-    pip install python-telegram-bot==20.7 aiohttp pymongo numpy scikit-learn pyrogram -q 2>/dev/null || {
+    pip install "python-telegram-bot[job-queue]>=21.0" pymongo certifi telethon python-dotenv -q 2>/dev/null || {
         log_error "Failed to install dependencies!"
         exit 1
     }
