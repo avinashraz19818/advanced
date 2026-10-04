@@ -359,6 +359,26 @@ class FakeDB:
     def set_leave_recovery_config(self, cfg):
         self.leave = cfg
 
+    def add_leave_recovery_pending(self, bot_id, user_id, source_channel_id, target_channel_id):
+        rows = self.leave.setdefault("pending_rows", {})
+        rows[(bot_id, user_id, target_channel_id)] = {
+            "bot_id": bot_id, "user_id": user_id,
+            "source_channel_id": source_channel_id, "target_channel_id": target_channel_id}
+        self.leave.setdefault("pending_adds", []).append(
+            (bot_id, user_id, source_channel_id, target_channel_id))
+
+    def get_leave_recovery_pending(self, bot_id, user_id):
+        rows = self.leave.get("pending_rows", {})
+        return [dict(v) for k, v in rows.items() if k[0] == bot_id and k[1] == user_id]
+
+    def clear_leave_recovery_pending(self, bot_id, user_id, target_channel_id=None):
+        rows = self.leave.setdefault("pending_rows", {})
+        for k in list(rows):
+            if k[0] == bot_id and k[1] == user_id and (
+                    target_channel_id is None or k[2] == target_channel_id):
+                rows.pop(k, None)
+        self.leave.setdefault("pending_clears", []).append((bot_id, user_id, target_channel_id))
+
     def add_leave_recovery_message(self, *a, **k):
         self.leave.setdefault("sent", []).append(a)
 
@@ -452,12 +472,29 @@ class FakeDB:
     # --- reachability
     def mark_reachable(self, *a):
         self.reachable_calls.append(tuple(a))
+        # real DB: mark_reachable() purana soft (initiate) mark hata deta hai
+        self.gone_calls = [c for c in self.gone_calls if not (
+            len(c) > 1 and c[0] == a[0] and c[1] == a[1]
+            and "initiate" in str(c[2] if len(c) > 2 else "").lower())]
 
     def mark_unreachable(self, *a):
         self.unreachable_calls.append(tuple(a))
 
     def mark_permanently_unreachable(self, *a):
         self.gone_calls.append(tuple(a))
+
+    def mark_initiate_blocked(self, bot_id, uid, reason=""):
+        self.gone_calls.append((bot_id, uid, f"initiate: {reason}"))
+        self.initiate_calls = getattr(self, "initiate_calls", [])
+        self.initiate_calls.append((bot_id, uid, str(reason)))
+
+    def is_initiate_blocked(self, bot_id, uid):
+        return any(c[0] == bot_id and c[1] == uid and "initiate" in str(c[2] if len(c) > 2 else "").lower()
+                   for c in self.gone_calls)
+
+    def count_initiate_blocked(self, bot_id):
+        return sum(1 for c in self.gone_calls if c[0] == bot_id
+                   and "initiate" in str(c[2] if len(c) > 2 else "").lower())
 
     def is_permanently_unreachable(self, bot_id, uid):
         return any(c[0] == bot_id and c[1] == uid for c in self.gone_calls)
@@ -1473,6 +1510,149 @@ def test_diagnostics():
           str([t[:60] for t, _ in rq.edits]))
 
 
+class InitiateBlockedBot(FakeBot):
+    """User ne bot ko /start nahi kiya -> Telegram 403 deta hai (permanent NAHI)."""
+
+    async def send_message(self, chat_id, text, **kw):
+        self._log("send_message", chat_id, text, kw)
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+    async def send_photo(self, chat_id, media, **kw):
+        self._log("send_photo", chat_id, media, kw)
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+
+def test_initiate_blocked_flow():
+    print("\n[16] initiate-blocked: soft mark + pending DM + /start par delivery")
+    A._DM_INITIATE_WARNED.clear()
+    A.db.user_bots = [{"bot_id": "b1", "bot_username": "one", "bot_token": "t1", "user_id": 999}]
+    A.db.gone_calls = []
+    A.db.reachable_calls = []
+    A.db.leave = {"enabled": True, "target_channel_id": -100999,
+                  "target_channel_link": "https://t.me/joinchat/x",
+                  "messages": [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""}]}
+
+    bot = InitiateBlockedBot("initiate")
+    ctx = FakeCtx()
+    ctx.bot = bot
+    member = SimpleNamespace(id=6661, first_name="NoStart", is_bot=False)
+    update = SimpleNamespace(chat_member=SimpleNamespace(
+        chat=SimpleNamespace(id=-100123, title="Chan"),
+        new_chat_member=SimpleNamespace(status="left", user=member),
+        old_chat_member=SimpleNamespace(status="member")))
+
+    handler, root, old = _capture_logs()
+    try:
+        run(A.handle_channel_member_update(update, ctx, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old)
+    warns = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+    infos = [r.getMessage() for r in handler.records if r.levelno == logging.INFO]
+    check("initiate: koi WARNING nahi (ye normal Telegram rule hai)", not warns, str(warns))
+    check("initiate: ek INFO line", sum(1 for m in infos if "/start nahi kiya" in m) == 1, str(infos))
+    check("initiate: soft mark mila", A.db.is_initiate_blocked("b1", 6661), str(A.db.gone_calls))
+    check("initiate: hard (permanent) mark nahi mila",
+          not any(c[1] == 6661 and "initiate" not in str(c[2]).lower() for c in A.db.gone_calls),
+          str(A.db.gone_calls))
+    check("initiate: DM pending me save hui",
+          ("b1", 6661, -100123, -100999) in A.db.leave.get("pending_adds", []),
+          str(A.db.leave.get("pending_adds")))
+
+    # dobara leave -> koi API call nahi, koi nayi warning nahi
+    bot.calls = []
+    handler2, root2, old2 = _capture_logs()
+    try:
+        run(A.handle_channel_member_update(update, ctx, "b1", 999))
+    finally:
+        _stop_capture(handler2, root2, old2)
+    check("initiate: dobara API call nahi", bot.calls == [], str(bot.calls))
+    check("initiate: dobara warning/log spam nahi",
+          not [r for r in handler2.records if r.levelno >= logging.WARNING],
+          str([r.getMessage()[:60] for r in handler2.records if r.levelno >= logging.WARNING]))
+
+    # user ne /start kiya -> pending leave-recovery DM apne aap chali jaye
+    good = FakeBot("good")
+    ctx2 = FakeCtx()
+    ctx2.bot = good
+    ctx2.args = []
+    run(A.user_bot_start(_fake_update(uid=6661, msg=FakeMsg(chat_id=6661)), ctx2, "b1", 999))
+    texts = [c[2] for c in good.calls if c[0] == "send_message" and c[1] == 6661]
+    check("start: pending leave-recovery DM chali", any("wapas aao" in str(t) for t in texts), str(texts[:2]))
+    check("start: soft mark clear ho gaya", not A.db.is_initiate_blocked("b1", 6661), str(A.db.gone_calls))
+    check("start: pending row delete ho gayi", not A.db.leave.get("pending_rows"),
+          str(A.db.leave.get("pending_rows")))
+    check("start: bheji hui message history me save hui", bool(A.db.leave.get("sent")), str(A.db.leave.get("sent")))
+
+    # target channel ki join request -> pending clear (user wapas aa gaya)
+    A.db.leave["pending_rows"] = {("b1", 7772, -100999): {"bot_id": "b1", "user_id": 7772,
+                                                          "source_channel_id": -100123,
+                                                          "target_channel_id": -100999}}
+    requester = SimpleNamespace(id=7772, first_name="Back", username="back", last_name="", is_bot=False)
+    run(A.process_join_request("b1", 999, requester, -100999, "Target", None,
+                               sender=good, approve=None, auto=True))
+    check("target join: pending row clear", not A.db.leave.get("pending_rows"),
+          str(A.db.leave.get("pending_rows")))
+
+    # broadcast: initiate-blocked user hard-drop na ho (pehle yahi bug tha)
+    A.db.leave = {"messages": []}
+    A.db.gone_calls = []
+    A.db.requesters = {"b2": [7771]}
+    A.db.user_bots = A.db.user_bots + [{"bot_id": "b2", "bot_username": "two", "bot_token": "t2", "user_id": 999}]
+    A.user_bot_applications["b2"] = SimpleNamespace(bot=InitiateBlockedBot("ib2"))
+    bctx = FakeCtx()
+    bctx.user_data["broadcast_draft_b2"] = {"text": "hi", "album": None, "buttons_json": None,
+                                            "media": None, "media_type": None}
+    handler3, root3, old3 = _capture_logs()
+    try:
+        run(A.send_user_broadcast(FakeQuery(bctx, uid=999), bctx, "b2", 999))
+    finally:
+        _stop_capture(handler3, root3, old3)
+        A.user_bot_applications.pop("b2", None)
+    infos3 = [r.getMessage() for r in handler3.records if r.levelno == logging.INFO]
+    check("broadcast: initiate user hard mark nahi hua",
+          not any(c[1] == 7771 and "initiate" not in str(c[2]).lower() for c in A.db.gone_calls),
+          str(A.db.gone_calls))
+    check("broadcast: soft mark mila", A.db.is_initiate_blocked("b2", 7771), str(A.db.gone_calls))
+    check("broadcast: summary me start_baaki dikha",
+          any("start_baaki=1" in m for m in infos3), str([m for m in infos3 if "broadcast b2" in m]))
+
+    # source-level: nayi cheezein waqai code me hain (regression guard)
+    source = open(A.__file__, encoding="utf-8").read()
+    for needle in ("def mark_initiate_blocked", "def is_initiate_blocked",
+                   "CREATE TABLE IF NOT EXISTS leave_recovery_pending",
+                   "def deliver_pending_leave_recovery", "def record_dm_failure"):
+        check(f"source: {needle}", needle in source)
+
+
+def test_network_hiccup_throttle():
+    print("\n[17] network hiccup log throttle")
+    A._NETWORK_HICCUP_STATE.clear()
+    fmt = A.MaskingFormatter("%(message)s")
+    filt = A.TransientNetworkFilter()
+    recs = []
+    for i in range(3):
+        rec = logging.LogRecord("telegram.ext.Updater.test", logging.ERROR, __file__, 1,
+                                "Exception happened while polling for updates.", (), None)
+        rec.exc_info = (A.NetworkError, A.NetworkError("httpx.ReadError"), None)
+        rec.exc_text = "Traceback ... 40 lines"
+        filt.filter(rec)
+        recs.append(rec)
+    check("hiccup: pehli line WARNING", recs[0].levelno == logging.WARNING, str(recs[0].levelno))
+    check("hiccup: baaki lines DEBUG (throttle)",
+          all(r.levelno == logging.DEBUG for r in recs[1:]), str([r.levelno for r in recs]))
+    text = fmt.format(recs[0])
+    check("hiccup: line me FORCE_IPV4 hint + chhoti line",
+          "FORCE_IPV4" in text and len(text) < 300, text)
+    # window khatam -> agli hiccup phir WARNING par (repeat count ke saath)
+    A._NETWORK_HICCUP_STATE[("telegram.ext.Updater.test", "NetworkError")] = [0.0, 3]
+    rec4 = logging.LogRecord("telegram.ext.Updater.test", logging.ERROR, __file__, 1,
+                             "Exception happened while polling for updates.", (), None)
+    rec4.exc_info = (A.NetworkError, A.NetworkError("httpx.ReadError"), None)
+    filt.filter(rec4)
+    check("hiccup: naye window par summary me repeat count",
+          rec4.levelno == logging.WARNING and "min me" in fmt.format(rec4), fmt.format(rec4))
+
+
 def _check_non_admin_diag():
     """Non-admin /diag bheje to kuch na aaye."""
     msg = FakeMsg(text="/diag", chat_id=555,
@@ -1514,6 +1694,8 @@ def main():
     A.reset_premium_styling_state()
     A.reset_premium_styling_state()
     test_subscription_picker_and_style_memory()
+    test_initiate_blocked_flow()
+    test_network_hiccup_throttle()
     test_diagnostics()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:

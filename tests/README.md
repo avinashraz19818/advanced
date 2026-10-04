@@ -13,14 +13,17 @@
   masking + startup guards, network noise filter + retry + FORCE_IPV4,
   leave-recovery DMs, panel routing, app wiring, **admin ADD ACCOUNT wizard**
   (direct user_id -> token -> subscription, cancel, legacy one-line format),
-  **HTML safety net** (Telegram HTML sanitize, welcome ERROR spam band) aur
-  **diagnostics** (build tag + bot status + /diag report + unreachable reset)
+  **HTML safety net** (Telegram HTML sanitize, welcome ERROR spam band),
+  **initiate-blocked flow** (soft mark, pending leave-recovery DM, /start par
+  auto-delivery, broadcast me hard-drop nahi) + **network hiccup throttle**
+  (ek window me ek hi WARNING) aur **diagnostics** (build tag + bot status +
+  /diag report + unreachable reset)
 
 ## Chalane ka tarika
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes
-/tmp/v/bin/python tests/verify_advanced.py     # 176 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 200 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:

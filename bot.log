@@ -1,4 +1,0 @@
-2026-10-04 12:30:09,662 - root - WARNING - leave recovery DM skip (user 8542069660): Forbidden: bot can't initiate conversation with a user - user ne bot ko /start nahi kiya (user /start kare to DM ja sakti hai)
-2026-10-04 12:30:16,931 - telegram.ext.Updater - WARNING - Telegram network hiccup (PTB khud retry kar raha hai, koi action zaroori nahi): Exception happened while polling for updates. (NetworkError)
-2026-10-04 12:33:41,869 - root - WARNING - leave recovery DM skip (user 7640551153): Forbidden: bot can't initiate conversation with a user - user ne bot ko /start nahi kiya (user /start kare to DM ja sakti hai)
-2026-10-04 12:33:47,316 - root - WARNING - leave recovery DM skip (user 6318634337): Forbidden: bot can't initiate conversation with a user - user ne bot ko /start nahi kiya (user /start kare to DM ja sakti hai)
