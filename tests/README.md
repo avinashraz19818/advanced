@@ -17,7 +17,9 @@
   **initiate-blocked flow** (soft mark, pending leave-recovery DM, /start par
   auto-delivery, broadcast me hard-drop nahi), **leave-recovery per-channel
   panel** (saare channels - koi 20-cap nahi, pagination, default 🔴 OFF,
-  Sab ON/OFF, one-time all-off migration), **network hiccup throttle**
+  Sab ON/OFF, one-time all-off migration), **Mini App integration** (web_app
+  button, base64 rows prefill, web_app_data se buttons+text save, expired
+  session handling), **network hiccup throttle**
   (ek window me ek hi WARNING) aur **diagnostics** (build tag + bot status +
   /diag report + unreachable reset)
 
@@ -25,7 +27,7 @@
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes
-/tmp/v/bin/python tests/verify_advanced.py     # 222 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 248 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:

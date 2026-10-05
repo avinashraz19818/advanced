@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import json
 import time
@@ -8,6 +9,7 @@ import inspect
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from functools import wraps
+from urllib.parse import quote
 
 from telegram import (
     Update,
@@ -306,7 +308,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-04-r19"
+BUILD_TAG = "2026-10-05-r20"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -2272,6 +2274,11 @@ def add_callback_button_to_json(buttons_json, text: str, cb: str, url: Optional[
 # The old "Label|link" bulk syntax stays available as "📄 Paste Many".
 BUTTON_WIZARD_KEY = "button_wizard"
 BUTTON_TARGET_KEY = "button_targets"
+# Mini App (webapp/index.html) ka https URL - .env me WEBAPP_URL=https://... set karo.
+# Set na ho to sirf purana wizard chalta hai (➕ Add Button / 📄 Paste Many).
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
+# Telegram URL ki limit ke andar rehne ke liye (rows/text prefill ki wajah se lamba na ho)
+MINI_APP_URL_MAX = 1900
 BUTTON_TARGET_TTL = 6 * 3600
 
 
@@ -2306,10 +2313,168 @@ def get_button_target(context, tid) -> Optional[dict]:
 
 
 def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
-    """One row callers can drop into any keyboard: ➕ Add Button | 📄 Paste Many."""
+    """One row callers can drop into any keyboard: ➕ Add Button | 🌐 Mini App | 📄 Paste Many.
+
+    `🌐 Mini App` tab sirf tab dikhta hai jab .env me WEBAPP_URL set ho — usme buttons
+    visual builder (webapp/index.html) me bante hain aur SAVE par seedha bot me aa jate hain.
+    """
     tid = register_button_target(context, target)
-    return [btn("Add Button", f"bwz_start_{tid}", "success", "➕"),
-            btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄")]
+    row = [btn("Add Button", f"bwz_start_{tid}", "success", "➕")]
+    mini = mini_app_button(context, target, tid)
+    if mini is not None:
+        row.append(mini)
+    row.append(btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄"))
+    return row
+
+
+def _mini_app_rows_payload(context, target: dict) -> str:
+    """Mini App ko bhejne ke liye current buttons (base64 JSON) - taaki edit kar sake."""
+    try:
+        payload = rows_to_buttons_json(target_rows(context, target)) or "[]"
+    except Exception:
+        payload = "[]"
+    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _mini_app_text_payload(context, target: dict) -> str:
+    """Mini App me message box prefill karne ke liye (jitna possible ho)."""
+    kind = target.get("kind")
+    try:
+        if kind in ("draft_user", "draft_admin"):
+            return str(_draft_for_target(context, target).get("text") or "")
+        if kind == "leave_msg":
+            messages = db.get_leave_recovery_config().get("messages", [])
+            idx = int(target.get("idx", 0))
+            if 0 <= idx < len(messages):
+                return str(messages[idx].get("text") or "")
+        if kind in ("message", "messages"):
+            mid = target.get("msg_id") or (target.get("msg_ids") or [None])[0]
+            row = db.get_message_by_id(mid) if mid else None
+            return str((row or {}).get("content_text") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def mini_app_button(context, target: dict, tid: Optional[str] = None) -> Optional[InlineKeyboardButton]:
+    """`🌐 Mini App` button (web_app) - yaad rakho: HTTPS URL hi chalta hai.
+
+    URL me tid (target), existing buttons (rows) aur text prefill jate hain, isliye
+    Mini App kholte hi client ke purane buttons edit ke liye ready hote hain. URL bahut
+    lamba na ho jaye isliye text/rows ko zarurat par drop kar diya jata hai.
+    """
+    if not WEBAPP_URL or not isinstance(WEBAPP_URL, str) or not WEBAPP_URL.startswith("https://"):
+        return None
+    try:
+        from telegram import WebAppInfo
+    except Exception:
+        return None
+    tid = tid or register_button_target(context, target)
+    kind = str(target.get("kind") or "")
+    base = f"{WEBAPP_URL}?tid={tid}&kind={kind}"
+    label = ""
+    try:
+        label = str(_target_title(target) or "")
+    except Exception:
+        pass
+    if label:
+        base += f"&label={quote(label[:40])}"
+    text = _mini_app_text_payload(context, target)
+    if text:
+        base += f"&text={quote(text[:300])}"
+    with_rows = base + f"&rows={quote(_mini_app_rows_payload(context, target))}"
+    url = with_rows if len(with_rows) <= MINI_APP_URL_MAX else base
+    if len(url) > MINI_APP_URL_MAX:      # text bhi bohat lamba - wo bhi chhod do
+        url = f"{WEBAPP_URL}?tid={tid}&kind={kind}"
+    try:
+        return InlineKeyboardButton("Mini App", web_app=WebAppInfo(url=url))
+    except Exception as ex:
+        logging.debug(f"mini app button skip: {mask_secrets(ex)}")
+        return None
+
+
+def apply_mini_app_text(context, target: dict, text: str) -> bool:
+    """Mini App ke message box ka text wahi jagah save karo jahan wizard karta hai."""
+    kind = target.get("kind")
+    if not text:
+        return False
+    if kind in ("draft_user", "draft_admin"):
+        draft = dict(_draft_for_target(context, target))
+        draft["text"] = text
+        key = f"broadcast_draft_{target.get('bot_id')}" if kind == "draft_user" else "admin_broadcast_draft"
+        context.user_data[key] = draft
+        return True
+    if kind == "leave_msg":
+        cfg = db.get_leave_recovery_config()
+        messages = cfg.get("messages", [])
+        idx = int(target.get("idx", 0))
+        if 0 <= idx < len(messages):
+            messages[idx]["text"] = text
+            cfg["messages"] = messages
+            db.set_leave_recovery_config(cfg)
+            return True
+    return False
+
+
+async def process_web_app_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Mini App ka SAVE: `web_app_data` message -> buttons (aur text) wahi save karo.
+
+    Return True = ye update handle ho gaya (aage processing ki zarurat nahi).
+    """
+    msg = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    data = getattr(msg, "web_app_data", None) if msg else None
+    raw = getattr(data, "data", None) if data else None
+    if not raw:
+        return False
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    target = None
+    try:
+        tid = (payload.get("target") or {}).get("id") or payload.get("tid")
+        target = get_button_target(context, tid)
+    except Exception:
+        target = None
+    if not target:
+        try:
+            await reply_premium_message(msg,
+                f"{pe('❌')} Ye builder session purana ho gaya.\n"
+                f"Panel me <b>➕ Add Button</b> (ya <b>🌐 Mini App</b>) dobara kholo aur phir save karo.",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return True
+    rows = payload.get("rows") or []
+    text = str(payload.get("text") or "").strip()
+    try:
+        ok = target_save_rows(context, target, rows)
+    except Exception as ex:
+        logging.error(f"mini app save fail: {mask_secrets(ex)}")
+        ok = False
+    if not ok:
+        try:
+            await reply_premium_message(msg, f"{pe('❌')} Buttons save nahi ho paye. Dobara try karo.",
+                                        parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return True
+    if text:
+        try:
+            apply_mini_app_text(context, target, text)
+        except Exception as ex:
+            logging.debug(f"mini app text save skip: {mask_secrets(ex)}")
+    count = button_count(rows_to_buttons_json(rows))
+    logging.info(f"mini app: {count} buttons save hue (target={target.get('kind')})")
+    logging.info(f"mini app layout: {strip_premium_emojis(_wizard_layout(rows))}")
+    try:
+        await reply_premium_message(msg,
+            f"{pe('✅')} <b>Mini App se buttons save ho gaye!</b> ({count})\n\n"
+            f"{_wizard_layout(rows)}",
+            parse_mode=ParseMode.HTML, reply_markup=markup_from_rows(rows))
+    except Exception as ex:
+        logging.warning(f"mini app confirm reply fail: {mask_secrets(ex)}")
+    return True
 
 
 def _draft_for_target(context, target: dict) -> dict:
@@ -3424,6 +3589,10 @@ async def handle_public_userbot_callback(update: Update, context: ContextTypes.D
     user = q.from_user
     if data == "live_chat_support":
         await send_premium_message(context.bot, user.id, UIFormatter.live_chat_header(), parse_mode=ParseMode.HTML)
+        return
+    if data == "start_now":
+        # "Bot action" wale buttons ke liye readymade action: welcome/menu dobara bhejo
+        await send_saved_welcome(bot_id, user.id, context, user=user)
 
 
 async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -3875,6 +4044,10 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
     uid = user.id
     msg = update.message
     if not msg:
+        return
+
+    # Mini App se aaye buttons (client ke apne bot me) -> wahi save karo
+    if await process_web_app_buttons(update, context):
         return
 
     # Handle support reply from admin to user
@@ -6687,6 +6860,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     if not msg:
+        return
+
+    # Mini App (webapp/index.html) ne buttons save kiye? -> sabse pehle wahi handle karo
+    if await process_web_app_buttons(update, context):
         return
 
     # Easy button builder (➕ Add Button wizard) has priority over everything else
