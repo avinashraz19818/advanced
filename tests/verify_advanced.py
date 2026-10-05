@@ -1723,7 +1723,7 @@ def test_mini_app_integration():
         ctx0.user_data.clear()
         row0 = A.button_builder_row(ctx0, {"kind": "draft_admin"})
         check("mini app: URL na hone par tab nahi",
-              _mini_app_btn(InlineKeyboardMarkup([row0])) is None and len(row0) == 2, str(len(row0)))
+              _mini_app_btn(InlineKeyboardMarkup([row0])) is None and len(row0) == 1, str(len(row0)))
 
         # --- WEBAPP_URL set -> 3 buttons, mini app URL me tid/kind/rows
         A.WEBAPP_URL = "https://example.github.io/advanced"
@@ -1731,8 +1731,8 @@ def test_mini_app_integration():
         ctx.user_data.clear()
         target = {"kind": "draft_admin", "tid": "x"}
         row = A.button_builder_row(ctx, target)
-        check("mini app: 3 buttons (Add Button | Mini App | Paste Many)", len(row) == 3, str(len(row)))
-        check("mini app: panel uses launcher callback", row[1].callback_data.startswith("bwz_app_"))
+        check("mini app: no separate Mini App or Paste Many tab", len(row) == 1, str(len(row)))
+        check("mini app: legacy fallback only without backend", row[0].callback_data.startswith("bwz_start_"))
         sent = []
         async def capture_send(**kwargs):
             sent.append(kwargs)

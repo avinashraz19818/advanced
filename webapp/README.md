@@ -1,138 +1,80 @@
-## r22 SAVE fix — deploy BOTH parts
+# Button Builder — direct Add/Edit Mini App (r23)
 
-1. Update the bot from `arena/01a1067e-advanced`, keeping WEBAPP_URL in `.env`.
-2. Upload the updated `downloads/button-studio.zip` as a NEW deployment of the
-   existing Cloudflare site (same hostname). Restart the bot and reopen the builder.
-3. In the current supported flow: Add Button -> Telegram reply-keyboard Mini App
-   button -> SAVE. Empty initData is normal for this launch type; sendData still works.
-4. Wait for the BOT's confirmation and preview. The frontend only confirms dispatch,
-   never database persistence. Saved-message buttons are stored for future sends;
-   existing copies already delivered to other users are not retroactively edited.
-   Broadcast drafts still require Send Broadcast; SAVE must not send a mass broadcast.
+## Supported direct flow
 
-Direct opening from an inline Add/Edit button is NOT complete: it needs an
-HTTPS backend with validated Telegram initData (not sendData). Do not replace the
-reply-keyboard launch with an inline web_app button until that transport is deployed.
-The current Telegram sendData payload limit is 4096 bytes; oversized payloads show
-an error rather than pretend to save. Browser-only previews cannot save to the bot.
+With `WEBAPP_API_URL` configured, every `button_builder_row` is a **single inline
+web_app button**: **Add Button** when empty, **Edit Buttons** when buttons exist.
+There is no separate Mini App tab, Paste Many tab, or manual-choice screen.
 
-# 🌐 Button Builder — Telegram Mini App (Premium)
+The frontend and API are served together by `miniapp_bridge.py` from the bot's
+VPS through HTTPS. Telegram initData is HMAC-verified against the originating
+bot token, user ID, timestamp and a random one-hour session. Only whitelisted
+frontend files are served; neither `.env` nor Python source is publicly served.
+Existing text/buttons load through authenticated POST, not URL query contents.
+Message text is read-only in this button editor.
 
-`index.html` = **premium visual button builder** (GroupHelp jaisa), jo bilkul usi format me
-output deta hai jo `advanced.py` use karta hai:
+SAVE writes through the existing message/album/draft/leave-message store,
+reads back the stored buttons, then returns a saved acknowledgement. The app
+closes only after this acknowledgement. A best-effort Telegram preview and
+navigation message are also sent. On failure, the editor stays open.
+Deleting all buttons and saving is supported. Saved message changes affect
+future sends; previous messages delivered to recipients are not retroactively
+edited. Broadcast SAVE updates the draft; it does NOT mass-send a broadcast.
 
-```json
-[[{"text":"Register","url":"https://t.me/x","style":"success","icon_char":"🔗"}]]
-```
-
-* `style` = `primary` (blue) / `success` (green) / `danger` (red) — khaali = transparent
-* `cb` = callback (bot action), `url` = link
-* `icon_id` + `icon_char` = premium emoji (bot ke `EMOJI_IDS` se)
-
-## Button ke 2 type (client ko yahi samajhna hai)
-
-| Type | Kab use kare | Example |
-|---|---|---|
-| **🔗 Link khule** | Website / channel / register link kholna ho (99% buttons yahi hain) | `https://veergame41.com/#/register?invitationCode=…`, `@yourchannel` |
-| **⚙️ Bot kuch kare** | Koi link nahi — bot khud kuch kare | 💬 **Live Chat Support** bheje, 🏠 **Welcome / Menu dobara** bheje |
-
-* **Link** wala button sab jagah chalta hai (kisi ke bhi chat me).
-* **Bot action** ke liye action aapke bot me pehle se hona chahiye — Mini App me
-  sirf wahi ready-made actions dikhti hain jo bot me already kaam karti hain
-  (`live_chat_support`, `start_now`), aur ek "Custom (advanced)" option bhi hai
-  (wo tab kaam karega jab bot me us naam ka handler ho).
-
-## Features (client-facing — koi JSON/emoji-id nahi dikhta)
-
-| Feature | Kya karta hai |
-|---|---|
-| **Live preview** | Asli Telegram post card jaisa — message + buttons (colors/emojis ke saath) |
-| **Message box** | Jo message ke neeche buttons lagenge |
-| **Rows editor** | `＋ Naya row`, per-row `＋` (row me max 8), row delete |
-| **Tap = edit sheet** | Naam, Link/Bot-action, color, emoji |
-| **Emoji picker (Telegram jaisa)** | 🔍 **Search** (`pizza` → 🍕), ⭐️ **Premium tab** (bot ke 65 premium emojis, ★ badge), 🕘 **Recent**, + 9 categories (1849 emojis) |
-| **Premium emojis** | Jo emojis bot me premium id wale hain unpar ★ badge; select karne par `icon_id` + `icon_char` dono save |
-| **⬆️⬇️⬅️➡️** | Button ko row/dabba badlo |
-| **SAVE** | Telegram me: seedha bot ko (`sendData`). Browser me: JSON copy |
-| **Auto-save draft** | localStorage me kaam save (galti se band ho to bhi kaam nahi jata) |
-
-### Emoji data (search ke liye)
-`emoji-data.js` — 1849 emojis, 9 categories, keywords ke saath (jaise Telegram ka search).
-Regenerate: `pip install emojis emoji && python3 webapp/gen_emoji_data.py`
-
-## Abhi kaise chalta hai (do modes)
-
-1. **Browser mode (abhi)** — local/preview me khulta hai. SAVE karne par JSON milta hai
-   jo aap bot ke "Paste Many" me paste kar sakte ho.
-2. **Telegram Mini App mode** — jab ye page HTTPS URL par host ho aur bot `web_app`
-   button se khole, to SAVE karne par buttons **seedha bot me** save ho jate hain
-   (`Telegram.WebApp.sendData` → bot ko `web_app_data` message milta hai).
-
-## Mini App banane ke liye kya chahiye
-
-| Cheez | Kyun | Free tareeka |
-|---|---|---|
-| **HTTPS URL** | Telegram sirf `https://` mini app URL allow karta hai | Cloudflare Tunnel (free, domain ke bina bhi) ya apna domain + `certbot` |
-| **Bot-side handler** | `web_app_data` se aaya JSON lena + save karna | `advanced.py` me ~40 lines (niche plan) |
-
-### Deployment — 3 options
-
-**A. Cloudflare Tunnel (domain ke bina, sabse fast)**
-```bash
-cd ~/advanced/webapp && python3 -m http.server 8110 --bind 127.0.0.1
-# doosri terminal me:
-cloudflared tunnel --url http://127.0.0.1:8110     # free, turant https URL deta hai
-```
-
-**B. Apna domain + nginx + free SSL (permanent)**
-```bash
-sudo apt install -y nginx certbot python3-certbot-nginx
-# nginx me /var/www/buttonbuilder -> ~/advanced/webapp serve karo
-sudo certbot --nginx -d yourdomain.com              # HTTPS free
-```
-
-**C. Static hosting** (Vercel/Netlify/GitHub Pages) — HTML waisa hi chalega, bas
-`sendData` ke liye wahi page Telegram ke andar khulna chahiye.
-
-## Bot me integration (ho chuka hai ✅)
-
-1. `.env` me sirf ek line:
-   ```bash
-   WEBAPP_URL=https://<aapka-https-url>/
-   ```
-2. Bot me ab automatic:
-   * Button builder panel me **🌐 Mini App** tab aata hai (`button_builder_row`) — purane
-     buttons URL me prefill ho kar aate hain (`tid`, `kind`, `rows`, `text`).
-   * Mini App ka **SAVE** → bot ko `web_app_data` message → buttons **aur** message text
-     wahi save hote hain jahan wizard save karta tha (`target_save_rows` +
-     `apply_mini_app_text`) — register link, welcome, broadcast draft, leave message sab.
-   * Save hone par chat me confirm + buttons ka preview aata hai.
-   * Agar session purana ho gaya (`tid` expire) → saaf message: "dobara kholo".
-
-## Hosting (HTTPS) — 3 tareeke
-
-**A. GitHub Pages (free, permanent, repo already public hai)**
-1. GitHub → repo → **Settings → Pages**
-2. Source: **Deploy from a branch** → Branch: `main` (ya `arena/01a1067e-advanced`) →
-   Folder: **/webapp** → Save
-3. URL banega: `https://avinashraz19818.github.io/advanced/`
-4. `.env` me: `WEBAPP_URL=https://avinashraz19818.github.io/advanced`
-
-**B. Cloudflare Tunnel (turant, domain ke bina)**
-```bash
-cd ~/advanced/webapp && python3 -m http.server 8110 --bind 127.0.0.1
-cloudflared tunnel --url http://127.0.0.1:8110     # free https URL deta hai
-```
-
-**C. Apna domain + nginx + certbot** (`sudo certbot --nginx -d buttons.yourdomain.com`)
-
-## Test
+## VPS setup without a domain / Cloudflare credentials
 
 ```bash
-node webapp/selftest.mjs                    # 39 checks (including empty-initData SAVE regression)
-python3 webapp/gen_emoji_map.py --check     # picker <-> bot ke premium emojis sync
+cd ~/advanced &&
+git fetch origin arena/01a1067e-advanced &&
+git merge --ff-only FETCH_HEAD &&
+bash scripts/enable-miniapp
 ```
 
-Self-test verify karta hai: output **Python ke `rows_to_buttons_json()` se byte-to-byte
-match**, premium emoji map bot ke `EMOJI_IDS` se aata hai, search (`pizza`/`fire`/`cake`)
-chalta hai, aur purana data (rows) theek load hota hai.
+The script downloads the official Linux cloudflared binary if unavailable,
+starts/reuses a Cloudflare Quick Tunnel to loopback port 8110, updates only
+`WEBAPP_URL`, `WEBAPP_API_URL`, `WEBAPP_PORT` in `.env`, and runs `./start`.
+The existing bot credentials remain in `.env`; no credentials are requested.
+The tunnel PID/log/binary live outside Git in `~/.advanced-miniapp/`.
+Open a **fresh bot panel** after updating: Telegram does not rewrite old keyboards.
+No ZIP upload to the old static Cloudflare Worker is needed for this mode.
+
+**Limitations:** Quick Tunnel is for testing and has no uptime guarantee. Its URL
+changes if restarted and the tunnel is NOT a reboot-persistent service. After VPS
+reboot/tunnel exit run `bash scripts/enable-miniapp` again, then reopen bot panels.
+Do not treat this as production high-availability deployment. For a permanent URL,
+configure a named Cloudflare Tunnel with a domain and systemd; route its HTTPS host
+to `http://127.0.0.1:8110`, set `WEBAPP_API_URL=https://your-host`, then restart bot.
+Keep port 8110 private. The frontend calls relative `/api/load` and `/api/save`,
+never browser localhost. In-memory sessions expire on restart (reopen the panel).
+
+Changing hosting URLs does not make the GitHub repo private. Change repository
+visibility separately if the backend source must not be publicly downloadable.
+
+## Legacy static ZIP mode
+
+`downloads/button-studio.zip` contains only HTML and emoji data, not this backend.
+It CANNOT provide direct inline-button saves alone. With only `WEBAPP_URL` and no
+`WEBAPP_API_URL`, the old callback/reply-keyboard launch remains a fallback.
+Keyboard-mode `sendData` allows 4096 bytes and may have empty initData. Browser
+previews and unsupported inline sendData launches cannot save to the bot.
+
+## Button types and emojis
+
+- **Link khule**: opens a website/channel/register URL.
+- **Bot kuch kare**: a bot callback, e.g. `live_chat_support` or `start_now` in userbots.
+  Custom actions need corresponding bot handlers.
+- 1849 searchable emojis; premium picker mapping is generated from the bot's
+  `EMOJI_IDS` (65 exact entries). Telegram renders premium icons; browser preview
+  uses ordinary emoji glyphs. Add IDs to advanced.py, then regenerate the mapping.
+
+## Tests
+
+```bash
+node webapp/selftest.mjs                         # 44 frontend checks
+python3 webapp/gen_emoji_map.py --check           # premium mapping sync
+/tmp/v/bin/python tests/verify_advanced.py        # 253 bot checks
+/tmp/v/bin/python tests/test_miniapp_direct.py    # HTTP + HMAC + DB integration
+```
+
+Direct integration tests use signed synthetic Telegram data and a fake database;
+they do not constitute a live Telegram/VPS deployment test.

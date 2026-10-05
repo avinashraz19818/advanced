@@ -35,3 +35,13 @@ PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:
 python3 -m venv /tmp/v21 && /tmp/v21/bin/pip install "python-telegram-bot[job-queue]==21.11.1"
 /tmp/v21/bin/python tests/verify_advanced.py
 ```
+
+## Direct Mini App transport (r23)
+
+`/tmp/v/bin/python tests/test_miniapp_direct.py` exercises an actual local HTTP
+server, signed synthetic Telegram initData, the bot asyncio loop, and the fake DB.
+Covers direct Add/Edit buttons, existing-row prefill, premium IDs, save/readback,
+clear-all, cross-user/wrong-bot/tampered/expired auth, malformed rows, deleted
+messages, DB failures, and a static-file allowlist (.env/source cannot be served).
+`node webapp/selftest.mjs` includes direct API ACK/failure/load-failure tests.
+Live Telegram and VPS deployment still require user-side verification.

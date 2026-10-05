@@ -212,5 +212,41 @@ broken.api.save();
 check("SAVE: transport error shown without success", broken.sent.length === 0 &&
       document.getElementById("toast").textContent.includes("nahi paaye"));
 
+// Direct inline mode: load via authenticated backend and close only after persisted ACK.
+async function directHarness({failLoad = false, failSave = false} = {}){
+  const calls = [], closes = [];
+  const env = {
+    ...sandbox, window: null, TextEncoder,
+    location: {search: "?session=capability"},
+    setTimeout(fn){ fn(); return 0; }, clearTimeout(){},
+    Telegram: {WebApp: {platform: "android", initData: "signed-data", ready(){}, expand(){},
+      close(){closes.push(true);}, sendData(){throw Error("Direct mode must not use sendData");}}},
+    async fetch(path, options){
+      calls.push({path, body: JSON.parse(options.body)});
+      const fail = path === "/api/load" ? failLoad : failSave;
+      return {ok: !fail, async json(){return fail ? {error: "DB unavailable"} :
+        path === "/api/load" ? {ok:true, rows:[[{text:"Existing",url:"https://t.me/old"}]],text:"Original"} :
+        {ok:true, saved:true};}};
+    },
+  };
+  env.window = env; env.globalThis = env;
+  vm.createContext(env); vm.runInContext(emojiData, env);
+  vm.runInContext(script + "\nglobalThis.directTest = {save,state};", env);
+  await new Promise(resolve => setImmediate(resolve));
+  return {api:env.directTest,calls,closes};
+}
+const direct = await directHarness();
+check("direct: existing buttons load for editing", direct.api.state.rows[0][0].text === "Existing");
+await direct.api.save();
+check("direct: SAVE uses same-origin API with Telegram authentication", direct.calls[1].path === "/api/save" &&
+  direct.calls[1].body.initData === "signed-data" && direct.calls[1].body.session === "capability");
+check("direct: closes after saved ACK", direct.closes.length === 1);
+const failedSave = await directHarness({failSave:true});
+await failedSave.api.save();
+check("direct: failed SAVE keeps app open", failedSave.closes.length === 0);
+const failedLoad = await directHarness({failLoad:true});
+await failedLoad.api.save();
+check("direct: failed load cannot overwrite existing buttons", failedLoad.calls.length === 1);
+
 console.log(`\n==== webapp selftest: ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

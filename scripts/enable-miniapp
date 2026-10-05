@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Run on your Linux VPS. Quick Tunnel needs no Cloudflare credentials/domain.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+STATE="$HOME/.advanced-miniapp"
+mkdir -p "$STATE"
+chmod 700 "$STATE"
+if ! command -v curl >/dev/null; then echo 'Install curl first: sudo apt install curl'; exit 1; fi
+if ! command -v cloudflared >/dev/null && [ ! -x "$STATE/cloudflared" ]; then
+  case "$(uname -m)" in
+    x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo 'Unsupported CPU'; exit 1;;
+  esac
+  curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH" -o "$STATE/cloudflared.tmp"
+  chmod 700 "$STATE/cloudflared.tmp"
+  mv "$STATE/cloudflared.tmp" "$STATE/cloudflared"
+fi
+CF="$(command -v cloudflared || printf '%s' "$STATE/cloudflared")"
+PORT=8110
+# Reuse the running tunnel so repeated installs do not change the URL.
+if [ -f "$STATE/tunnel.pid" ] && kill -0 "$(cat "$STATE/tunnel.pid")" 2>/dev/null; then
+  echo 'Existing tunnel reused.'
+else
+  : > "$STATE/tunnel.log"
+  nohup "$CF" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate > "$STATE/tunnel.log" 2>&1 < /dev/null &
+  echo $! > "$STATE/tunnel.pid"
+fi
+URL=''
+for _ in $(seq 1 60); do
+  URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE/tunnel.log" | head -1 || true)"
+  [ -n "$URL" ] && break
+  sleep 1
+done
+if [ -z "$URL" ]; then echo "Tunnel failed. Check $STATE/tunnel.log"; exit 1; fi
+python3 - "$URL" "$PORT" <<'PY'
+import os, pathlib, sys
+p = pathlib.Path('.env')
+s = p.read_text() if p.exists() else ''
+values = {'WEBAPP_URL': sys.argv[1], 'WEBAPP_API_URL': sys.argv[1], 'WEBAPP_PORT': sys.argv[2]}
+lines = [line for line in s.splitlines() if line.split('=',1)[0].strip() not in values]
+lines += [f'{k}={v}' for k,v in values.items()]
+p.write_text('\n'.join(lines)+'\n')
+os.chmod(p, 0o600)
+PY
+printf '\nMini App URL: %s\n' "$URL"
+echo 'Starting bot + authenticated Mini App backend...'
+./start
+curl --fail --silent --retry 15 --retry-connrefused --retry-delay 2 "http://127.0.0.1:$PORT/health" >/dev/null
+echo 'Done. Open a FRESH bot panel. Add Button/Edit Buttons opens the Mini App directly.'
+echo 'VPS reboot/tunnel exit ke baad: bash scripts/enable-miniapp dobara chalao.'
+echo 'Quick Tunnel URL temporary hai; production ke liye named tunnel + domain use karo.'

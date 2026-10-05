@@ -308,7 +308,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-05-r22"
+BUILD_TAG = "2026-10-05-r23"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -2276,6 +2276,8 @@ BUTTON_WIZARD_KEY = "button_wizard"
 BUTTON_TARGET_KEY = "button_targets"
 # Mini App (webapp/index.html) ka https URL - .env me WEBAPP_URL=https://... set karo.
 # Set na ho to sirf purana wizard chalta hai (➕ Add Button / 📄 Paste Many).
+WEBAPP_API_URL = os.getenv("WEBAPP_API_URL", "").strip().rstrip("/")
+WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8110"))
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
 # Telegram URL ki limit ke andar rehne ke liye (rows/text prefill ki wajah se lamba na ho)
 MINI_APP_URL_MAX = 1900
@@ -2313,18 +2315,72 @@ def get_button_target(context, tid) -> Optional[dict]:
 
 
 def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
-    """One row callers can drop into any keyboard: ➕ Add Button | 🌐 Mini App | 📄 Paste Many.
+    """One direct Add/Edit web_app button when the authenticated backend is enabled.
 
-    `🌐 Mini App` tab sirf tab dikhta hai jab .env me WEBAPP_URL set ho — usme buttons
-    visual builder (webapp/index.html) me bante hain aur SAVE par seedha bot me aa jate hain.
+    Without WEBAPP_API_URL, preserve the legacy launcher for old installations.
     """
     tid = register_button_target(context, target)
-    row = [btn("Add Button", f"bwz_start_{tid}", "success", "➕")]
-    mini = mini_app_button(context, target, tid)
-    if mini is not None:
-        row.append(btn("Mini App", f"bwz_app_{tid}", "primary", "🌐"))
-    row.append(btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄"))
-    return row
+    if WEBAPP_API_URL.startswith("https://"):
+        return [direct_mini_app_button(context, target, tid)]
+    # Legacy installation: no separate Mini App tab. Configure the direct backend.
+    return [btn("Add Button", f"bwz_start_{tid}", "success", "➕")]
+
+
+def direct_mini_app_button(context, target, tid):
+    from telegram import WebAppInfo
+    import miniapp_bridge
+
+    async def load(_data):
+        if not get_button_target(context, tid):
+            raise ValueError("Session expire ho gaya. Panel dobara kholo.")
+        return {"rows": json.loads(rows_to_buttons_json(target_rows(context, target)) or "[]"),
+                "text": _mini_app_text_payload(context, target), "label": _target_title(target)}
+
+    async def save(data):
+        if not get_button_target(context, tid):
+            raise ValueError("Session expire ho gaya. Panel dobara kholo.")
+        rows = data.get("rows")
+        if not isinstance(rows, list) or len(rows) > 100:
+            raise ValueError("Buttons ka format galat hai.")
+        for row in rows:
+            if not isinstance(row, list) or len(row) > 8:
+                raise ValueError("Ek row me maximum 8 buttons hain.")
+            for item in row:
+                if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item['text'].strip():
+                    raise ValueError("Button ka naam chahiye.")
+                url, cb = item.get('url'), item.get('cb') or item.get('callback_data')
+                if bool(url) == bool(cb):
+                    raise ValueError("Button me ek link ya action chahiye.")
+                if url and (not isinstance(url, str) or not url.startswith(('https://', 'http://', 'tg://'))):
+                    raise ValueError("Button link galat hai.")
+                if cb and (not isinstance(cb, str) or len(cb.encode()) > 64):
+                    raise ValueError("Bot action bahut lamba hai.")
+        rows = rows_from_buttons_json(json.dumps(rows))
+        mids = ([target.get('msg_id')] if target.get('kind') == 'message' else
+                target.get('msg_ids', []) if target.get('kind') == 'messages' else [])
+        if any(not db.get_message_by_id(mid) for mid in mids):
+            raise ValueError("Message delete ho gaya. Naya panel kholo.")
+        if not target_save_rows(context, target, rows):
+            raise ValueError("Buttons save nahi hue. Dobara try karo.")
+        # Verify persistence before telling the frontend to close.
+        if rows_to_buttons_json(target_rows(context, target)) != rows_to_buttons_json(rows):
+            raise ValueError("Save verify nahi hua. Dobara try karo.")
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        try:
+            await context.bot.send_message(chat_id=context._user_id,
+                text="✅ Buttons save hokar message/configuration me lag gaye.",
+                reply_markup=markup_from_rows(rows))
+            nav = target_nav_rows(target)
+            if nav:
+                await context.bot.send_message(chat_id=context._user_id, text="Aage ka option:",
+                                               reply_markup=InlineKeyboardMarkup(nav))
+        except Exception as ex:
+            logging.warning(f"Mini App saved, confirmation delivery failed: {mask_secrets(ex)}")
+        return {"saved": True}
+
+    session = miniapp_bridge.register(context.bot.token, context._user_id, load, save)
+    label = "Edit Buttons" if target_rows(context, target) else "Add Button"
+    return InlineKeyboardButton(label, web_app=WebAppInfo(url=f"{WEBAPP_API_URL}/?session={session}"))
 
 
 def _mini_app_rows_payload(context, target: dict) -> str:
@@ -3911,10 +3967,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ])
         await safe_edit_message_text(q,
             f"{pe('🔘')} <b>Edit Inline Buttons</b>\n\n"
-            "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
-            "<b>Paste Many</b> = purana format\n"
-            "<code>Button Label|https://link</code>\n"
-            "<code>Label One|https://link1 || Label Two|https://link2</code>",
+            "<b>Add Button / Edit Buttons</b> dabao → builder me badlav karo → <b>SAVE</b>." ,
             parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
@@ -3996,8 +4049,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ])
         await safe_edit_message_text(q,
             f"{pe('🔘')} <b>Inline Buttons</b>\n\n"
-            "<b>Add Button</b> = easy (naam → link → row)\n"
-            "<b>Paste Many</b> = bulk format",
+            "<b>Add Button / Edit Buttons</b> dabao aur SAVE karo.",
             parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
@@ -4367,8 +4419,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                                                "back_cb": f"manage_bot_{bot_id}"})
         await reply_premium_message(msg,
             f"{pe('✅')} <b>Message saved!</b>\n\n"
-            f"{pe('🔘')} Buttons add karne ke liye <b>Add Button</b> dabao (naam → link → row), "
-            f"ya <b>Paste Many</b> se purana <code>Label|link</code> format use karo.",
+            f"{pe('🔘')} <b>Add Button</b> dabao → buttons banao → <b>SAVE</b>.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
                 builder,
                 [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
@@ -6433,10 +6484,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             await safe_edit_message_text(q,
                 f"<blockquote>{pp('🔘')} <b>BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
-                "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
-                "<b>Paste Many</b> = bulk format (premium emoji supported)\n"
-                "<code>Button Label|https://link</code>\n"
-                "<code>Label1|https://url1 || Label2|https://url2</code>",
+                "<b>Add Button / Edit Buttons</b> dabao aur SAVE karo.",
                 parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
@@ -7264,6 +7312,9 @@ async def start_bots_on_boot():
 
 
 async def main():
+    if WEBAPP_API_URL.startswith("https://"):
+        import miniapp_bridge
+        miniapp_bridge.start(WEBAPP_PORT)
     logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
     install_log_masking()
     if install_force_ipv4():

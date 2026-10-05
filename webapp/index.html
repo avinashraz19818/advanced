@@ -803,8 +803,31 @@ function loadDraft(){
 }
 
 /* ---------------- save ---------------- */
-function save(){
+const directSession = new URLSearchParams(location.search).get("session");
+let directLoaded = false, saving = false;
+async function directAPI(path, extra = {}){
+  const response = await fetch(path, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({session: directSession, initData: TG?.initData || "", ...extra})
+  });
+  const result = await response.json();
+  if (!response.ok || !result.ok) throw Error(result.error || "Bot se connection nahi hua.");
+  return result;
+}
+async function save(){
   const rows = buildJSON();
+  if (directSession){
+    if (!directLoaded || saving) { toast("Builder load hone do.", true); return; }
+    saving = true;
+    try {
+      const result = await directAPI("/api/save", {rows});
+      if (!result.saved) throw Error("Save confirm nahi hua.");
+      toast("Buttons save hokar lag gaye ✅");
+      setTimeout(() => TG?.close(), 700);
+    } catch(e){ toast(e.message || "Save nahi hua. Dobara try karo.", true); }
+    finally { saving = false; }
+    return;
+  }
   if (!rows.length){ toast("Pehle ek button banao", true); return; }
   const payload = { action: "save_buttons", rows, text: state.text, target: state.target };
   // Reply-keyboard Mini Apps may have EMPTY initData. It is not a sendData gate.
@@ -899,6 +922,23 @@ $("emojiUseCustom").onclick = () => {
   }
   render();
 })();
+
+if (directSession){
+  state.rows = [];
+  state.text = "";
+  $("msgText").readOnly = true; // Button editor: do not accidentally rewrite forwarded content.
+  $("subtitle").textContent = "Bot se buttons load ho rahe hain…";
+  render();
+  directAPI("/api/load").then(data => {
+    state.rows = [];
+    importRows(data.rows || []);
+    state.text = data.text || "";
+    $("msgText").value = state.text;
+    $("subtitle").textContent = data.label || "Buttons edit karo";
+    directLoaded = true;
+    render();
+  }).catch(e => { $("subtitle").textContent = e.message; toast(e.message, true); });
+}
 </script>
 </body>
 </html>
