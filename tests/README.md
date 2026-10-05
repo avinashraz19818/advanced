@@ -45,3 +45,13 @@ clear-all, cross-user/wrong-bot/tampered/expired auth, malformed rows, deleted
 messages, DB failures, and a static-file allowlist (.env/source cannot be served).
 `node webapp/selftest.mjs` includes direct API ACK/failure/load-failure tests.
 Live Telegram and VPS deployment still require user-side verification.
+
+## Shared emoji packs (r24)
+
+`/tmp/v/bin/python tests/test_emoji_packs.py`: multi-link parsing/deduplication,
+custom-pack type checks, static/video/TGS cache import, refresh/remove, pagination,
+partial failure, external-animation-resource rejection, and admin-only controls.
+`tests/test_miniapp_direct.py` also tests authenticated `/api/packs` listing.
+Frontend selftest covers explicit pack IDs (same Unicode glyph, different IDs),
+serialization, authenticated catalog requests, and embedded layout wiring.
+Actual Telegram downloads and animation playback on devices need a live smoke test.

@@ -223,30 +223,40 @@ async function directHarness({failLoad = false, failSave = false} = {}){
       close(){closes.push(true);}, sendData(){throw Error("Direct mode must not use sendData");}}},
     async fetch(path, options){
       calls.push({path, body: JSON.parse(options.body)});
-      const fail = path === "/api/load" ? failLoad : failSave;
+      const fail = path === "/api/load" ? failLoad : path === "/api/save" ? failSave : false;
       return {ok: !fail, async json(){return fail ? {error: "DB unavailable"} :
+        path === "/api/packs" ? {ok:true,packs:[{name:"AdminPack",title:"Admin pack",count:2}],items:[],next:null} :
         path === "/api/load" ? {ok:true, rows:[[{text:"Existing",url:"https://t.me/old"}]],text:"Original"} :
         {ok:true, saved:true};}};
     },
   };
   env.window = env; env.globalThis = env;
   vm.createContext(env); vm.runInContext(emojiData, env);
-  vm.runInContext(script + "\nglobalThis.directTest = {save,state};", env);
+  vm.runInContext(script + "\nglobalThis.directTest = {save,state,choosePackEmoji,buildJSON,openPicker};", env);
   await new Promise(resolve => setImmediate(resolve));
   return {api:env.directTest,calls,closes};
 }
 const direct = await directHarness();
 check("direct: existing buttons load for editing", direct.api.state.rows[0][0].text === "Existing");
 await direct.api.save();
-check("direct: SAVE uses same-origin API with Telegram authentication", direct.calls[1].path === "/api/save" &&
-  direct.calls[1].body.initData === "signed-data" && direct.calls[1].body.session === "capability");
+check("direct: SAVE uses same-origin API with Telegram authentication", direct.calls.some(c => c.path === "/api/save" && c.body.initData === "signed-data" && c.body.session === "capability"));
 check("direct: closes after saved ACK", direct.closes.length === 1);
 const failedSave = await directHarness({failSave:true});
 await failedSave.api.save();
 check("direct: failed SAVE keeps app open", failedSave.closes.length === 0);
 const failedLoad = await directHarness({failLoad:true});
 await failedLoad.api.save();
-check("direct: failed load cannot overwrite existing buttons", failedLoad.calls.length === 1);
+check("direct: failed load cannot overwrite existing buttons", !failedLoad.calls.some(c => c.path === "/api/save"));
+
+direct.api.choosePackEmoji({char:"💎",id:"9876543210"});
+check("packs: explicit custom ID wins over fixed emoji map", direct.api.state.pickEmoji.id === "9876543210");
+direct.api.choosePackEmoji({char:"💎",id:"9876543211"});
+check("packs: same glyph from different packs keeps distinct IDs", direct.api.state.pickEmoji.id === "9876543211");
+direct.api.state.rows[0][0].icon_id = direct.api.state.pickEmoji.id;
+check("packs: actual pack ID survives output serialization", direct.api.buildJSON()[0][0].icon_id === "9876543211");
+check("packs: library loaded through authenticated API", direct.calls.some(c => c.path === "/api/packs" && c.body.initData === "signed-data"));
+check("packs: embedded picker lies inside editor before Apply", html.indexOf('id="packPicker"') < html.indexOf('id="fSave"'));
+check("packs: animations player is vendored", html.includes('src="vendor/lottie_light.min.js"'));
 
 console.log(`\n==== webapp selftest: ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

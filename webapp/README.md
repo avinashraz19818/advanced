@@ -1,4 +1,34 @@
-# Button Builder — direct Add/Edit Mini App (r23)
+# Button Builder — direct Add/Edit Mini App (r24)
+
+## Admin-managed premium emoji packs (r24)
+
+Main bot: **Admin Panel → Emoji Packs → Add Pack Links**. Send one or more
+`t.me/addemoji/PackName` links (up to 20 per message; send more in the next message).
+There is no fixed total pack count cap; VPS disk/database/network capacity applies.
+Only admins can import, refresh or remove packs. Packs are a SHARED library visible
+to all Mini App users, not an automatic import of each user's Telegram account.
+
+Imports use Telegram getStickerSet/getFile and store actual custom_emoji_id values.
+Links to normal sticker sets are rejected. Each pack is published only after all
+its assets are downloaded; failure leaves an existing version intact. Resending a
+link refreshes the pack. The admin list has pagination and removal controls.
+
+The **direct Mini App** embeds this library inside the button editor below Emoji,
+not in a separate overlay. It does not display the fixed/default picker there.
+Search pack names, switch packs, and page through 48 emojis at a time. TGS assets
+are decompressed into Lottie JSON and rendered by vendored lottie-web 5.13.0 light
+(SVG renderer, MIT license included). WEBM uses muted looping video; static WEBP
+uses images. Offscreen animations pause and leaving the editor destroys players.
+Unsupported assets/codecs fall back to the associated Unicode glyph. Selected
+custom IDs remain distinct even when several emojis share the same Unicode glyph.
+
+Metadata persists in PostgreSQL `system_settings.miniapp_emoji_packs_v1`.
+Downloaded assets live in `.emoji-assets/` (gitignored), surviving ordinary bot
+restarts and Git pulls. Back up this directory with the DB on VPS migrations, or
+resend pack links to download missing assets. Removing a pack removes it from the
+picker, not from already-saved buttons; cached files are retained. The bridge serves
+only hash-named asset files, never Telegram token-bearing download URLs. Use the
+HTTPS backend mode; a static ZIP alone cannot fetch this authenticated catalog.
 
 ## Supported direct flow
 
@@ -70,7 +100,7 @@ previews and unsupported inline sendData launches cannot save to the bot.
 ## Tests
 
 ```bash
-node webapp/selftest.mjs                         # 44 frontend checks
+node webapp/selftest.mjs                         # 50 frontend checks
 python3 webapp/gen_emoji_map.py --check           # premium mapping sync
 /tmp/v/bin/python tests/verify_advanced.py        # 253 bot checks
 /tmp/v/bin/python tests/test_miniapp_direct.py    # HTTP + HMAC + DB integration
@@ -78,3 +108,5 @@ python3 webapp/gen_emoji_map.py --check           # premium mapping sync
 
 Direct integration tests use signed synthetic Telegram data and a fake database;
 they do not constitute a live Telegram/VPS deployment test.
+
+Pack importer/admin tests: `/tmp/v/bin/python tests/test_emoji_packs.py` (offline fakes).

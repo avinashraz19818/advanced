@@ -96,6 +96,18 @@ class Direct(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(A.target_rows(self.ctx, target)[0][0]['cb'], 'live_chat_support')
         self.assertEqual(A.rows_from_buttons_json(A.db.messages[2]['buttons_json'])[0][0]['text'], 'Support')
 
+    async def test_pack_api_requires_auth_and_pages_metadata(self):
+        import emoji_packs
+        values = {emoji_packs.KEY: {'Test':{'name':'Test','title':'Test pack','items':[
+            {'id':'123456789','char':'💎','kind':'image','src':'/emoji-assets/'+'a'*64+'.webp'}]}}}
+        A.db.get_setting = lambda key, default=None: values.get(key, default)
+        status, result = await self.request('/api/packs')
+        self.assertEqual(status,200)
+        self.assertEqual(result['packs'][0]['count'],1)
+        status, result = await self.request('/api/packs',pack='Test')
+        self.assertEqual(result['items'][0]['id'],'123456789')
+        self.assertEqual((await self.request('/api/packs',initData=''))[0],403)
+
     async def test_auth_rejections(self):
         for init in ('', signed(uid=43), signed(token='wrong'), signed(age=7200)):
             self.assertEqual((await self.request('/api/save', initData=init, rows=[]))[0], 403)

@@ -308,7 +308,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-05-r23"
+BUILD_TAG = "2026-10-05-r24"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -789,9 +789,34 @@ def admin_kb() -> InlineKeyboardMarkup:
         [btn("Default First Message", "admin_default_first_msg", "primary", "💬")],
         [btn("Broadcast", "admin_broadcast", "success", "✈️"),
          btn("Send Reminders", "admin_send_reminders", "primary", "🔔")],
+        [btn("Emoji Packs", "admin_epacks", "primary", "😀")],
         [btn("Diagnostics", "admin_diag", "primary", "🩺")],
         [btn("Main Menu", "main_menu", "primary", "🔙")],
     ])
+
+def emoji_pack_panel(context, page=0):
+    import secrets
+    import emoji_packs
+    packs = list(emoji_packs.catalog(db).values())
+    page = max(0, min(page, max(0, (len(packs)-1)//8)))
+    rows = [[btn("Add Pack Links", "admin_epadd", "success", "➕")]]
+    mapping = {}
+    for pack in packs[page*8:page*8+8]:
+        key = secrets.token_hex(6)
+        mapping[key] = pack['name']
+        rows.append([btn(f"Remove: {pack['title'][:30]} ({len(pack['items'])})",
+                         f"admin_epdel_{key}", "danger", "🗑")])
+    context.user_data['emoji_pack_delete'] = mapping
+    nav = []
+    if page: nav.append(btn("Prev", f"admin_epage_{page-1}", "primary", "⬅️"))
+    if (page+1)*8 < len(packs): nav.append(btn("Next", f"admin_epage_{page+1}", "primary", "➡️"))
+    if nav: rows.append(nav)
+    rows.append([btn("Back", "admin_panel", "primary", "🔙")])
+    return (f"😀 Emoji Packs: {len(packs)} packs / {sum(len(p['items']) for p in packs)} emojis\n"
+            f"Page {page+1} — sabhi Mini App users ke liye.\n"
+            "Add Pack Links se multiple links bhejo. Same link dobara bhejne se pack refresh hoga.",
+            InlineKeyboardMarkup(rows))
+
 
 def verification_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[btn("Verify Now", "human_verify", "success", "✅")]])
@@ -2378,7 +2403,11 @@ def direct_mini_app_button(context, target, tid):
             logging.warning(f"Mini App saved, confirmation delivery failed: {mask_secrets(ex)}")
         return {"saved": True}
 
-    session = miniapp_bridge.register(context.bot.token, context._user_id, load, save)
+    async def packs(data):
+        import emoji_packs
+        return emoji_packs.page(db, data)
+
+    session = miniapp_bridge.register(context.bot.token, context._user_id, load, save, packs)
     label = "Edit Buttons" if target_rows(context, target) else "Add Button"
     return InlineKeyboardButton(label, web_app=WebAppInfo(url=f"{WEBAPP_API_URL}/?session={session}"))
 
@@ -6242,10 +6271,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          parse_mode=ParseMode.HTML, reply_markup=diag_kb())
             return
 
+        if data.startswith("admin_ep"):
+            if not is_admin(uid):
+                await q.answer("Not authorized", show_alert=True)
+                return
+            import emoji_packs
+            if data == "admin_epadd":
+                context.user_data["emoji_pack_links"] = True
+                await safe_edit_message_text(q, "😀 Emoji pack links bhejo (har line me ek):\n"
+                    "https://t.me/addemoji/PackName\n\nEk message me 20 links tak. Aur packs agle message me bhej sakte ho.\n"
+                    "Ye packs sabhi clients ke Mini App me dikhenge.",
+                    reply_markup=InlineKeyboardMarkup([[btn("Cancel", "admin_epacks", "danger", "❌")]]))
+                return
+            context.user_data.pop("emoji_pack_links", None)
+            if data.startswith("admin_epdel_"):
+                # Short opaque index stored per admin; never put pack names in 64-byte callbacks.
+                name = context.user_data.get("emoji_pack_delete", {}).get(data.removeprefix("admin_epdel_"))
+                if name:
+                    await emoji_packs.remove_pack(db, name)
+            page = int(data.removeprefix("admin_epage_")) if data.startswith("admin_epage_") else 0
+            text, markup = emoji_pack_panel(context, page)
+            await safe_edit_message_text(q, text, reply_markup=markup)
+            return
+
         if data == "admin_panel":
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
                 return
+            context.user_data.pop("emoji_pack_links", None)
             # leaving the panel drops any half-finished broadcast (avoids a stale draft)
             for stale_key in ("admin_broadcast", "admin_broadcast_stage", "admin_broadcast_draft",
                               "admin_bcast_selected", "admin_broadcast_target"):
@@ -6957,6 +7010,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Mini App (webapp/index.html) ne buttons save kiye? -> sabse pehle wahi handle karo
     if await process_web_app_buttons(update, context):
+        return
+
+    if context.user_data.get("emoji_pack_links") and is_admin(user.id):
+        import emoji_packs
+        names = emoji_packs.names_from_text(msg.text or "")
+        if not names or len(names) > 20:
+            await reply_premium_message(msg, "1–20 valid t.me/addemoji/... links bhejo, har line me ek.")
+            return
+        if context.user_data.get("emoji_pack_busy"):
+            await reply_premium_message(msg, "Pehla import chal raha hai. Complete hone do.")
+            return
+        context.user_data["emoji_pack_busy"] = True
+        try:
+            await reply_premium_message(msg, f"⏳ {len(names)} packs download ho rahe hain…")
+            for name in names:
+                try:
+                    count = await emoji_packs.add_pack(db, context.bot, name)
+                    await reply_premium_message(msg, f"✅ {name}: {count} emojis add/update hue.")
+                except Exception:
+                    # Telegram exceptions can contain bot file URLs; do not echo them.
+                    await reply_premium_message(msg, f"❌ {name}: import nahi hua. Emoji-pack link check karke dobara bhejo.")
+            await reply_premium_message(msg, "Aur links bhej sakte ho. Mini App dobara kholne par packs dikhenge.",
+                reply_markup=InlineKeyboardMarkup([[btn("Done / Packs", "admin_epacks", "success", "✅")]]))
+        finally:
+            context.user_data.pop("emoji_pack_busy", None)
         return
 
     # Easy button builder (➕ Add Button wizard) has priority over everything else

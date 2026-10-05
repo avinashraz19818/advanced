@@ -18,14 +18,14 @@ TTL = 3600
 ROOT = Path(__file__).resolve().parent / 'webapp'
 
 
-def register(bot_token, user_id, load, save):
+def register(bot_token, user_id, load, save, packs=None):
     now = time.time()
     with LOCK:
         for key in list(SESSIONS):
             if SESSIONS[key]['expires'] < now:
                 del SESSIONS[key]
         key = secrets.token_urlsafe(32)
-        SESSIONS[key] = dict(token=bot_token, uid=int(user_id), load=load, save=save,
+        SESSIONS[key] = dict(token=bot_token, uid=int(user_id), load=load, save=save, packs=packs,
                              loop=asyncio.get_running_loop(), expires=now + TTL)
     return key
 
@@ -76,9 +76,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path.startswith('/emoji-assets/'):
+            import re
+            from emoji_packs import ASSETS
+            name = path.removeprefix('/emoji-assets/')
+            if not re.fullmatch(r'[a-f0-9]{64}\.(json|webm|webp)', name):
+                return self.reply(404, {'error':'Not found'})
+            asset = ASSETS / name
+            if not asset.is_file():
+                return self.reply(404, {'error':'Not found'})
+            mime = {'json':'application/json', 'webm':'video/webm', 'webp':'image/webp'}[name.rsplit('.',1)[1]]
+            return self.reply(200, asset.read_bytes(), mime)
         if path == '/health':
             return self.reply(200, {'ok': True})
-        assets = {'/': ('index.html', 'text/html; charset=utf-8'),
+        assets = {'/vendor/lottie_light.min.js': ('vendor/lottie_light.min.js', 'text/javascript'), '/': ('index.html', 'text/html; charset=utf-8'),
                   '/index.html': ('index.html', 'text/html; charset=utf-8'),
                   '/emoji-data.js': ('emoji-data.js', 'text/javascript; charset=utf-8')}
         if path not in assets:
@@ -87,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, (ROOT / filename).read_bytes(), kind)
 
     def do_POST(self):
-        if urlsplit(self.path).path not in ('/api/load', '/api/save'):
+        if urlsplit(self.path).path not in ('/api/load', '/api/save', '/api/packs'):
             return self.reply(404, {'error': 'Not found'})
         try:
             size = int(self.headers.get('Content-Length', '0'))
@@ -99,7 +110,9 @@ class Handler(BaseHTTPRequestHandler):
             session = authenticate(data['session'], data['initData'])
         except (ValueError, KeyError, TypeError):
             return self.reply(403, {'error': 'Session invalid/expired. Bot ka panel dobara kholo.'})
-        action = 'save' if urlsplit(self.path).path == '/api/save' else 'load'
+        action = urlsplit(self.path).path.rsplit('/', 1)[1]
+        if not session.get(action):
+            return self.reply(404, {'error':'Not available'})
         future = asyncio.run_coroutine_threadsafe(session[action](data), session['loop'])
         try:
             result = future.result(timeout=30)

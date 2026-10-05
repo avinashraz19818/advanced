@@ -6,6 +6,7 @@
 <title>Button Builder</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="emoji-data.js"></script>
+<script src="vendor/lottie_light.min.js"></script>
 <style>
   :root{
     --bg:#0b111a; --bg-2:#111a26; --card:rgba(255,255,255,.045); --card-solid:#151f2d;
@@ -214,6 +215,16 @@
   .savebar .in{max-width:540px;margin:0 auto;display:flex;gap:11px;align-items:center}
   .savebar .n{font-size:11.5px;color:var(--muted);white-space:nowrap}
   .savebar .sbtn{flex:1;padding:15px;font-size:15px;border-radius:15px}
+.pack-picker{margin-top:12px;padding:12px;border:1px solid #33465a;border-radius:18px;background:#0d1721}
+.pack-tabs{display:flex;gap:8px;overflow-x:auto;margin:10px 0;padding-bottom:6px}
+.pack-tabs button{flex-shrink:0;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:9px 12px;background:#23374a;color:#dceafa;border:1px solid #38516a;border-radius:14px}
+.pack-tabs button.on{background:#245993;border-color:#70afff}
+.pack-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;max-height:260px;overflow:auto}
+.pack-emoji{height:49px;min-width:0;border-radius:10px;border:1px solid transparent;background:#182a3a;color:white;position:relative;cursor:pointer}
+.pack-emoji.on{border:2px solid #6bb8ff;background:#28486b}
+.pack-emoji img,.pack-emoji video,.pack-emoji .anim{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}
+.pack-emoji .fallback{font-size:26px;line-height:44px}
+.pack-footer{display:flex;justify-content:space-between;align-items:center;margin-top:10px;gap:8px}
 </style>
 </head>
 <body>
@@ -319,6 +330,19 @@
         <span class="ar">›</span>
       </div>
       <button class="emojiClear" id="fEmojiClear">🚫</button>
+    </div>
+
+    <div id="packPicker" class="pack-picker hidden">
+      <div class="muted">Premium Emoji Packs · admin ki library</div>
+      <input id="packSearch" placeholder="Pack naam search karo…" autocomplete="off">
+      <div id="packTabs" class="pack-tabs"></div>
+      <div id="packStatus" class="muted">Packs load ho rahe hain…</div>
+      <div id="packGrid" class="pack-grid"></div>
+      <div class="pack-footer">
+        <button id="packPrev" class="sbtn">←</button>
+        <span id="packPage" class="muted"></span>
+        <button id="packNext" class="sbtn">→</button>
+      </div>
     </div>
 
     <div class="sheetact">
@@ -596,6 +620,7 @@ function buildJSON(){
 
 /* ---------------- emoji picker ---------------- */
 function openPicker(){
+  if (directSession) { $("packPicker").scrollIntoView?.({block:"nearest",behavior:"smooth"}); return; }
   $("picker").classList.add("open");
   $("emojiSearch").value = "";
   state.search = "";
@@ -674,7 +699,7 @@ function refreshEmojiButton(){
   const pick = state.pickEmoji || { char: "", id: "" };
   $("fEmojiBig").textContent = pick.char || "🙂";
   $("fEmojiLabel").textContent = pick.char
-    ? (isPremium(pick.char) ? "Premium emoji lagaya ✔" : "Emoji lagaya ✔")
+    ? (pick.id ? "Premium emoji lagaya ✔" : "Emoji lagaya ✔")
     : "Emoji chuno (premium bhi)";
 }
 
@@ -695,8 +720,9 @@ function openSheet(r, i){
   paintColors(b.style || "");
   refreshEmojiButton();
   $("sheetWrap").classList.add("open");
+  if (directSession) showPackPage(packName, packOffset);
 }
-function closeSheet(){ $("sheetWrap").classList.remove("open"); state.editing = null; }
+function closeSheet(){ ++packRequest; stopPackAnimations(); $("sheetWrap").classList.remove("open"); state.editing = null; }
 const TYPE_HINTS = {
   url: "<b>🔗 Link khule</b> — user button dabayega to ek <b>link khulega</b> (website, " +
        "Telegram channel, register link).<br>Jaise: <code>https://veergame41.com/#/register?…</code> " +
@@ -851,6 +877,87 @@ async function save(){
   toast("Yahan save nahi hoga. Bot ka naya Add Button panel kholkar Mini App kholo.", true);
 }
 
+/* ---------------- shared admin pack library (embedded, not a modal) ---------------- */
+let packList = [], packName = "", packOffset = 0, packNext = null, packRequest = 0;
+let packPlayers = [], packVideos = [], packObserver = null;
+function stopPackAnimations(){
+  packObserver?.disconnect(); packObserver = null;
+  packPlayers.forEach(p => p.destroy()); packPlayers = [];
+  packVideos.forEach(v => {v.pause(); v.removeAttribute("src"); v.load();}); packVideos = [];
+}
+function renderPackTabs(){
+  const tabs = $("packTabs"); tabs.innerHTML = "";
+  const query = ($("packSearch").value || "").toLowerCase();
+  for (const p of packList.filter(p => (p.title+" "+p.name).toLowerCase().includes(query))){
+    const b = document.createElement("button"); b.type = "button";
+    b.textContent = `${p.title} (${p.count})`;
+    b.className = p.name === packName ? "on" : "";
+    b.onclick = () => showPackPage(p.name, 0);
+    tabs.appendChild(b);
+  }
+}
+function choosePackEmoji(item){
+  state.pickEmoji = {char:item.char, id:String(item.id)};
+  refreshEmojiButton();
+  $("packGrid").querySelectorAll(".pack-emoji").forEach(el => el.classList.toggle("on", el.dataset.emojiId === String(item.id)));
+  toast("Premium emoji select hua — Apply dabao");
+}
+async function showPackPage(name, offset = 0){
+  const request = ++packRequest;
+  stopPackAnimations();
+  packName = name; packOffset = offset;
+  renderPackTabs();
+  const grid = $("packGrid"); grid.innerHTML = "";
+  $("packPrev").disabled = true; $("packNext").disabled = true;
+  $("packPage").textContent = "";
+  if (!name){ $("packStatus").textContent = "Abhi pack nahi hai. Admin Panel → Emoji Packs se links add karo."; return; }
+  $("packStatus").textContent = "Emojis load ho rahe hain…";
+  try {
+    const data = await directAPI("/api/packs", {pack:name, offset});
+    if (request !== packRequest || !state.editing) return;
+    packNext = data.next;
+    $("packPrev").disabled = offset === 0;
+    $("packNext").disabled = data.next == null;
+    $("packPage").textContent = `Page ${Math.floor(offset/48)+1}`;
+    $("packStatus").textContent = "Emoji tap karo — phir Apply";
+    if (typeof IntersectionObserver !== "undefined"){
+      packObserver = new IntersectionObserver(entries => entries.forEach(e => {
+        const media = e.target._media;
+        if (!media) return;
+        if (e.isIntersecting) { const p = media.play(); p?.catch?.(() => {}); }
+        else media.pause();
+      }), {root: grid});
+    }
+    for (const item of data.items || []){
+      const tile = document.createElement("button"); tile.type = "button";
+      tile.dataset.emojiId = String(item.id);
+      tile.className = "pack-emoji" + (state.pickEmoji?.id === String(item.id) ? " on" : "");
+      tile.title = item.char;
+      const fallback = document.createElement("span"); fallback.className = "fallback"; fallback.textContent = item.char; tile.appendChild(fallback);
+      tile.onclick = () => choosePackEmoji(item);
+      grid.appendChild(tile);
+      if (item.kind === "lottie" && window.lottie){
+        const container = document.createElement("div"); container.className = "anim"; tile.appendChild(container);
+        const player = window.lottie.loadAnimation({container,renderer:"svg",loop:true,autoplay:!packObserver,path:item.src});
+        player.addEventListener("DOMLoaded", () => {fallback.style.visibility = "hidden";});
+        packPlayers.push(player); tile._media = player;
+      } else if (item.kind === "video"){
+        const video = document.createElement("video"); video.muted = true; video.loop = true; video.playsInline = true; video.src = item.src;
+        video.onloadeddata = () => {fallback.style.visibility = "hidden";};
+        tile.appendChild(video); packVideos.push(video); tile._media = video;
+        if (!packObserver) video.play().catch(() => {});
+      } else if (item.kind === "image"){
+        const img = document.createElement("img"); img.alt = item.char; img.loading = "lazy"; img.src = item.src;
+        img.onload = () => {fallback.style.visibility = "hidden";}; tile.appendChild(img);
+      }
+      if (tile._media && packObserver) packObserver.observe(tile);
+    }
+  } catch(e){ if(request === packRequest) $("packStatus").textContent = e.message || "Pack load nahi hua. Dobara pack tap karo."; }
+}
+$("packSearch").oninput = renderPackTabs;
+$("packPrev").onclick = () => showPackPage(packName, Math.max(0, packOffset-48));
+$("packNext").onclick = () => {if(packNext != null) showPackPage(packName, packNext);};
+
 /* ---------------- wiring ---------------- */
 $("addRow").onclick = () => { if (state.rows.length < MAX_ROWS){ state.rows.push([newButton()]); render(); openSheet(state.rows.length - 1, 0); } };
 $("fSave").onclick = applySheet;
@@ -924,6 +1031,14 @@ $("emojiUseCustom").onclick = () => {
 })();
 
 if (directSession){
+  $("packPicker").classList.remove("hidden");
+  $("fEmojiLabel").textContent = "Neeche pack se emoji chuno";
+  directAPI("/api/packs").then(data => {
+    packList = data.packs || [];
+    packName = packList[0]?.name || "";
+    renderPackTabs();
+    if(state.editing) showPackPage(packName);
+  }).catch(() => {$("packStatus").textContent = "Packs load nahi hue. Mini App dobara kholo.";});
   state.rows = [];
   state.text = "";
   $("msgText").readOnly = true; // Button editor: do not accidentally rewrite forwarded content.
