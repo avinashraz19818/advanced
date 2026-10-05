@@ -379,6 +379,20 @@ class FakeDB:
                 rows.pop(k, None)
         self.leave.setdefault("pending_clears", []).append((bot_id, user_id, target_channel_id))
 
+    def _execute(self, sql, params=()):
+        # real DB jaisa: raw SQL calls record karo (test me kaam ke liye)
+        self.sql_calls = getattr(self, "sql_calls", [])
+        self.sql_calls.append(sql.strip().split()[0] if sql and sql.strip() else sql)
+        if "leave_recovery_messages" in (sql or "") and "UPDATE" in (sql or ""):
+            self.leave["messages_cleared"] = True
+        return None
+
+    def clear_all_leave_recovery_pending(self):
+        rows = self.leave.setdefault("pending_rows", {})
+        count = len(rows)
+        rows.clear()
+        return count
+
     def add_leave_recovery_message(self, *a, **k):
         self.leave.setdefault("sent", []).append(a)
 
@@ -453,9 +467,19 @@ class FakeDB:
         return None
 
     def get_bot_channels(self, bot_id):
-        if hasattr(self, "bot_channels"):
-            return list(self.bot_channels)
+        bc = getattr(self, "bot_channels", None)
+        if isinstance(bc, dict):          # per-bot channels
+            return list(bc.get(bot_id, []))
+        if bc is not None:
+            return list(bc)
         return [{"channel_id": -100123, "channel_title": "Test Channel", "auto_approve": 0}]
+
+    def get_setting(self, key, default=None):
+        return getattr(self, "settings", {}).get(key, default)
+
+    def set_setting(self, key, value):
+        self.settings = getattr(self, "settings", {})
+        self.settings[key] = value
 
     def get_total_requesters_count(self, bot_id):
         return 7
@@ -1112,6 +1136,7 @@ def test_network_noise_and_retry():
 def test_leave_recovery():
     print("\n[9] leave recovery DM (blocked users)")
     A.db.leave = {"enabled": True, "target_channel_id": -100999, "target_channel_link": "https://t.me/joinchat/x",
+                  "channel_configs": {"-100123": True},   # default OFF hai, isliye explicitly ON
                   "messages": [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""},
                                {"text": "Second message", "buttons_json": ""}]}
     A.db.gone_calls = []
@@ -1530,6 +1555,7 @@ def test_initiate_blocked_flow():
     A.db.reachable_calls = []
     A.db.leave = {"enabled": True, "target_channel_id": -100999,
                   "target_channel_link": "https://t.me/joinchat/x",
+                  "channel_configs": {"-100123": True},   # default OFF hai, isliye explicitly ON
                   "messages": [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""}]}
 
     bot = InitiateBlockedBot("initiate")
@@ -1653,6 +1679,125 @@ def test_network_hiccup_throttle():
           rec4.levelno == logging.WARNING and "min me" in fmt.format(rec4), fmt.format(rec4))
 
 
+def _lr_admin_q(ctx, data):
+    q = FakeQuery(ctx, uid=A.ADMIN_USER_ID)
+    q.data = data
+    run(A.callback_handler(_fake_update(q=q, uid=A.ADMIN_USER_ID), ctx))
+    return q
+
+
+def _lr_kb(q):
+    """Aakhri edit ka reply_markup (safe_edit_message_text -> q.edits)."""
+    return (q.edits[-1][1] or {}).get("reply_markup")
+
+
+def test_leave_recovery_channels_panel():
+    print("\n[18] leave recovery: saare channels + default OFF + Sab ON/OFF")
+    # 25 channels (2 bots) - pehle panel sirf pehle 20 dikhata tha
+    A.db.user_bots = [{"bot_id": "b1", "bot_username": "one", "bot_token": "t1", "user_id": 999},
+                      {"bot_id": "b2", "bot_username": "two", "bot_token": "t2", "user_id": 999}]
+    A.db.bot_channels = {
+        "b1": [{"channel_id": -100000 - i, "channel_title": f"Chan {i:02d}", "auto_approve": 0}
+               for i in range(15)],
+        "b2": [{"channel_id": -100100 - i, "channel_title": f"Chan {i + 15}", "auto_approve": 0}
+               for i in range(10)],
+    }
+    A.db.leave = {"enabled": True, "target_channel_id": -100999,
+                  "target_channel_link": "https://t.me/x", "messages": [], "channel_configs": {}}
+    A.db.settings = {}
+
+    all_channels = A.leave_recovery_all_channels()
+    check("panel: saare 25 channels milte hain (koi 20-cap nahi)", len(all_channels) == 25, str(len(all_channels)))
+
+    ctx = FakeCtx()
+    q = _lr_admin_q(ctx, "admin_leave_channels")
+    labels = _kb_labels(_lr_kb(q))
+    check("panel: default sab OFF (🔴)", all(l.startswith("🔴") for l in labels if "Chan" in l), str(labels))
+    check("panel: Sab OFF / Sab ON buttons", any("Sab OFF" in l for l in labels) and any("Sab ON" in l for l in labels), str(labels))
+    check("panel: text me default OFF likha hai", "Default sab channels OFF" in q.edits[-1][0], q.edits[-1][0][:80])
+    check("panel: page 1/4 (8 per page, 25 channels)",
+          "Page 1/4" in q.edits[-1][0], q.edits[-1][0][-120:])
+
+    # pagination -> aage ke channels bhi dikhein
+    q2 = _lr_admin_q(ctx, "admin_leave_chan_page_3")
+    labels3 = _kb_labels(_lr_kb(q2))
+    check("panel: page 4 par aakhri channel dikhta hai", any("Chan 24" in l for l in labels3), str(labels3))
+    check("panel: page 4 text", "Page 4/4" in q2.edits[-1][0], q2.edits[-1][0][-120:])
+
+    # toggle: default OFF -> ek tap me ON
+    q3 = _lr_admin_q(ctx, "admin_leave_chan_toggle_-100000")
+    check("toggle: channel ON ho gaya", A.db.leave["channel_configs"].get("-100000") is True,
+          str(A.db.leave["channel_configs"]))
+    check("toggle: toggle ke baad usi page par wapas", "Page 1/4" in q3.edits[-1][0], q3.edits[-1][0][-120:])
+    check("toggle: current ON channels list me",
+          A.leave_recovery_on_channels(A.db.leave) == ["-100000"],
+          str(A.leave_recovery_on_channels(A.db.leave)))
+
+    # status text: sirf ON channels dikhein + default OFF ka note
+    status = A.leave_recovery_status_text()
+    plain_status = A.strip_premium_emojis(status)
+    check("status: ON channel dikhta hai", "-100000" in status and "Chan 00" in status, plain_status[:220])
+    check("status: counts sahi (total 25, ON 1, OFF 24)",
+          "total 25 | 🟢 ON 1 | 🔴 OFF 24" in plain_status, plain_status[:260])
+
+    # Sab ON / Sab OFF
+    q4 = _lr_admin_q(ctx, "admin_leave_all_on")
+    on_ids = A.leave_recovery_on_channels(A.db.leave)
+    check("sab ON: 25 channels ON", len(on_ids) == 25, str(len(on_ids)))
+    check("sab ON: text me sab ON",
+          "ON: 25" in A.strip_premium_emojis(q4.edits[-1][0]), A.strip_premium_emojis(q4.edits[-1][0])[:200])
+    q5 = _lr_admin_q(ctx, "admin_leave_all_off")
+    check("sab OFF: sab OFF ho gaye", A.leave_recovery_on_channels(A.db.leave) == [],
+          str(A.db.leave["channel_configs"]))
+    check("sab OFF: text me sab OFF",
+          "ON: 0" in A.strip_premium_emojis(q5.edits[-1][0]), A.strip_premium_emojis(q5.edits[-1][0])[:200])
+
+    # default OFF par leave recovery bilkul nahi chalti
+    member = SimpleNamespace(id=9991, first_name="NoDM", is_bot=False)
+    update = SimpleNamespace(chat_member=SimpleNamespace(
+        chat=SimpleNamespace(id=-100000, title="Chan 00"),
+        new_chat_member=SimpleNamespace(status="left", user=member),
+        old_chat_member=SimpleNamespace(status="member")))
+    lctx = FakeCtx()
+    lctx.bot = FakeBot("lr")
+    run(A.handle_channel_member_update(update, lctx, "b1", 999))
+    check("default OFF: koi DM nahi jati", not lctx.bot.calls, str(lctx.bot.calls))
+
+    # channel ON karne par DM chalti hai
+    A.db.leave["channel_configs"]["-100000"] = True
+    A.db.leave["messages"] = [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""}]
+    lctx2 = FakeCtx()
+    lctx2.bot = FakeBot("lr2")
+    run(A.handle_channel_member_update(update, lctx2, "b1", 999))
+    check("channel ON: DM chali", any(c[0] == "send_message" and c[1] == 9991 for c in lctx2.bot.calls),
+          str(lctx2.bot.calls[:2]))
+
+    # one-time migration: purane ON channels OFF + dobara restart par kuch na chhedo
+    A.db.leave = {"enabled": True, "target_channel_id": -100999, "target_channel_link": "https://t.me/x",
+                  "messages": [], "channel_configs": {"-100000": True, "-100001": True}}
+    A.db.settings = {}
+    changed = A.migrate_leave_recovery_default_off()
+    check("migration: purane ON channels OFF", changed >= 2 and A.leave_recovery_on_channels(A.db.leave) == [],
+          f"changed={changed} cfg={A.db.leave['channel_configs']}")
+    A.db.leave["channel_configs"]["-100002"] = True     # admin ne khud ON kiya
+    changed2 = A.migrate_leave_recovery_default_off()
+    check("migration: dobara restart par admin ka ON safe",
+          changed2 == 0 and A.db.leave["channel_configs"].get("-100002") is True,
+          f"changed2={changed2} cfg={A.db.leave['channel_configs']}")
+    # Clear Pending Records -> queued DMs bhi saaf
+    A.db.leave["pending_rows"] = {("b1", 5, -100999): {"bot_id": "b1", "user_id": 5,
+                                                       "source_channel_id": -100000,
+                                                       "target_channel_id": -100999}}
+    A.db.bot_channels = {}
+    _lr_admin_q(ctx, "admin_leave_clear_pending")
+    check("clear pending: queued recovery DMs bhi clear",
+          not A.db.leave.get("pending_rows"), str(A.db.leave.get("pending_rows")))
+
+    source = open(A.__file__, encoding="utf-8").read()
+    check("source: migration main() me chalti hai",
+          "migrate_leave_recovery_default_off()" in source and "turned_off = migrate" in source)
+
+
 def _check_non_admin_diag():
     """Non-admin /diag bheje to kuch na aaye."""
     msg = FakeMsg(text="/diag", chat_id=555,
@@ -1695,6 +1840,7 @@ def main():
     A.reset_premium_styling_state()
     test_subscription_picker_and_style_memory()
     test_initiate_blocked_flow()
+    test_leave_recovery_channels_panel()
     test_network_hiccup_throttle()
     test_diagnostics()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")

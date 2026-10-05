@@ -306,7 +306,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-04-r18"
+BUILD_TAG = "2026-10-04-r19"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -1384,6 +1384,11 @@ class Database:
             self._execute("""DELETE FROM leave_recovery_pending
                    WHERE bot_id=%s AND user_id=%s AND target_channel_id=%s""",
                           (bot_id, user_id, target_channel_id))
+
+    def clear_all_leave_recovery_pending(self) -> int:
+        """Admin ka 'Clear Pending Records': queue me padi saari recovery DM hata do."""
+        rows = self._fetchall("DELETE FROM leave_recovery_pending RETURNING user_id")
+        return len(rows or [])
 
     def add_leave_recovery_message(self, bot_id: str, user_id, source_channel_id, target_channel_id, message_id):
         self._execute("INSERT INTO leave_recovery_messages (bot_id, user_id, source_channel_id, target_channel_id, message_id) VALUES (%s,%s,%s,%s,%s)", (bot_id, user_id, source_channel_id, target_channel_id, message_id))
@@ -4255,14 +4260,13 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
     leave_cfg = db.get_leave_recovery_config() or {}
     if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id")
             and int(leave_cfg["target_channel_id"]) == int(chat_id)):
-        chan_enabled = (leave_cfg.get("channel_configs") or {}).get(str(chat_id), True)
-        if chan_enabled:
-            await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat_id), sender)
-            # User wapas target channel me aa gaya -> ab pending recovery DM ki zarurat nahi
-            try:
-                db.clear_leave_recovery_pending(bot_id, requester.id, int(chat_id))
-            except Exception:
-                pass
+        # User wapas target channel me aa gaya -> purane "waps aao" DM hata do aur pending
+        # recovery DM ki zarurat khatam (ye cleanup per-channel toggle se independent hai).
+        await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat_id), sender)
+        try:
+            db.clear_leave_recovery_pending(bot_id, requester.id, int(chat_id))
+        except Exception:
+            pass
         if approve is not None:
             try:
                 await approve()
@@ -4371,8 +4375,10 @@ def leave_recovery_plan(leave_cfg: dict, user, source_channel_id: int,
             return None
     except (TypeError, ValueError):
         return None
-    if not (leave_cfg.get("channel_configs") or {}).get(str(source_channel_id), True):
-        logging.info(f"Leave recovery disabled for channel {source_channel_id}, skipping.")
+    # Default OFF: jab tak admin is channel ko khud ON na kare, leave recovery nahi chalti.
+    if not (leave_cfg.get("channel_configs") or {}).get(str(source_channel_id), False):
+        logging.info(f"Leave recovery is channel ({source_channel_id}) ke liye OFF hai, skipping "
+                     f"(Admin Panel -> Leave Recovery -> Per-Channel Settings me ON karo).")
         return None
     extra = {"source_channel_title": chat_title or str(source_channel_id),
              "source_channel_id": source_channel_id,
@@ -4559,11 +4565,13 @@ async def _legacy_handle_join_request(update: Update, context: ContextTypes.DEFA
 
     leave_cfg = db.get_leave_recovery_config()
     if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id") and int(leave_cfg["target_channel_id"]) == int(chat.id)):
-        channel_configs = leave_cfg.get("channel_configs", {})
-        chan_key = str(chat.id)
-        chan_enabled = channel_configs.get(chan_key, True)
-        if chan_enabled:
-            await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
+        # Target channel ki join request -> user wapas aa gaya: purane recovery DM delete
+        # karo aur pending recovery DM clear kar do (per-channel toggle se independent).
+        await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
+        try:
+            db.clear_leave_recovery_pending(bot_id, requester.id, int(chat.id))
+        except Exception:
+            pass
         try:
             await jr.approve()
         except Exception as ex:
@@ -5651,6 +5659,79 @@ async def start_all_userbots(q):
 
 
 # ================= LEAVE RECOVERY =================
+LEAVE_CHAN_PAGE_SIZE = 8
+
+
+def leave_recovery_all_channels() -> List[Tuple[str, str]]:
+    """Saare bots ke saare channels: [(channel_id_str, title), ...] (dedupe + sorted).
+
+    Pehle panel sirf pehle 20 channels dikhata tha (`[:20]`), isliye baaki channels
+    list me aate hi nahi the - ab poori list aati hai (pagination ke saath).
+    """
+    found: Dict[str, str] = {}
+    try:
+        bots = db.get_all_user_bots() or []
+    except Exception as ex:
+        logging.warning(f"leave recovery channels list fail: {mask_secrets(ex)}")
+        return []
+    for bot in bots:
+        bot_id = bot.get("bot_id") if isinstance(bot, dict) else None
+        if not bot_id:
+            continue
+        try:
+            channels = db.get_bot_channels(bot_id) or []
+        except Exception:
+            continue
+        for ch in channels:
+            try:
+                cid = str(int(ch["channel_id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            title = (ch.get("channel_title") or ch.get("channel_username") or cid)
+            found.setdefault(cid, str(title))
+    return sorted(found.items(), key=lambda kv: (kv[1] or "").lower())
+
+
+def leave_recovery_on_channels(cfg: Optional[dict] = None) -> List[str]:
+    """Jo channels admin ne khud ON kiye hain (default sab OFF hai)."""
+    cfg = cfg or db.get_leave_recovery_config()
+    channel_configs = cfg.get("channel_configs") or {}
+    return [str(cid) for cid, val in channel_configs.items() if val]
+
+
+def leave_recovery_set_all(enabled: bool) -> int:
+    """Saare known channels ko ek saath ON/OFF karo. Return: kitne channels chhue."""
+    cfg = db.get_leave_recovery_config()
+    channel_configs = {str(k): bool(v) for k, v in (cfg.get("channel_configs") or {}).items()}
+    ids = {cid for cid, _ in leave_recovery_all_channels()}
+    ids.update(channel_configs)
+    for cid in ids:
+        channel_configs[str(cid)] = bool(enabled)
+    cfg["channel_configs"] = channel_configs
+    db.set_leave_recovery_config(cfg)
+    return len(ids)
+
+
+def migrate_leave_recovery_default_off() -> int:
+    """One-time: purane config me jo bhi channel ON tha, use OFF kar do.
+
+    Pehle default ON tha (config me channel na ho to ON maana jata tha), isliye purane
+    bots bina puche DM bhej rahe the. Ab default OFF hai - aur ye migration purane
+    ON channels ko bhi ek baar OFF kar deta hai, taaki admin khud decide kare.
+    """
+    try:
+        if db.get_setting("leave_recovery_default_off_v1"):
+            return 0
+    except Exception:
+        return 0
+    try:
+        changed = leave_recovery_set_all(False)
+        db.set_setting("leave_recovery_default_off_v1", True)
+        return changed
+    except Exception as ex:
+        logging.warning(f"leave recovery default-off migration skip: {mask_secrets(ex)}")
+        return 0
+
 
 def leave_recovery_status_text() -> str:
     cfg = db.get_leave_recovery_config()
@@ -5660,11 +5741,21 @@ def leave_recovery_status_text() -> str:
     messages = cfg.get("messages", [])
     msg_count = len(messages)
 
-    channel_configs = cfg.get("channel_configs", {})
+    all_channels = dict(leave_recovery_all_channels())
+    on_ids = leave_recovery_on_channels(cfg)
+    total_channels = len(all_channels)
     chan_lines = []
-    for cid, enabled in channel_configs.items():
-        chan_lines.append(f"  • <code>{cid}</code> → {'🟢 ON' if enabled else '🔴 OFF'}")
-    chan_text = "\n".join(chan_lines) if chan_lines else "  (Global setting applies to all)"
+    for cid in on_ids[:8]:
+        title = all_channels.get(cid, "")
+        chan_lines.append(f"  🟢 <code>{cid}</code> {EmojiManager._html_escape(title)[:30]}".rstrip())
+    if len(on_ids) > 8:
+        chan_lines.append(f"  … +{len(on_ids) - 8} more ON")
+    if not chan_lines:
+        chan_lines.append("  🔴 Sab channels OFF hain — jis channel par chahiye use "
+                          "Per-Channel Settings me ON karo.")
+    chan_text = "\n".join(chan_lines)
+    chan_counts = (f"total {total_channels} | 🟢 ON {len(on_ids)} | "
+                   f"🔴 OFF {max(0, total_channels - len(on_ids))}")
 
     msgs_preview = ""
     for i, m in enumerate(messages[:3]):
@@ -5682,7 +5773,8 @@ def leave_recovery_status_text() -> str:
         f"<b>Target Channel ID:</b> <code>{target_id}</code>\n"
         f"<b>Target Link:</b> {EmojiManager._html_escape(str(link))}\n\n"
         f"<b>Messages ({msg_count}):</b>{msgs_preview}\n\n"
-        f"<b>Per-Channel Config:</b>\n{chan_text}\n\n"
+        f"<b>Per-Channel Config:</b> {chan_counts}\n"
+        f"<i>Default: 🔴 OFF (jab tak khud ON na karo)</i>\n{chan_text}\n\n"
         f"<i>Global setting. All userbots use this config.</i>"
     )
 
@@ -5717,23 +5809,55 @@ def leave_recovery_msgs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def leave_recovery_channels_kb() -> InlineKeyboardMarkup:
+def leave_recovery_channels_text(page: int = 0) -> str:
+    channels = leave_recovery_all_channels()
+    on_ids = set(leave_recovery_on_channels())
+    total = len(channels)
+    pages = max(1, (total + LEAVE_CHAN_PAGE_SIZE - 1) // LEAVE_CHAN_PAGE_SIZE)
+    page = max(0, min(int(page or 0), pages - 1))
+    on_count = len(on_ids)
+    return (
+        f"<blockquote>{pp('⚙️')} <b>PER-CHANNEL LEAVE RECOVERY</b></blockquote>\n\n"
+        f"Jis channel par leave-recovery chahiye usko <b>ON</b> karo (tap = toggle).\n"
+        f"🟢 = ON   |   🔴 = OFF\n\n"
+        f"<b>Total:</b> {total} channels | 🟢 ON: {on_count} | 🔴 OFF: {total - on_count}\n\n"
+        f"<i>Default sab channels OFF hain.</i>\n"
+        f"<i>Page {page + 1}/{pages}</i>"
+    )
+
+
+def leave_recovery_channels_kb(page: int = 0) -> InlineKeyboardMarkup:
     cfg = db.get_leave_recovery_config()
-    channel_configs = cfg.get("channel_configs", {})
-    all_channels = {}
-    for bot in db.get_all_user_bots():
-        for ch in db.get_bot_channels(bot["bot_id"]):
-            cid = str(ch["channel_id"])
-            all_channels[cid] = ch.get("channel_title", cid)
+    channel_configs = cfg.get("channel_configs") or {}
+    channels = leave_recovery_all_channels()
+    total = len(channels)
+    pages = max(1, (total + LEAVE_CHAN_PAGE_SIZE - 1) // LEAVE_CHAN_PAGE_SIZE)
+    page = max(0, min(int(page or 0), pages - 1))
+    start = page * LEAVE_CHAN_PAGE_SIZE
+    page_items = channels[start:start + LEAVE_CHAN_PAGE_SIZE]
 
     rows = []
-    for cid, title in list(all_channels.items())[:20]:
-        enabled = channel_configs.get(cid, True)
+    for cid, title in page_items:
+        # Default OFF - sirf wahi channel ON hai jise admin ne khud ON kiya ho.
+        enabled = bool(channel_configs.get(cid, False))
         status_icon = "🟢" if enabled else "🔴"
-        rows.append([btn(f"{status_icon} {title[:25]}", f"admin_leave_chan_toggle_{cid}", "primary", "⚙️")])
+        rows.append([btn(f"{status_icon} {title[:25]}", f"admin_leave_chan_toggle_{cid}",
+                         "success" if enabled else "primary", "⚙️")])
 
     if not rows:
         rows.append([btn("No channels found", "admin_leave_channels", "primary", "❌")])
+
+    rows.append([btn("🔴 Sab OFF", "admin_leave_all_off", "danger", "🛑"),
+                 btn("🟢 Sab ON", "admin_leave_all_on", "success", "✅")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("⬅️ Prev", f"admin_leave_chan_page_{page - 1}", "primary", "⬅️"))
+        nav.append(btn(f"{page + 1}/{pages}", "admin_leave_channels", "primary", "📄"))
+        if page < pages - 1:
+            nav.append(btn("Next ➡️", f"admin_leave_chan_page_{page + 1}", "primary", "➡️"))
+        rows.append(nav)
 
     rows.append([btn("Back", "admin_leave_recovery", "primary", "🔙")])
     return InlineKeyboardMarkup(rows)
@@ -6101,13 +6225,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_leave_channels":
             if not is_admin(uid):
                 return
-            await safe_edit_message_text(q,
-                f"<blockquote>{pp('⚙️')} <b>PER-CHANNEL LEAVE RECOVERY</b></blockquote>\n\n"
-                "Toggle leave recovery ON/OFF for each channel.\n"
-                "🟢 = Leave recovery active for this channel\n"
-                "🔴 = Leave recovery disabled for this channel\n\n"
-                "<i>By default all channels are ON.</i>",
-                parse_mode=ParseMode.HTML, reply_markup=leave_recovery_channels_kb())
+            await safe_edit_message_text(q, leave_recovery_channels_text(0),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(0))
+            return
+
+        if data.startswith("admin_leave_chan_page_"):
+            if not is_admin(uid):
+                return
+            try:
+                page = int(data.replace("admin_leave_chan_page_", ""))
+            except ValueError:
+                page = 0
+            await safe_edit_message_text(q, leave_recovery_channels_text(page),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(page))
             return
 
         if data.startswith("admin_leave_chan_toggle_"):
@@ -6116,20 +6248,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chan_id = data.replace("admin_leave_chan_toggle_", "")
             cfg = db.get_leave_recovery_config()
             channel_configs = cfg.get("channel_configs", {})
-            current = channel_configs.get(chan_id, True)
+            current = bool(channel_configs.get(chan_id, False))   # default OFF
             channel_configs[chan_id] = not current
             cfg["channel_configs"] = channel_configs
             db.set_leave_recovery_config(cfg)
-            new_status = "🟢 ON" if not current else "🔴 OFF"
-            await safe_edit_message_text(q,
-                f"{pe('✅')} Channel <code>{chan_id}</code> leave recovery set to <b>{new_status}</b>",
-                parse_mode=ParseMode.HTML, reply_markup=leave_recovery_channels_kb())
+            # Toggle ke baad usi page par wapas (channel list me apni jagah rehne de)
+            channels = [cid for cid, _ in leave_recovery_all_channels()]
+            try:
+                page = channels.index(chan_id) // LEAVE_CHAN_PAGE_SIZE
+            except ValueError:
+                page = 0
+            await safe_edit_message_text(q, leave_recovery_channels_text(page),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(page))
+            return
+
+        if data in ("admin_leave_all_off", "admin_leave_all_on"):
+            if not is_admin(uid):
+                return
+            enabled = data == "admin_leave_all_on"
+            try:
+                count = leave_recovery_set_all(enabled)
+            except Exception as ex:
+                count = 0
+                logging.error(f"leave recovery all-{'on' if enabled else 'off'} fail: {mask_secrets(ex)}")
+            logging.info(f"leave recovery: {count} channels ko {'ON' if enabled else 'OFF'} kiya "
+                         f"(admin {uid})")
+            await safe_edit_message_text(q, leave_recovery_channels_text(0),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(0))
             return
 
         if data == "admin_leave_clear_pending":
             if not is_admin(uid):
                 return
             db._execute("UPDATE leave_recovery_messages SET deleted_at=now() WHERE deleted_at IS NULL")
+            try:
+                queued = db.clear_all_leave_recovery_pending()
+            except Exception as ex:
+                queued = 0
+                logging.warning(f"pending leave recovery clear skip: {mask_secrets(ex)}")
+            logging.info(f"leave recovery: pending records clear kiye (queued DMs: {queued}, admin {uid})")
             await show_leave_recovery_panel(q)
             return
 
@@ -6900,6 +7059,17 @@ async def main():
                          f"marks saaf kiye - user ke /start karne par inhe DM ja sakti hai")
     except Exception as ex:
         logging.warning(f"unreachable cleanup skip: {mask_secrets(ex)}")
+
+    # Leave recovery ab har channel par default OFF hai (pehle default ON tha). Ek baar
+    # purane ON channels ko bhi OFF kar do, phir admin khud jis channel par chahiye ON kare.
+    try:
+        turned_off = migrate_leave_recovery_default_off()
+        if turned_off:
+            logging.info(f"{pp('🔕')} Leave recovery: {turned_off} channels OFF kar diye "
+                         f"(naya default OFF - Admin Panel -> Leave Recovery -> Per-Channel "
+                         f"Settings se ON karo)")
+    except Exception as ex:
+        logging.warning(f"leave recovery default-off migration skip: {mask_secrets(ex)}")
 
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:

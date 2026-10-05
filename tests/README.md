@@ -15,7 +15,9 @@
   (direct user_id -> token -> subscription, cancel, legacy one-line format),
   **HTML safety net** (Telegram HTML sanitize, welcome ERROR spam band),
   **initiate-blocked flow** (soft mark, pending leave-recovery DM, /start par
-  auto-delivery, broadcast me hard-drop nahi) + **network hiccup throttle**
+  auto-delivery, broadcast me hard-drop nahi), **leave-recovery per-channel
+  panel** (saare channels - koi 20-cap nahi, pagination, default 🔴 OFF,
+  Sab ON/OFF, one-time all-off migration), **network hiccup throttle**
   (ek window me ek hi WARNING) aur **diagnostics** (build tag + bot status +
   /diag report + unreachable reset)
 
@@ -23,7 +25,7 @@
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes
-/tmp/v/bin/python tests/verify_advanced.py     # 200 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 222 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:
