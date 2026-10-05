@@ -308,7 +308,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-05-r20"
+BUILD_TAG = "2026-10-05-r21"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -2322,7 +2322,7 @@ def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
     row = [btn("Add Button", f"bwz_start_{tid}", "success", "➕")]
     mini = mini_app_button(context, target, tid)
     if mini is not None:
-        row.append(mini)
+        row.append(btn("Mini App", f"bwz_app_{tid}", "primary", "🌐"))
     row.append(btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄"))
     return row
 
@@ -2703,6 +2703,37 @@ async def handle_button_wizard_callback(q, context, data: str) -> bool:
     parts = data.split("_")
     action = parts[1] if len(parts) > 1 else ""
     tid = parts[2] if len(parts) > 2 else ""
+    if action in ("start", "app"):
+        target = get_button_target(context, tid)
+        mini = mini_app_button(context, target, tid) if target else None
+        if mini is not None:
+            # sendData works only for Mini Apps launched from a reply-keyboard button.
+            from telegram import KeyboardButton, ReplyKeyboardMarkup
+            context.user_data.pop(BUTTON_WIZARD_KEY, None)
+            await context.bot.send_message(
+                chat_id=q.from_user.id,
+                text="🌐 Neeche keyboard me ‘Mini App kholo’ dabao. Buttons banao aur SAVE karo.\n"
+                     "Typing se banana ho to ‘Manual typing’ chuno.",
+                reply_markup=ReplyKeyboardMarkup(
+                    [[KeyboardButton("🌐 Mini App kholo", web_app=mini.web_app)]],
+                    resize_keyboard=True, one_time_keyboard=True))
+            await safe_edit_message_text(q, "🎛 Button Builder — Mini App ready hai.",
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("Manual typing", f"bwz_manual_{tid}", "primary", "✏️")],
+                    [btn("Cancel", f"bwz_close_{tid}", "danger", "❌")]]))
+            return True
+    if action == "close":
+        from telegram import ReplyKeyboardRemove
+        context.user_data.pop(BUTTON_WIZARD_KEY, None)
+        await context.bot.send_message(chat_id=q.from_user.id, text="Builder band kar diya.",
+                                       reply_markup=ReplyKeyboardRemove())
+        return True
+    if action == "manual":
+        from telegram import ReplyKeyboardRemove
+        await context.bot.send_message(chat_id=q.from_user.id, text="✏️ Manual builder",
+                                       reply_markup=ReplyKeyboardRemove())
+        await start_button_wizard(q, context, tid, mode="wizard")
+        return True
     if action in ("start", "bulk"):
         await start_button_wizard(q, context, tid, mode="bulk" if action == "bulk" else "wizard")
         return True
@@ -4904,7 +4935,7 @@ def _build_userbot_app(token: str, bot_id: str, owner_id: int):
     app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|bwz_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
     app.add_handler(CallbackQueryHandler(lambda u, c: userbot_wizard_callback(u, c, bot_id, owner_id), pattern=r"^bwz_"))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_set_buttons_callback(u, c, bot_id, owner_id), pattern=f"^setbtn_{bot_id}_"))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA | filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
     return app
@@ -7277,7 +7308,7 @@ async def main():
     app.add_handler(CommandHandler("proof", proof_text_command))
     app.add_handler(CommandHandler("prooftext", proof_text_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, handle_message))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA | filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, handle_message))
     app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")

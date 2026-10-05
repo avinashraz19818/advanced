@@ -1732,7 +1732,25 @@ def test_mini_app_integration():
         target = {"kind": "draft_admin", "tid": "x"}
         row = A.button_builder_row(ctx, target)
         check("mini app: 3 buttons (Add Button | Mini App | Paste Many)", len(row) == 3, str(len(row)))
-        mini = _mini_app_btn(InlineKeyboardMarkup([row]))
+        check("mini app: panel uses launcher callback", row[1].callback_data.startswith("bwz_app_"))
+        sent = []
+        async def capture_send(**kwargs):
+            sent.append(kwargs)
+        async def capture_edit(*args, **kwargs):
+            pass
+        old_edit = A.safe_edit_message_text
+        old_bot = ctx.bot
+        try:
+            ctx.bot = SimpleNamespace(send_message=capture_send)
+            A.safe_edit_message_text = capture_edit
+            q = SimpleNamespace(from_user=SimpleNamespace(id=999))
+            run(A.handle_button_wizard_callback(q, ctx, row[0].callback_data))
+            check("Add Button: reply keyboard launches Mini App", bool(sent) and
+                  bool(sent[0]["reply_markup"].keyboard[0][0].web_app))
+        finally:
+            ctx.bot = old_bot
+            A.safe_edit_message_text = old_edit
+        mini = _mini_app_btn(InlineKeyboardMarkup([[A.mini_app_button(ctx, target)]]))
         check("mini app: web_app button bana", mini is not None, str([b.text for b in row]))
         check("mini app: label 'Mini App'", mini and mini["text"].endswith("Mini App"), str(mini and mini["text"]))
         url = mini["url"] if mini else ""
@@ -1753,7 +1771,7 @@ def test_mini_app_integration():
         A.db.leave = {"messages": [{"text": "Hi", "buttons_json":
                       json.dumps([[{"text": "Old", "url": "https://t.me/old", "style": "success"}]])}],
                       "enabled": True, "target_channel_id": -100999}
-        row2 = A.button_builder_row(ctx2, {"kind": "leave_msg", "idx": 0})
+        row2 = [A.mini_app_button(ctx2, {"kind": "leave_msg", "idx": 0})]
         mini2 = _mini_app_btn(InlineKeyboardMarkup([row2]))
         rows2 = _decode_rows_param(mini2["url"])
         check("mini app: purane buttons prefill hote hain",
@@ -1769,7 +1787,7 @@ def test_mini_app_integration():
             big_rows.append([{"text": f"Button number {i} with a long name", "url": "https://t.me/some/very/long/link/here"}])
         A.db.leave = {"messages": [{"text": "T" * 800, "buttons_json": json.dumps(big_rows)}],
                       "enabled": True, "target_channel_id": -100999}
-        row3 = A.button_builder_row(ctx3, {"kind": "leave_msg", "idx": 0})
+        row3 = [A.mini_app_button(ctx3, {"kind": "leave_msg", "idx": 0})]
         mini3 = _mini_app_btn(InlineKeyboardMarkup([row3]))
         check("mini app: lamba data ho to bhi URL limit ke andar",
               mini3 is not None and len(mini3["url"]) <= A.MINI_APP_URL_MAX + 40, str(len(mini3["url"] if mini3 else "")))
