@@ -1831,6 +1831,24 @@ def test_mini_app_integration():
               A.rows_from_buttons_json(A.db.leave["messages"][0]["buttons_json"])[0][0]["text"] == "Join",
               str(A.db.leave["messages"][0]["buttons_json"]))
 
+        # Saved message and album: persistence, not just a preview reply.
+        for kind, ids in (("message", [810]), ("messages", [811, 812])):
+            target = {"kind": kind, "msg_id": ids[0], "msg_ids": ids}
+            c = FakeCtx()
+            c.user_data.clear()
+            session = A.register_button_target(c, target)
+            for mid in ids:
+                A.db.messages[mid] = {"id": mid, "buttons_json": "[]"}
+            m = FakeMsg(chat_id=A.ADMIN_USER_ID)
+            m.web_app_data = SimpleNamespace(data=json.dumps({
+                "target": {"id": session}, "rows": payload["rows"]}))
+            run(A.process_web_app_buttons(_fake_update(msg=m, uid=A.ADMIN_USER_ID), c))
+            check(f"mini app SAVE: {kind} DB me attached",
+                  all(A.rows_from_buttons_json(A.db.messages[mid]["buttons_json"])[0][0]["url"]
+                      == "https://t.me/reg" for mid in ids))
+        check("mini app SAVE: broadcast Send button available after save", any(
+            "bcast_send" in str(kw.get("reply_markup")) for _, kw in msg.replies))
+
         # --- purana/expired tid -> saaf error, koi crash nahi
         ctx6 = FakeCtx()
         ctx6.user_data.clear()

@@ -27,7 +27,7 @@
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes
-/tmp/v/bin/python tests/verify_advanced.py     # 248 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 253 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:

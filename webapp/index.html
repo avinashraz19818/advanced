@@ -807,15 +807,25 @@ function save(){
   const rows = buildJSON();
   if (!rows.length){ toast("Pehle ek button banao", true); return; }
   const payload = { action: "save_buttons", rows, text: state.text, target: state.target };
-  if (TG && typeof TG.sendData === "function" && TG.initData){
-    TG.sendData(JSON.stringify(payload));
-    toast("Save ho gaya ✅");
-    setTimeout(() => TG.close(), 700);
+  // Reply-keyboard Mini Apps may have EMPTY initData. It is not a sendData gate.
+  const inTelegram = TG && TG.platform && TG.platform !== "unknown";
+  const launch = new URLSearchParams(location.search).get("launch");
+  if (inTelegram && state.target && launch === "keyboard" && typeof TG.sendData === "function"){
+    const data = JSON.stringify(payload);
+    if (new TextEncoder().encode(data).length > 4096){
+      toast("Buttons/message zyada bade hain. Chhota karke SAVE karo (Telegram limit).", true);
+      return;
+    }
+    try {
+      TG.sendData(data);
+      // Telegram closes the app. Only the BOT may confirm database persistence.
+      toast("Bot ko bhej diya — chat me save confirmation dekho.");
+    } catch(e){
+      toast("Bot ko bhej nahi paaye. Dobara SAVE karo.", true);
+    }
     return;
   }
-  try { window.parent.postMessage(JSON.stringify(payload), "*"); } catch(e){}
-  navigator.clipboard?.writeText(JSON.stringify(rows, null, 1)).then(
-    () => toast("Buttons ready ✅"), () => toast("Buttons ready ✅"));
+  toast("Yahan save nahi hoga. Bot ka naya Add Button panel kholkar Mini App kholo.", true);
 }
 
 /* ---------------- wiring ---------------- */
@@ -858,14 +868,14 @@ $("emojiUseCustom").onclick = () => {
   const pill = $("modePill");
   if (pill) pill.textContent = (TG && TG.initData) ? "TELEGRAM" : "PREVIEW";
 
-  state.text = q.get("text") ? decodeURIComponent(q.get("text")) : "";
+  state.text = q.get("text") || "";
   $("msgText").value = state.text;
   const rowsParam = q.get("rows");
   let loaded = 0;
   if (rowsParam){
     try { loaded = importRows(JSON.parse(decodeURIComponent(escape(atob(rowsParam))))); } catch(e){}
   }
-  if (!loaded) loaded = loadDraft() ? state.rows.reduce((n, r) => n + r.length, 0) : 0;
+  if (!loaded && !tid) loaded = loadDraft() ? state.rows.reduce((n, r) => n + r.length, 0) : 0;
   if (!loaded && !state.rows.length){
     if (!tid){
       state.text = state.text || "👋 Welcome! Neeche se option choose karo.";

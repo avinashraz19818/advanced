@@ -170,5 +170,47 @@ check("ui: search placeholder Telegram jaisa", /Search \(e\.g\. pizza/.test(html
 check("ui: premium badge (★) picker me", /class="pro"/.test(html));
 check("ui: emoji-data.js load hota hai", /src="emoji-data\.js"/.test(html));
 
+// Save regression: Telegram reply-keyboard launches legitimately have empty initData.
+function saveHarness({platform = "android", launch = "keyboard", throws = false} = {}) {
+  const sent = [];
+  const env = {
+    ...sandbox, window: null, TextEncoder,
+    setTimeout(){ return 0; }, clearTimeout(){},
+    location: {search: `?tid=test&launch=${launch}&text=100%25`},
+    Telegram: {WebApp: {platform, initData: "", ready(){}, expand(){},
+      sendData(data){ if (throws) throw Error("transport"); sent.push(JSON.parse(data)); }}},
+  };
+  env.window = env;
+  env.globalThis = env;
+  vm.createContext(env);
+  vm.runInContext(emojiData, env);
+  vm.runInContext(script + "\nglobalThis.saveTest = {save, state};", env);
+  const api = env.saveTest;
+  const isolated = api.state.rows.every(row => row.every(b => !b.url));
+  api.state.rows = [[{text: "Join", url: "https://t.me/test", cb: "", style: "primary"}]];
+  return {api, sent, isolated};
+}
+const live = saveHarness();
+check("prefill: percent text decoded once", live.api.state.text === "100%");
+check("prefill: target never loads unrelated browser draft", live.isolated);
+live.api.save();
+check("SAVE: empty initData still sends keyboard payload", live.sent.length === 1 &&
+      live.sent[0].target.id === "test" && live.sent[0].rows[0][0].url === "https://t.me/test");
+check("SAVE: UI does not falsely confirm database save", !document.getElementById("toast").textContent.includes("Save ho gaya"));
+const browser = saveHarness({platform: "unknown"});
+browser.api.save();
+check("SAVE: ordinary browser cannot pretend to save", browser.sent.length === 0);
+const inline = saveHarness({launch: "inline"});
+inline.api.save();
+check("SAVE: unsupported inline launch cannot silently lose data", inline.sent.length === 0);
+const large = saveHarness();
+large.api.state.text = "💎".repeat(1500);
+large.api.save();
+check("SAVE: 4096 byte limit checked before send", large.sent.length === 0);
+const broken = saveHarness({throws: true});
+broken.api.save();
+check("SAVE: transport error shown without success", broken.sent.length === 0 &&
+      document.getElementById("toast").textContent.includes("nahi paaye"));
+
 console.log(`\n==== webapp selftest: ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

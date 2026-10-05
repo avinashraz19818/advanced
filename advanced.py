@@ -308,7 +308,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-05-r21"
+BUILD_TAG = "2026-10-05-r22"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -2371,7 +2371,7 @@ def mini_app_button(context, target: dict, tid: Optional[str] = None) -> Optiona
         return None
     tid = tid or register_button_target(context, target)
     kind = str(target.get("kind") or "")
-    base = f"{WEBAPP_URL}?tid={tid}&kind={kind}"
+    base = f"{WEBAPP_URL}?tid={tid}&kind={kind}&launch=keyboard"
     label = ""
     try:
         label = str(_target_title(target) or "")
@@ -2385,7 +2385,7 @@ def mini_app_button(context, target: dict, tid: Optional[str] = None) -> Optiona
     with_rows = base + f"&rows={quote(_mini_app_rows_payload(context, target))}"
     url = with_rows if len(with_rows) <= MINI_APP_URL_MAX else base
     if len(url) > MINI_APP_URL_MAX:      # text bhi bohat lamba - wo bhi chhod do
-        url = f"{WEBAPP_URL}?tid={tid}&kind={kind}"
+        url = f"{WEBAPP_URL}?tid={tid}&kind={kind}&launch=keyboard"
     try:
         return InlineKeyboardButton("Mini App", web_app=WebAppInfo(url=url))
     except Exception as ex:
@@ -2464,6 +2464,13 @@ async def process_web_app_buttons(update: Update, context: ContextTypes.DEFAULT_
             apply_mini_app_text(context, target, text)
         except Exception as ex:
             logging.debug(f"mini app text save skip: {mask_secrets(ex)}")
+    context.user_data.pop(BUTTON_WIZARD_KEY, None)
+    try:
+        from telegram import ReplyKeyboardRemove
+        await reply_premium_message(msg, "✅ Buttons configuration me lag gaye. Neeche preview hai.",
+                                    reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
     count = button_count(rows_to_buttons_json(rows))
     logging.info(f"mini app: {count} buttons save hue (target={target.get('kind')})")
     logging.info(f"mini app layout: {strip_premium_emojis(_wizard_layout(rows))}")
@@ -2474,6 +2481,13 @@ async def process_web_app_buttons(update: Update, context: ContextTypes.DEFAULT_
             parse_mode=ParseMode.HTML, reply_markup=markup_from_rows(rows))
     except Exception as ex:
         logging.warning(f"mini app confirm reply fail: {mask_secrets(ex)}")
+    nav = target_nav_rows(target)
+    if nav:
+        try:
+            await reply_premium_message(msg, "Aage ka option chuno:",
+                                        reply_markup=InlineKeyboardMarkup(nav))
+        except Exception as ex:
+            logging.debug(f"mini app navigation: {mask_secrets(ex)}")
     return True
 
 

@@ -1,3 +1,21 @@
+## r22 SAVE fix — deploy BOTH parts
+
+1. Update the bot from `arena/01a1067e-advanced`, keeping WEBAPP_URL in `.env`.
+2. Upload the updated `downloads/button-studio.zip` as a NEW deployment of the
+   existing Cloudflare site (same hostname). Restart the bot and reopen the builder.
+3. In the current supported flow: Add Button -> Telegram reply-keyboard Mini App
+   button -> SAVE. Empty initData is normal for this launch type; sendData still works.
+4. Wait for the BOT's confirmation and preview. The frontend only confirms dispatch,
+   never database persistence. Saved-message buttons are stored for future sends;
+   existing copies already delivered to other users are not retroactively edited.
+   Broadcast drafts still require Send Broadcast; SAVE must not send a mass broadcast.
+
+Direct opening from an inline Add/Edit button is NOT complete: it needs an
+HTTPS backend with validated Telegram initData (not sendData). Do not replace the
+reply-keyboard launch with an inline web_app button until that transport is deployed.
+The current Telegram sendData payload limit is 4096 bytes; oversized payloads show
+an error rather than pretend to save. Browser-only previews cannot save to the bot.
+
 # 🌐 Button Builder — Telegram Mini App (Premium)
 
 `index.html` = **premium visual button builder** (GroupHelp jaisa), jo bilkul usi format me
@@ -111,7 +129,7 @@ cloudflared tunnel --url http://127.0.0.1:8110     # free https URL deta hai
 ## Test
 
 ```bash
-node webapp/selftest.mjs                    # 31 checks (JS <-> Python format match)
+node webapp/selftest.mjs                    # 39 checks (including empty-initData SAVE regression)
 python3 webapp/gen_emoji_map.py --check     # picker <-> bot ke premium emojis sync
 ```
 
