@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+from functools import lru_cache
 from pathlib import Path
 
 KEY = 'miniapp_emoji_packs_v1'
@@ -85,15 +86,38 @@ async def remove_pack(db, name):
         db.set_setting(KEY, packs)
 
 
+@lru_cache(maxsize=1)
+def emoji_keywords():
+    source = (Path(__file__).resolve().parent / 'webapp' / 'emoji-data.js').read_text()
+    groups = json.loads(source.split('=', 1)[1].strip().rstrip(';'))
+    return {char.replace('\ufe0f', ''): tags for group in groups for char, tags in group['items']}
+
+
 def page(db, data):
     packs = catalog(db)
+    query = str(data.get('query') or '').strip().casefold()[:100]
     name = data.get('pack')
+    offset = max(0, int(data.get('offset', 0)))
+    if query:
+        keywords = emoji_keywords()
+        tokens = query.replace('\ufe0f', '').split()
+        hits, seen = [], set()
+        for pack in packs.values():
+            for item in pack['items']:
+                char = item.get('char', '').replace('\ufe0f', '')
+                haystack = f"{char} {keywords.get(char, '')} {pack['title']} {pack['name']}".casefold()
+                if item['id'] not in seen and all(token in haystack for token in tokens):
+                    hits.append(item)
+                    seen.add(item['id'])
+        return {'items': hits[offset:offset+48], 'total':len(hits),
+                'next':offset+48 if offset+48 < len(hits) else None}
     if not name:
-        return {'packs':[{'name':p['name'], 'title':p['title'], 'count':len(p['items'])}
+        return {'packs':[{'name':p['name'], 'title':p['title'], 'count':len(p['items']),
+                          'cover':p['items'][0] if p['items'] else None}
                          for p in packs.values()]}
     pack = packs.get(name)
     if not pack:
         raise ValueError('Pack remove ho gaya. Builder dobara kholo.')
-    offset = max(0, int(data.get('offset', 0)))
     items = pack['items'][offset:offset+48]
-    return {'items':items, 'next':offset+48 if offset+48 < len(pack['items']) else None}
+    return {'items':items, 'total':len(pack['items']),
+            'next':offset+48 if offset+48 < len(pack['items']) else None}

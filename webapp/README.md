@@ -1,4 +1,20 @@
-# Button Builder — direct Add/Edit Mini App (r24)
+# Button Builder — direct Add/Edit Mini App (r25)
+
+## r25 fixes and keyboard-style picker
+
+- Album JobQueue contexts now retain the initiating user's ID as well as their
+  user_data. Sessions bind to this actor, never a managed bot owner or group ID.
+  Missing identity fails closed (legacy callback fallback), not an int(None) crash.
+- Rounded emoji search field, compact lazy-loaded pack-cover tabs (names shown in
+  active-pack heading/tooltips), denser transparent tiles and touch-scroll grid.
+- Search across installed admin packs by Unicode emoji, English emoji keywords
+  (fire, heart, diamond, etc.), or pack title/name. Searches are paginated/debounced;
+  this matches metadata, not visual recognition of arbitrary sticker artwork.
+- **Premium icon** keeps the exact animated custom emoji ID in the Telegram button's
+  fixed leading icon slot (one per button). **Text me insert** inserts the associated
+  NORMAL Unicode glyph at the label's caret/replaces selected text, before/in/after
+  the name. It does NOT create arbitrary animated custom emoji entities in button
+  labels: Telegram's inline-button text field does not support those entities.
 
 ## Admin-managed premium emoji packs (r24)
 
@@ -100,7 +116,7 @@ previews and unsupported inline sendData launches cannot save to the bot.
 ## Tests
 
 ```bash
-node webapp/selftest.mjs                         # 50 frontend checks
+node webapp/selftest.mjs                         # 57 frontend checks
 python3 webapp/gen_emoji_map.py --check           # premium mapping sync
 /tmp/v/bin/python tests/verify_advanced.py        # 253 bot checks
 /tmp/v/bin/python tests/test_miniapp_direct.py    # HTTP + HMAC + DB integration

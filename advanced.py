@@ -308,7 +308,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-05-r24"
+BUILD_TAG = "2026-10-05-r25"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -2345,7 +2345,7 @@ def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
     Without WEBAPP_API_URL, preserve the legacy launcher for old installations.
     """
     tid = register_button_target(context, target)
-    if WEBAPP_API_URL.startswith("https://"):
+    if WEBAPP_API_URL.startswith("https://") and getattr(context, "_user_id", None):
         return [direct_mini_app_button(context, target, tid)]
     # Legacy installation: no separate Mini App tab. Configure the direct backend.
     return [btn("Add Button", f"bwz_start_{tid}", "success", "➕")]
@@ -3625,11 +3625,16 @@ class _UserDataContext:
     ("'NoneType' object has no attribute 'pop'") aur broadcast album save hi nahi hota.
     Ab schedule karte waqt asli user_data dict job ke data me jaata hai."""
 
-    __slots__ = ("_wrapped", "_user_data")
+    __slots__ = ("_wrapped", "_user_data", "_actor_id")
 
-    def __init__(self, context, user_data: dict):
+    def __init__(self, context, user_data: dict, user_id=None):
         object.__setattr__(self, "_wrapped", context)
         object.__setattr__(self, "_user_data", user_data)
+        object.__setattr__(self, "_actor_id", user_id or getattr(context, "_user_id", None))
+
+    @property
+    def _user_id(self):
+        return object.__getattribute__(self, "_actor_id")
 
     @property
     def user_data(self) -> dict:
@@ -3639,10 +3644,10 @@ class _UserDataContext:
         return getattr(object.__getattribute__(self, "_wrapped"), item)
 
 
-def _context_with_user_data(context, user_data):
+def _context_with_user_data(context, user_data, user_id=None):
     """Job context (user_data None) ko live user_data ke saath usable banao."""
-    if isinstance(user_data, dict) and getattr(context, "user_data", None) is not user_data:
-        return _UserDataContext(context, user_data)
+    if isinstance(user_data, dict) and (user_id is not None or getattr(context, "user_data", None) is not user_data):
+        return _UserDataContext(context, user_data, user_id)
     return context
 
 
@@ -4158,7 +4163,7 @@ async def _flush_media_group(bot_id: str, actor_uid: int, managed_uid: int, chat
 async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
     # Job context me user_data None hota hai - captured dict se replace karo
-    ctx = _context_with_user_data(context, data.get("user_data"))
+    ctx = _context_with_user_data(context, data.get("user_data"), data.get("actor_uid"))
     await _flush_media_group(data.get("bot_id"), data.get("actor_uid"), data.get("managed_uid"),
                              data.get("chat_id"), ctx, data.get("media_group_id"))
 
@@ -5371,6 +5376,7 @@ def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1
     "'NoneType' object has no attribute 'pop'" and the draft was never saved.
     """
     data = dict(data or {})
+    data.setdefault("actor_uid", getattr(context, "_user_id", None))
     if not isinstance(data.get("user_data"), dict):
         user_data = getattr(context, "user_data", None)
         if isinstance(user_data, dict):
@@ -5385,7 +5391,7 @@ def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1
             await asyncio.sleep(when)
             await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
                                         data.get("chat_id"), data.get("media_group_id"),
-                                        user_data=data.get("user_data"))
+                                        user_data=data.get("user_data"), actor_uid=data.get("actor_uid"))
         except Exception as ex:
             logging.error(f"broadcast album flush task failed: {mask_secrets(ex)}")
 
@@ -5432,6 +5438,7 @@ async def collect_broadcast_album(context, scope: str, bot_id: Optional[str], ms
                 pass
     _schedule_broadcast_flush(context, job_key,
                               {"scope": scope, "bot_id": bot_id, "chat_id": msg.chat_id,
+                               "actor_uid": getattr(getattr(msg, "from_user", None), "id", None) or getattr(context, "_user_id", None),
                                "media_group_id": media_group_id})
     return True
 
@@ -5440,12 +5447,12 @@ async def _flush_broadcast_album_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
     await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
                                 data.get("chat_id"), data.get("media_group_id"),
-                                user_data=data.get("user_data"))
+                                user_data=data.get("user_data"), actor_uid=data.get("actor_uid"))
 
 
 async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
-                                chat_id, media_group_id, user_data: Optional[dict] = None):
-    ctx = _context_with_user_data(context, user_data)
+                                chat_id, media_group_id, user_data: Optional[dict] = None, actor_uid=None):
+    ctx = _context_with_user_data(context, user_data, actor_uid)
     user_data = getattr(ctx, "user_data", None)
     if not isinstance(user_data, dict):
         logging.error(f"album flush: user_data available nahi hai (scope={scope}, bot={bot_id})")

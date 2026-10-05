@@ -232,7 +232,7 @@ async function directHarness({failLoad = false, failSave = false} = {}){
   };
   env.window = env; env.globalThis = env;
   vm.createContext(env); vm.runInContext(emojiData, env);
-  vm.runInContext(script + "\nglobalThis.directTest = {save,state,choosePackEmoji,buildJSON,openPicker};", env);
+  vm.runInContext(script + "\nglobalThis.directTest = {save,state,choosePackEmoji,buildJSON,openPicker,setPackInsertMode,rememberTextSelection};", env);
   await new Promise(resolve => setImmediate(resolve));
   return {api:env.directTest,calls,closes};
 }
@@ -257,6 +257,25 @@ check("packs: actual pack ID survives output serialization", direct.api.buildJSO
 check("packs: library loaded through authenticated API", direct.calls.some(c => c.path === "/api/packs" && c.body.initData === "signed-data"));
 check("packs: embedded picker lies inside editor before Apply", html.indexOf('id="packPicker"') < html.indexOf('id="fSave"'));
 check("packs: animations player is vendored", html.includes('src="vendor/lottie_light.min.js"'));
+
+// Normal label emojis use the captured text caret; premium icon ID stays separate.
+const input = document.getElementById("fText");
+input.value = "Join now"; input.selectionStart = 5; input.selectionEnd = 5;
+direct.api.rememberTextSelection(); direct.api.setPackInsertMode("text");
+direct.api.choosePackEmoji({char:"🔥",id:"123"});
+check("label emoji: inserts at middle cursor", input.value === "Join 🔥now");
+check("label emoji: premium icon ID is not overwritten", direct.api.state.pickEmoji.id === "9876543211");
+input.selectionStart = 0; input.selectionEnd = 0; direct.api.rememberTextSelection();
+direct.api.choosePackEmoji({char:"💎",id:"456"});
+check("label emoji: inserts before text", input.value.startsWith("💎Join"));
+input.selectionStart = input.value.length; input.selectionEnd = input.value.length; direct.api.rememberTextSelection();
+direct.api.choosePackEmoji({char:"✅",id:"789"});
+check("label emoji: inserts after text", input.value.endsWith("✅"));
+input.value = "ABCD"; input.selectionStart = 1; input.selectionEnd = 3; direct.api.rememberTextSelection();
+direct.api.choosePackEmoji({char:"🔥",id:"123"});
+check("label emoji: replaces selected range", input.value === "A🔥D");
+check("picker: styled emoji search, not native white input", html.includes('#packSearch{') && html.includes('Search emoji · fire, heart'));
+check("picker: compact cover tabs instead of title chips", html.includes('p.cover?.char') && !html.includes('b.textContent = `${p.title} (${p.count})`'));
 
 console.log(`\n==== webapp selftest: ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

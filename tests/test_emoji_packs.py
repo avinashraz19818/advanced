@@ -79,6 +79,18 @@ class Packs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(E.page(self.db,{'pack':'P0','offset':96})['items']),9)
         self.assertIsNone(E.page(self.db,{'pack':'P0','offset':96})['next'])
 
+    async def test_emoji_search_across_packs_and_covers(self):
+        self.db.set_setting(E.KEY, {
+            'One':{'name':'One','title':'Fireworks','items':[{'id':'1','char':'🔥'}, {'id':'2','char':'💎'}]},
+            'Two':{'name':'Two','title':'Love','items':[{'id':'3','char':'❤️'}, {'id':'1','char':'🔥'}]}})
+        self.assertEqual(E.page(self.db,{})['packs'][0]['cover']['id'],'1')
+        self.assertEqual([i['id'] for i in E.page(self.db,{'query':'HEART'})['items']],['3'])
+        self.assertEqual([i['id'] for i in E.page(self.db,{'query':'❤'})['items']],['3'])
+        self.assertEqual([i['id'] for i in E.page(self.db,{'query':'diamond'})['items']],['2'])
+        self.assertEqual(E.page(self.db,{'query':'🔥'})['total'],1)
+        self.assertEqual(E.page(self.db,{'query':'no-such-emoji'})['items'],[])
+        self.assertEqual(E.page(self.db,{'query':'heart','offset':48})['items'],[])
+
     async def test_bad_names_and_external_animation_rejected(self):
         with self.assertRaises(ValueError): await E.add_pack(self.db,self.bot,'../.env')
         self.pack.stickers = [sticker(3,'lottie')]

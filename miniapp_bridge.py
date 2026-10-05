@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parent / 'webapp'
 
 
 def register(bot_token, user_id, load, save, packs=None):
+    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        raise ValueError("Mini App session requires the initiating Telegram user ID")
     now = time.time()
     with LOCK:
         for key in list(SESSIONS):

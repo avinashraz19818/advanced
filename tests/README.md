@@ -55,3 +55,11 @@ partial failure, external-animation-resource rejection, and admin-only controls.
 Frontend selftest covers explicit pack IDs (same Unicode glyph, different IDs),
 serialization, authenticated catalog requests, and embedded layout wiring.
 Actual Telegram downloads and animation playback on devices need a live smoke test.
+
+## r25 regression coverage
+
+Direct transport suite includes missing-user identity, media-group JobQueue and
+broadcast-album job session binding (actor, not managed owner). Pack suite covers
+keyword/glyph search, metadata covers, cross-pack deduplication, and pagination.
+Frontend tests cover insertion before/inside/after a label and replacement of
+selected text while preserving the separate premium icon ID.

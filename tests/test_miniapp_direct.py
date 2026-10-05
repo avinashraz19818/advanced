@@ -108,6 +108,57 @@ class Direct(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['items'][0]['id'],'123456789')
         self.assertEqual((await self.request('/api/packs',initData=''))[0],403)
 
+    async def test_job_context_keeps_initiating_user_not_owner_or_chat(self):
+        # Reproduce the live crash: from_job has user_data=None and _user_id=None.
+        jobctx = SimpleNamespace(_user_id=None,user_data=None,bot=self.ctx.bot)
+        proxy = A._context_with_user_data(jobctx, self.ctx.user_data, 42)
+        self.assertEqual(proxy._user_id,42)
+        button = A.button_builder_row(proxy, {'kind':'message','msg_id':1})[0]
+        self.key = parse_qs(urlsplit(button.web_app.url).query)['session'][0]
+        self.assertEqual((await self.request('/api/load'))[0],200)
+        self.assertEqual((await self.request('/api/load',initData=signed(uid=99)))[0],403)
+        # Missing identity must not crash the panel or silently authorize someone else.
+        noid = A._context_with_user_data(jobctx, self.ctx.user_data)
+        fallback = A.button_builder_row(noid, {'kind':'message','msg_id':1})[0]
+        self.assertIsNone(fallback.web_app)
+        self.assertTrue(fallback.callback_data.startswith('bwz_start_'))
+        with self.assertRaises(ValueError): bridge.register(TOKEN,None,None,None)
+
+    async def test_broadcast_album_job_direct_button_uses_actor(self):
+        captured = []
+        async def capture(*args, **kwargs): captured.append(kwargs)
+        original = A.send_premium_message
+        A.send_premium_message = capture
+        try:
+            ud = {A._broadcast_album_key('user','b1','album'): [
+                {'text':'album','media':'file','media_type':'photo'}]}
+            ctx = SimpleNamespace(user_data=None,_user_id=None,bot=self.ctx.bot)
+            await A.flush_broadcast_album(ctx,'user','b1',42,'album',user_data=ud,actor_uid=42)
+            button = captured[0]['reply_markup'].inline_keyboard[0][0]
+            self.assertIsNotNone(button.web_app)
+            key = parse_qs(urlsplit(button.web_app.url).query)['session'][0]
+            self.assertEqual(bridge.SESSIONS[key]['uid'],42)
+            self.assertIn('broadcast_draft_b1',ud)
+        finally: A.send_premium_message = original
+
+    async def test_saved_album_job_direct_button_uses_actor(self):
+        captured = []
+        async def capture(*args, **kwargs): captured.append(kwargs)
+        old_send = A.send_premium_message
+        A.send_premium_message = capture
+        A.db.get_bot_channels = lambda bot_id: [{'channel_id':-100123}]
+        try:
+            ud = {'42_b1':{'mg_album':[{'text':'Photo','media_id':'file','media_type':'photo'}]}}
+            ctx = SimpleNamespace(user_data=None,_user_id=None,bot=self.ctx.bot,
+                job=SimpleNamespace(data={'bot_id':'b1','actor_uid':42,'managed_uid':99,
+                    'chat_id':42,'media_group_id':'album','user_data':ud}))
+            await A._flush_media_group_job(ctx)
+            button = captured[0]['reply_markup'].inline_keyboard[0][0]
+            self.assertIsNotNone(button.web_app)
+            key = parse_qs(urlsplit(button.web_app.url).query)['session'][0]
+            self.assertEqual(bridge.SESSIONS[key]['uid'],42)  # not managed owner 99
+        finally: A.send_premium_message = old_send
+
     async def test_auth_rejections(self):
         for init in ('', signed(uid=43), signed(token='wrong'), signed(age=7200)):
             self.assertEqual((await self.request('/api/save', initData=init, rows=[]))[0], 403)

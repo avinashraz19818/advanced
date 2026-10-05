@@ -215,16 +215,27 @@
   .savebar .in{max-width:540px;margin:0 auto;display:flex;gap:11px;align-items:center}
   .savebar .n{font-size:11.5px;color:var(--muted);white-space:nowrap}
   .savebar .sbtn{flex:1;padding:15px;font-size:15px;border-radius:15px}
-.pack-picker{margin-top:12px;padding:12px;border:1px solid #33465a;border-radius:18px;background:#0d1721}
-.pack-tabs{display:flex;gap:8px;overflow-x:auto;margin:10px 0;padding-bottom:6px}
-.pack-tabs button{flex-shrink:0;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:9px 12px;background:#23374a;color:#dceafa;border:1px solid #38516a;border-radius:14px}
-.pack-tabs button.on{background:#245993;border-color:#70afff}
-.pack-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;max-height:260px;overflow:auto}
-.pack-emoji{height:49px;min-width:0;border-radius:10px;border:1px solid transparent;background:#182a3a;color:white;position:relative;cursor:pointer}
-.pack-emoji.on{border:2px solid #6bb8ff;background:#28486b}
+.pack-picker{margin-top:14px;padding:12px;border:1px solid #293d51;border-radius:22px;background:#101b27;box-shadow:0 10px 30px #0002}
+.pack-searchbar{display:flex;align-items:center;gap:10px;border-radius:22px;background:#203143;padding:0 12px;color:#93a9bf}
+#packSearch{min-width:0;flex:1;width:100%;font:inherit;font-size:14px;background:transparent!important;color:#e3edf7!important;border:0!important;box-shadow:none!important;outline:none;padding:12px 0;margin:0}
+#packSearch::placeholder{color:#91a5ba}#packSearchClear{border:0;background:none;color:#91a5ba;font-size:23px;cursor:pointer}
+.pack-tabs{display:flex;gap:6px;overflow-x:auto;margin:12px 0 8px;padding:0 0 8px;scrollbar-width:none;border-bottom:1px solid #293c50}
+.pack-tabs::-webkit-scrollbar{display:none}
+.pack-tabs button{flex:0 0 44px;width:44px;height:44px;overflow:hidden;padding:5px;background:transparent;color:#dceafa;border:0;border-radius:12px;position:relative;font-size:27px;cursor:pointer}
+.pack-tabs button.on{background:#2b4968;box-shadow:inset 0 -2px #70b6ff}
+.pack-tabs img,.pack-tabs video,.pack-tabs .cover-anim{width:34px;height:34px;object-fit:contain;position:absolute;inset:5px}
+.pack-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;height:256px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#354d64 transparent}
+.pack-emoji{height:43px;min-width:0;border-radius:10px;border:1px solid transparent;background:transparent;color:white;position:relative;cursor:pointer;padding:2px}
+.pack-emoji:hover{background:#25394e}.pack-emoji.on{border:1px solid #6bb8ff;background:#28486b}
 .pack-emoji img,.pack-emoji video,.pack-emoji .anim{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}
-.pack-emoji .fallback{font-size:26px;line-height:44px}
-.pack-footer{display:flex;justify-content:space-between;align-items:center;margin-top:10px;gap:8px}
+.pack-emoji .fallback{font-size:26px;line-height:39px}
+#packStatus{font-size:11px;font-weight:600;letter-spacing:.2px;min-height:25px;color:#8fa5bd}
+.pack-footer{display:flex;justify-content:space-between;align-items:center;margin-top:10px;gap:8px;border-top:1px solid #26394c;padding-top:8px}
+.pack-footer .sbtn{padding:5px 13px;background:#1c3044}.pack-footer button:disabled{opacity:.3}
+.pack-modes{display:flex;gap:5px;background:#0b141f;border-radius:12px;padding:4px;margin-top:10px}
+.pack-modes button{flex:1;border:0;border-radius:9px;padding:9px 4px;color:#91a5ba;background:transparent;font-size:12px;font-weight:600}
+.pack-modes button.on{color:#dbeeff;background:#2a4560}.pack-help{font-size:11px;color:#91a5ba;margin:8px 2px;line-height:1.5}
+@media(max-width:360px){.pack-grid{grid-template-columns:repeat(6,minmax(0,1fr))}}
 </style>
 </head>
 <body>
@@ -333,8 +344,9 @@
     </div>
 
     <div id="packPicker" class="pack-picker hidden">
-      <div class="muted">Premium Emoji Packs · admin ki library</div>
-      <input id="packSearch" placeholder="Pack naam search karo…" autocomplete="off">
+      <div class="pack-searchbar"><span aria-hidden="true">⌕</span><input id="packSearch" placeholder="Search emoji · fire, heart, 💎…" autocomplete="off"><button id="packSearchClear" aria-label="Clear search">×</button></div>
+      <div class="pack-modes"><button id="packModeIcon" class="on">★ Premium icon</button><button id="packModeText">Aa Text me insert</button></div>
+      <div class="pack-help" id="packInsertHint">Premium icon button ke aage lagega. Text me emoji ke liye “Text me insert” chuno.</div>
       <div id="packTabs" class="pack-tabs"></div>
       <div id="packStatus" class="muted">Packs load ho rahe hain…</div>
       <div id="packGrid" class="pack-grid"></div>
@@ -712,6 +724,7 @@ function openSheet(r, i){
   $("sheetTitle").textContent = b.text || "Naya button";
   $("sheetSub").textContent = `Row ${r + 1} · button ${i + 1}`;
   $("fText").value = b.text || "";
+  textSelection = {start:$("fText").value.length,end:$("fText").value.length};
   $("fValue").value = b.url || b.webapp || "";
   if (b.cb && READY_ACTIONS.includes(b.cb)){ $("fCbAction").value = b.cb; $("fCbCustom").value = ""; }
   else if (b.cb){ $("fCbAction").value = "__custom__"; $("fCbCustom").value = b.cb; }
@@ -722,7 +735,7 @@ function openSheet(r, i){
   $("sheetWrap").classList.add("open");
   if (directSession) showPackPage(packName, packOffset);
 }
-function closeSheet(){ ++packRequest; stopPackAnimations(); $("sheetWrap").classList.remove("open"); state.editing = null; }
+function closeSheet(){ ++packRequest; clearTimeout(packSearchTimer); stopPackAnimations(); coverObserver?.disconnect(); coverObserver = null; coverPlayers.forEach(p => p.destroy()); coverPlayers = []; $("sheetWrap").classList.remove("open"); state.editing = null; }
 const TYPE_HINTS = {
   url: "<b>🔗 Link khule</b> — user button dabayega to ek <b>link khulega</b> (website, " +
        "Telegram channel, register link).<br>Jaise: <code>https://veergame41.com/#/register?…</code> " +
@@ -880,23 +893,67 @@ async function save(){
 /* ---------------- shared admin pack library (embedded, not a modal) ---------------- */
 let packList = [], packName = "", packOffset = 0, packNext = null, packRequest = 0;
 let packPlayers = [], packVideos = [], packObserver = null;
+let coverPlayers = [], coverObserver = null, packQuery = "", packSearchTimer, packInsertMode = "icon", textSelection = {start:0,end:0};
 function stopPackAnimations(){
   packObserver?.disconnect(); packObserver = null;
   packPlayers.forEach(p => p.destroy()); packPlayers = [];
   packVideos.forEach(v => {v.pause(); v.removeAttribute("src"); v.load();}); packVideos = [];
 }
 function renderPackTabs(){
+  coverPlayers.forEach(p => p.destroy()); coverPlayers = [];
+  coverObserver?.disconnect(); coverObserver = null;
   const tabs = $("packTabs"); tabs.innerHTML = "";
-  const query = ($("packSearch").value || "").toLowerCase();
-  for (const p of packList.filter(p => (p.title+" "+p.name).toLowerCase().includes(query))){
+  if (typeof IntersectionObserver !== "undefined") coverObserver = new IntersectionObserver(entries => {
+    for (const e of entries) if(e.isIntersecting) {e.target._loadCover?.(); e.target._loadCover = null; coverObserver?.unobserve(e.target);}
+  }, {root:tabs, rootMargin:"80px"});
+  for (const p of packList){
     const b = document.createElement("button"); b.type = "button";
-    b.textContent = `${p.title} (${p.count})`;
-    b.className = p.name === packName ? "on" : "";
-    b.onclick = () => showPackPage(p.name, 0);
+    b.title = `${p.title} · ${p.count} emoji`;
+    b.setAttribute?.("aria-label", b.title);
+    b.textContent = p.cover?.char || "😀";
+    b.className = !packQuery && p.name === packName ? "on" : "";
+    b.onclick = () => {$("packSearch").value = ""; packQuery = ""; clearTimeout(packSearchTimer); showPackPage(p.name, 0);};
     tabs.appendChild(b);
+    b._loadCover = () => {
+    const c = p.cover;
+    if (c?.kind === "image"){
+      const img = document.createElement("img"); img.src = c.src; img.alt = p.title; img.loading = "lazy"; b.appendChild(img);
+    } else if (c?.kind === "lottie" && window.lottie){
+      const box = document.createElement("div"); box.className = "cover-anim"; b.appendChild(box);
+      const player = window.lottie.loadAnimation({container:box,renderer:"svg",autoplay:false,loop:false,path:c.src});
+      player.addEventListener("DOMLoaded", () => {if(b.firstChild?.nodeType === 3) b.firstChild.textContent = "";});
+      coverPlayers.push(player);
+    } else if (c?.kind === "video"){
+      const v = document.createElement("video"); v.src = c.src; v.muted = true; v.playsInline = true; v.preload = "metadata"; b.appendChild(v);
+    }
+    };
+    if(coverObserver) coverObserver.observe(b); else b._loadCover();
   }
 }
+function rememberTextSelection(){
+  const input = $("fText");
+  textSelection = {start:input.selectionStart ?? input.value.length,end:input.selectionEnd ?? input.value.length};
+}
+function setPackInsertMode(mode){
+  packInsertMode = mode;
+  $("packModeIcon").classList.toggle("on", mode === "icon");
+  $("packModeText").classList.toggle("on", mode === "text");
+  $("packInsertHint").textContent = mode === "text"
+    ? "Naam me cursor rakho, phir emoji tap karo. Yahan normal emoji insert hoga — animated premium nahi."
+    : "Premium animated icon button ke aage fixed rahega. Ek button par ek premium icon.";
+}
 function choosePackEmoji(item){
+  if (packInsertMode === "text"){
+    const input = $("fText"), value = input.value || "";
+    const start = Math.min(textSelection.start, value.length), end = Math.min(textSelection.end, value.length);
+    const next = value.slice(0,start) + item.char + value.slice(end);
+    if (next.length > 64) {toast("Button naam 64 characters se chhota rakho", true); return;}
+    input.value = next;
+    textSelection = {start:start+item.char.length,end:start+item.char.length};
+    input.setSelectionRange?.(textSelection.start,textSelection.end);
+    toast("Naam me emoji insert hua — Apply dabao");
+    return;
+  }
   state.pickEmoji = {char:item.char, id:String(item.id)};
   refreshEmojiButton();
   $("packGrid").querySelectorAll(".pack-emoji").forEach(el => el.classList.toggle("on", el.dataset.emojiId === String(item.id)));
@@ -910,16 +967,18 @@ async function showPackPage(name, offset = 0){
   const grid = $("packGrid"); grid.innerHTML = "";
   $("packPrev").disabled = true; $("packNext").disabled = true;
   $("packPage").textContent = "";
-  if (!name){ $("packStatus").textContent = "Abhi pack nahi hai. Admin Panel → Emoji Packs se links add karo."; return; }
+  if (!name && !packQuery){ $("packStatus").textContent = "Abhi pack nahi hai. Admin Panel → Emoji Packs se links add karo."; return; }
   $("packStatus").textContent = "Emojis load ho rahe hain…";
   try {
-    const data = await directAPI("/api/packs", {pack:name, offset});
+    const data = await directAPI("/api/packs", {pack:name, offset, query:packQuery});
     if (request !== packRequest || !state.editing) return;
     packNext = data.next;
     $("packPrev").disabled = offset === 0;
     $("packNext").disabled = data.next == null;
     $("packPage").textContent = `Page ${Math.floor(offset/48)+1}`;
-    $("packStatus").textContent = "Emoji tap karo — phir Apply";
+    $("packStatus").textContent = packQuery
+      ? `${data.total || 0} results · ${packQuery}`
+      : `${packList.find(p => p.name === name)?.title || "Emoji"} · ${data.total || 0}`;
     if (typeof IntersectionObserver !== "undefined"){
       packObserver = new IntersectionObserver(entries => entries.forEach(e => {
         const media = e.target._media;
@@ -954,7 +1013,15 @@ async function showPackPage(name, offset = 0){
     }
   } catch(e){ if(request === packRequest) $("packStatus").textContent = e.message || "Pack load nahi hua. Dobara pack tap karo."; }
 }
-$("packSearch").oninput = renderPackTabs;
+$("packSearch").oninput = () => {
+  packQuery = $("packSearch").value.trim(); ++packRequest;
+  clearTimeout(packSearchTimer);
+  packSearchTimer = setTimeout(() => showPackPage(packName, 0), 250);
+};
+$("packSearchClear").onclick = () => {$("packSearch").value = ""; packQuery = ""; clearTimeout(packSearchTimer); showPackPage(packName,0);};
+$("packModeIcon").onclick = () => setPackInsertMode("icon");
+$("packModeText").onclick = () => setPackInsertMode("text");
+for (const event of ["input","select","click","keyup","blur"]) $("fText").addEventListener(event, rememberTextSelection);
 $("packPrev").onclick = () => showPackPage(packName, Math.max(0, packOffset-48));
 $("packNext").onclick = () => {if(packNext != null) showPackPage(packName, packNext);};
 
