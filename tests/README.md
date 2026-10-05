@@ -17,9 +17,7 @@
   **initiate-blocked flow** (soft mark, pending leave-recovery DM, /start par
   auto-delivery, broadcast me hard-drop nahi), **leave-recovery per-channel
   panel** (saare channels - koi 20-cap nahi, pagination, default 🔴 OFF,
-  Sab ON/OFF, one-time all-off migration), **Mini App integration** (web_app
-  button, base64 rows prefill, web_app_data se buttons+text save, expired
-  session handling), **network hiccup throttle**
+  Sab ON/OFF, one-time all-off migration), **network hiccup throttle**
   (ek window me ek hi WARNING) aur **diagnostics** (build tag + bot status +
   /diag report + unreachable reset)
 
@@ -27,7 +25,7 @@
 ```bash
 python3 -m venv /tmp/v
 /tmp/v/bin/pip install "python-telegram-bot[job-queue]" pyflakes
-/tmp/v/bin/python tests/verify_advanced.py     # 253 checks
+/tmp/v/bin/python tests/verify_advanced.py     # 242 checks
 ```
 
 PTB 22.x (naya) aur 21.x (purana) dono par green hona chahiye:
@@ -36,30 +34,11 @@ python3 -m venv /tmp/v21 && /tmp/v21/bin/pip install "python-telegram-bot[job-qu
 /tmp/v21/bin/python tests/verify_advanced.py
 ```
 
-## Direct Mini App transport (r23)
+## Chat button builder (r27)
 
-`/tmp/v/bin/python tests/test_miniapp_direct.py` exercises an actual local HTTP
-server, signed synthetic Telegram initData, the bot asyncio loop, and the fake DB.
-Covers direct Add/Edit buttons, existing-row prefill, premium IDs, save/readback,
-clear-all, cross-user/wrong-bot/tampered/expired auth, malformed rows, deleted
-messages, DB failures, and a static-file allowlist (.env/source cannot be served).
-`node webapp/selftest.mjs` includes direct API ACK/failure/load-failure tests.
-Live Telegram and VPS deployment still require user-side verification.
-
-## Shared emoji packs (r24)
-
-`/tmp/v/bin/python tests/test_emoji_packs.py`: multi-link parsing/deduplication,
-custom-pack type checks, static/video/TGS cache import, refresh/remove, pagination,
-partial failure, external-animation-resource rejection, and admin-only controls.
-`tests/test_miniapp_direct.py` also tests authenticated `/api/packs` listing.
-Frontend selftest covers explicit pack IDs (same Unicode glyph, different IDs),
-serialization, authenticated catalog requests, and embedded layout wiring.
-Actual Telegram downloads and animation playback on devices need a live smoke test.
-
-## r25 regression coverage
-
-Direct transport suite includes missing-user identity, media-group JobQueue and
-broadcast-album job session binding (actor, not managed owner). Pack suite covers
-keyword/glyph search, metadata covers, cross-pack deduplication, and pagination.
-Frontend tests cover insertion before/inside/after a label and replacement of
-selected text while preserving the separate premium icon ID.
+Mini App and its backend were removed at the user's request. The old Add Button /
+Paste Many panel is restored. Add Button now asks name -> link -> color, displaying
+four real button samples: Blue, Green, Red, Default. A per-pending-button nonce
+rejects stale/double color taps. Normal/default style survives storage round trips.
+Tests cover color persistence, premium IDs, old callbacks, explicit default styling,
+and the absence of Mini App launchers. Main bot/userbots share this wizard.

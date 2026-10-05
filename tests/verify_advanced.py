@@ -11,7 +11,6 @@
 """
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -21,8 +20,6 @@ import types
 from contextlib import redirect_stdout
 from datetime import timedelta
 from types import SimpleNamespace
-
-from telegram import InlineKeyboardMarkup
 
 # ---------------------------------------------------------------- psycopg2 stub
 psycopg2 = types.ModuleType("psycopg2")
@@ -663,6 +660,14 @@ def test_button_wizard():
     check("name step consumed", run(A.handle_button_wizard_message(msg, ctx)) is True)
     check("premium icon captured", state["pending"]["icon_id"] == "5000000001", str(state["pending"]))
     run(A.handle_button_wizard_message(FakeMsg("https://t.me/join"), ctx))
+    check("link ke baad color step", state["step"] == "color")
+    choices = A._wizard_kb(state, A.get_button_target(ctx, tid)).to_dict()["inline_keyboard"]
+    check("color: real colored buttons", [choices[0][0].get("style"),choices[0][1].get("style"),choices[1][0].get("style")]
+          == ["primary","success","danger"])
+    check("color: default has no style", "style" not in choices[1][1])
+    check("color: actual label + premium icon", "Join Now" in choices[0][0]["text"] and choices[0][0].get("icon_custom_emoji_id") == "5000000001")
+    green_callback = choices[0][1]["callback_data"]
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, green_callback))
     check("button stored in row 1", len(state["rows"]) == 1 and len(state["rows"][0]) == 1, str(state["rows"]))
 
     run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, f"bwz_same_{tid}"))
@@ -671,6 +676,15 @@ def test_button_wizard():
     run(A.handle_button_wizard_message(FakeMsg("not-a-link"), ctx))
     check("invalid link rejected", state["step"] == "url", str(state.get("step")))
     run(A.handle_button_wizard_message(FakeMsg("https://site.com"), ctx))
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, green_callback))
+    check("old color tap ignored for next button", state["step"] == "color" and len(state["rows"][0]) == 1)
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, f"bwz_done_{tid}"))
+    check("cannot skip pending color using stale Done", state["step"] == "color")
+    run(A.handle_button_wizard_message(FakeMsg("Red please"), ctx))
+    check("typed color does not become another label", state["step"] == "color")
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, f"bwz_color_{tid}_red_{state['color_nonce']}"))
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, green_callback))
+    check("double tap cannot duplicate row", len(state["rows"][0]) == 2)
     check("2 buttons in one row", len(state["rows"][0]) == 2, str(state["rows"]))
 
     qd = FakeQuery(ctx)
@@ -679,6 +693,19 @@ def test_button_wizard():
     check("buttons saved to DB", len(saved) == 1 and len(saved[0]) == 2, str(saved))
     check("premium icon persisted", saved[0][0]["icon_id"] == "5000000001", str(saved))
     check("wizard state cleared", A.BUTTON_WIZARD_KEY not in ctx.user_data)
+    check("chosen green/red persist in DB", [b["style"] for b in saved[0]] == ["success","danger"])
+    markup = A.markup_from_rows(saved).to_dict()["inline_keyboard"]
+    check("saved markup uses chosen colors", [b.get("style") for b in markup[0]] == ["success","danger"])
+    for style in (None, "primary", "success", "danger"):
+        original = [[{"text":"Test", "url":"https://t.me/test", "style":style}]]
+        restored = A.rows_from_buttons_json(A.rows_to_buttons_json(original))
+        check(f"style roundtrip: {style}", restored[0][0]["style"] == style)
+        check(f"render style: {style}", A.markup_from_rows(restored).to_dict()["inline_keyboard"][0][0].get("style") == style)
+    panel = A.button_builder_row(FakeCtx(), {"kind":"draft_admin"})
+    check("old Add Button + Paste Many restored", len(panel) == 2 and all(b.web_app is None for b in panel))
+    source = open(A.__file__, encoding="utf-8").read()
+    check("Mini App backend removed", "miniapp_bridge" not in source and "WEBAPP_API_URL" not in source)
+
 
     # bulk paste mode
     ctx2 = FakeCtx()
@@ -1694,189 +1721,6 @@ def _lr_kb(q):
     return (q.edits[-1][1] or {}).get("reply_markup")
 
 
-def _mini_app_btn(markup):
-    """markup ke andar 🌐 Mini App wala (web_app) button dhoondo -> {"text","url"}."""
-    for row in markup.to_dict().get("inline_keyboard", []):
-        for b in row:
-            if b.get("web_app"):
-                return {"text": b.get("text", ""), "url": (b["web_app"] or {}).get("url", "")}
-    return None
-
-
-def _decode_rows_param(url):
-    qs = dict(p.split("=", 1) for p in url.split("?", 1)[1].split("&"))
-    import base64 as _b64
-    from urllib.parse import unquote
-    return json.loads(_b64.b64decode(unquote(qs["rows"])).decode("utf-8"))
-
-
-def test_mini_app_integration():
-    print("\n[19] Mini App integration (button + web_app_data save)")
-    import base64 as _b64
-    from urllib.parse import unquote, urlparse, parse_qs
-
-    # --- WEBAPP_URL set nahi -> purana wizard hi chalta hai (Mini App tab nahi)
-    old_url = A.WEBAPP_URL
-    try:
-        A.WEBAPP_URL = ""
-        ctx0 = FakeCtx()
-        ctx0.user_data.clear()
-        row0 = A.button_builder_row(ctx0, {"kind": "draft_admin"})
-        check("mini app: URL na hone par tab nahi",
-              _mini_app_btn(InlineKeyboardMarkup([row0])) is None and len(row0) == 1, str(len(row0)))
-
-        # --- WEBAPP_URL set -> 3 buttons, mini app URL me tid/kind/rows
-        A.WEBAPP_URL = "https://example.github.io/advanced"
-        ctx = FakeCtx()
-        ctx.user_data.clear()
-        target = {"kind": "draft_admin", "tid": "x"}
-        row = A.button_builder_row(ctx, target)
-        check("mini app: no separate Mini App or Paste Many tab", len(row) == 1, str(len(row)))
-        check("mini app: legacy fallback only without backend", row[0].callback_data.startswith("bwz_start_"))
-        sent = []
-        async def capture_send(**kwargs):
-            sent.append(kwargs)
-        async def capture_edit(*args, **kwargs):
-            pass
-        old_edit = A.safe_edit_message_text
-        old_bot = ctx.bot
-        try:
-            ctx.bot = SimpleNamespace(send_message=capture_send)
-            A.safe_edit_message_text = capture_edit
-            q = SimpleNamespace(from_user=SimpleNamespace(id=999))
-            run(A.handle_button_wizard_callback(q, ctx, row[0].callback_data))
-            check("Add Button: reply keyboard launches Mini App", bool(sent) and
-                  bool(sent[0]["reply_markup"].keyboard[0][0].web_app))
-        finally:
-            ctx.bot = old_bot
-            A.safe_edit_message_text = old_edit
-        mini = _mini_app_btn(InlineKeyboardMarkup([[A.mini_app_button(ctx, target)]]))
-        check("mini app: web_app button bana", mini is not None, str([b.text for b in row]))
-        check("mini app: label 'Mini App'", mini and mini["text"].endswith("Mini App"), str(mini and mini["text"]))
-        url = mini["url"] if mini else ""
-        check("mini app: https + sahi base", url.startswith("https://example.github.io/advanced?"), url[:60])
-        qs = parse_qs(urlparse(url).query)
-        check("mini app: tid URL me hai", "tid" in qs and qs["tid"][0], str(qs.get("tid")))
-        check("mini app: kind URL me hai", qs.get("kind", [""])[0] == "draft_admin", str(qs.get("kind")))
-        check("mini app: rows (base64) URL me hai", "rows" in qs, str(list(qs)[:6]))
-        rows_in_url = json.loads(_b64.b64decode(unquote(qs["rows"][0])).decode("utf-8"))
-        check("mini app: rows decode hote hain (khaali list)", rows_in_url == [], str(rows_in_url))
-        # registered tid se target milta hai (save isi se hoga)
-        tid = qs["tid"][0]
-        check("mini app: tid se target milta hai", bool(A.get_button_target(ctx, tid)), tid)
-
-        # --- purane buttons URL me prefill hote hain
-        ctx2 = FakeCtx()
-        ctx2.user_data.clear()
-        A.db.leave = {"messages": [{"text": "Hi", "buttons_json":
-                      json.dumps([[{"text": "Old", "url": "https://t.me/old", "style": "success"}]])}],
-                      "enabled": True, "target_channel_id": -100999}
-        row2 = [A.mini_app_button(ctx2, {"kind": "leave_msg", "idx": 0})]
-        mini2 = _mini_app_btn(InlineKeyboardMarkup([row2]))
-        rows2 = _decode_rows_param(mini2["url"])
-        check("mini app: purane buttons prefill hote hain",
-              rows2 and rows2[0][0]["text"] == "Old" and rows2[0][0]["url"] == "https://t.me/old",
-              str(rows2))
-
-        # --- URL bahut lamba na ho (rows+text bade hone par bhi)
-        ctx3 = FakeCtx()
-        ctx3.user_data.clear()
-        ctx3.user_data["admin_broadcast_draft"] = {"text": "X" * 900, "buttons_json": "[]"}
-        big_rows = []
-        for i in range(12):
-            big_rows.append([{"text": f"Button number {i} with a long name", "url": "https://t.me/some/very/long/link/here"}])
-        A.db.leave = {"messages": [{"text": "T" * 800, "buttons_json": json.dumps(big_rows)}],
-                      "enabled": True, "target_channel_id": -100999}
-        row3 = [A.mini_app_button(ctx3, {"kind": "leave_msg", "idx": 0})]
-        mini3 = _mini_app_btn(InlineKeyboardMarkup([row3]))
-        check("mini app: lamba data ho to bhi URL limit ke andar",
-              mini3 is not None and len(mini3["url"]) <= A.MINI_APP_URL_MAX + 40, str(len(mini3["url"] if mini3 else "")))
-
-        # --- SAVE: web_app_data -> buttons draft me save + confirm reply
-        ctx4 = FakeCtx()
-        ctx4.user_data.clear()
-        ctx4.user_data["admin_broadcast_draft"] = {"text": "purana", "buttons_json": "[]", "album": None}
-        tid4 = A.register_button_target(ctx4, {"kind": "draft_admin"})
-        payload = {"action": "save_buttons", "tid": tid4, "text": "Mini App se aaya message",
-                   "rows": [[{"text": "Register", "url": "https://t.me/reg", "style": "success", "icon_char": "🔗"}],
-                            [{"text": "Live Chat", "cb": "live_chat_support", "style": "primary"}]]}
-        msg = FakeMsg(chat_id=A.ADMIN_USER_ID)
-        msg.web_app_data = SimpleNamespace(data=json.dumps(payload))
-        handled = run(A.process_web_app_buttons(_fake_update(msg=msg, uid=A.ADMIN_USER_ID), ctx4))
-        check("mini app save: update handle hua", handled is True)
-        draft = ctx4.user_data.get("admin_broadcast_draft") or {}
-        saved = A.rows_from_buttons_json(draft.get("buttons_json"))
-        check("mini app save: buttons draft me save", len(saved) == 2 and saved[0][0]["text"] == "Register",
-              str(saved))
-        check("mini app save: text bhi save", draft.get("text") == "Mini App se aaya message", str(draft.get("text")))
-        check("mini app save: callback button bhi save", saved[1][0]["cb"] == "live_chat_support", str(saved[1]))
-        check("mini app save: confirm reply gaya (buttons preview ke saath)",
-              any("save ho gaye" in (t or "") for t, _ in msg.replies), str([t[:50] for t, _ in msg.replies]))
-        check("mini app save: reply me preview markup", any(
-            kw.get("reply_markup") for _, kw in msg.replies), str(msg.replies[:1])[:120])
-
-        # --- leave message ke liye save (text + buttons dono)
-        A.db.leave = {"enabled": True, "target_channel_id": -100999,
-                      "messages": [{"text": "old text", "buttons_json": "[]"}]}
-        ctx5 = FakeCtx()
-        ctx5.user_data.clear()
-        tid5 = A.register_button_target(ctx5, {"kind": "leave_msg", "idx": 0})
-        msg5 = FakeMsg(chat_id=A.ADMIN_USER_ID)
-        msg5.web_app_data = SimpleNamespace(data=json.dumps(
-            {"tid": tid5, "text": "naya text", "rows": [[{"text": "Join", "url": "https://t.me/j"}]]}))
-        run(A.process_web_app_buttons(_fake_update(msg=msg5, uid=A.ADMIN_USER_ID), ctx5))
-        check("mini app save: leave message text update", A.db.leave["messages"][0]["text"] == "naya text",
-              str(A.db.leave["messages"][0]))
-        check("mini app save: leave message buttons update",
-              A.rows_from_buttons_json(A.db.leave["messages"][0]["buttons_json"])[0][0]["text"] == "Join",
-              str(A.db.leave["messages"][0]["buttons_json"]))
-
-        # Saved message and album: persistence, not just a preview reply.
-        for kind, ids in (("message", [810]), ("messages", [811, 812])):
-            target = {"kind": kind, "msg_id": ids[0], "msg_ids": ids}
-            c = FakeCtx()
-            c.user_data.clear()
-            session = A.register_button_target(c, target)
-            for mid in ids:
-                A.db.messages[mid] = {"id": mid, "buttons_json": "[]"}
-            m = FakeMsg(chat_id=A.ADMIN_USER_ID)
-            m.web_app_data = SimpleNamespace(data=json.dumps({
-                "target": {"id": session}, "rows": payload["rows"]}))
-            run(A.process_web_app_buttons(_fake_update(msg=m, uid=A.ADMIN_USER_ID), c))
-            check(f"mini app SAVE: {kind} DB me attached",
-                  all(A.rows_from_buttons_json(A.db.messages[mid]["buttons_json"])[0][0]["url"]
-                      == "https://t.me/reg" for mid in ids))
-        check("mini app SAVE: broadcast Send button available after save", any(
-            "bcast_send" in str(kw.get("reply_markup")) for _, kw in msg.replies))
-
-        # --- purana/expired tid -> saaf error, koi crash nahi
-        ctx6 = FakeCtx()
-        ctx6.user_data.clear()
-        msg6 = FakeMsg(chat_id=A.ADMIN_USER_ID)
-        msg6.web_app_data = SimpleNamespace(data=json.dumps({"tid": "999999", "rows": [[{"text": "X", "url": "https://t.me/x"}]]}))
-        handled6 = run(A.process_web_app_buttons(_fake_update(msg=msg6, uid=A.ADMIN_USER_ID), ctx6))
-        check("mini app save: expired session par handle + error reply",
-              handled6 is True and any("purana" in (t or "") for t, _ in msg6.replies),
-              str([t[:60] for t, _ in msg6.replies]))
-
-        # --- web_app_data na ho to kuch na kare (aam messages waisa hi chalein)
-        msg7 = FakeMsg(text="hello")
-        check("mini app: aam message par False", run(A.process_web_app_buttons(
-            _fake_update(msg=msg7, uid=1), FakeCtx())) is False)
-
-        # --- wiring: dono handlers me hook laga hai
-        source = open(A.__file__, encoding="utf-8").read()
-        check("wiring: main bot handle_message me hook",
-              source.count("await process_web_app_buttons(update, context)") >= 2, "2 hooks chahiye")
-        check("wiring: WEBAPP_URL env se aata hai", 'os.getenv("WEBAPP_URL"' in source)
-        check("wiring: start_now readymade action bhi handle hota hai",
-              'data == "start_now"' in source)
-        check("env example: WEBAPP_URL documented", "WEBAPP_URL" in open(
-            os.path.join(os.path.dirname(A.__file__), ".env.example"), encoding="utf-8").read())
-    finally:
-        A.WEBAPP_URL = old_url
-
-
 def test_leave_recovery_channels_panel():
     print("\n[18] leave recovery: saare channels + default OFF + Sab ON/OFF")
     # 25 channels (2 bots) - pehle panel sirf pehle 20 dikhata tha
@@ -2027,7 +1871,6 @@ def main():
     test_subscription_picker_and_style_memory()
     test_initiate_blocked_flow()
     test_leave_recovery_channels_panel()
-    test_mini_app_integration()
     test_network_hiccup_throttle()
     test_diagnostics()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")

@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import json
 import time
@@ -9,7 +8,6 @@ import inspect
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from functools import wraps
-from urllib.parse import quote
 
 from telegram import (
     Update,
@@ -308,7 +306,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-10-05-r25"
+BUILD_TAG = "2026-10-05-r27"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -789,34 +787,9 @@ def admin_kb() -> InlineKeyboardMarkup:
         [btn("Default First Message", "admin_default_first_msg", "primary", "💬")],
         [btn("Broadcast", "admin_broadcast", "success", "✈️"),
          btn("Send Reminders", "admin_send_reminders", "primary", "🔔")],
-        [btn("Emoji Packs", "admin_epacks", "primary", "😀")],
         [btn("Diagnostics", "admin_diag", "primary", "🩺")],
         [btn("Main Menu", "main_menu", "primary", "🔙")],
     ])
-
-def emoji_pack_panel(context, page=0):
-    import secrets
-    import emoji_packs
-    packs = list(emoji_packs.catalog(db).values())
-    page = max(0, min(page, max(0, (len(packs)-1)//8)))
-    rows = [[btn("Add Pack Links", "admin_epadd", "success", "➕")]]
-    mapping = {}
-    for pack in packs[page*8:page*8+8]:
-        key = secrets.token_hex(6)
-        mapping[key] = pack['name']
-        rows.append([btn(f"Remove: {pack['title'][:30]} ({len(pack['items'])})",
-                         f"admin_epdel_{key}", "danger", "🗑")])
-    context.user_data['emoji_pack_delete'] = mapping
-    nav = []
-    if page: nav.append(btn("Prev", f"admin_epage_{page-1}", "primary", "⬅️"))
-    if (page+1)*8 < len(packs): nav.append(btn("Next", f"admin_epage_{page+1}", "primary", "➡️"))
-    if nav: rows.append(nav)
-    rows.append([btn("Back", "admin_panel", "primary", "🔙")])
-    return (f"😀 Emoji Packs: {len(packs)} packs / {sum(len(p['items']) for p in packs)} emojis\n"
-            f"Page {page+1} — sabhi Mini App users ke liye.\n"
-            "Add Pack Links se multiple links bhejo. Same link dobara bhejne se pack refresh hoga.",
-            InlineKeyboardMarkup(rows))
-
 
 def verification_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[btn("Verify Now", "human_verify", "success", "✅")]])
@@ -2185,6 +2158,8 @@ def rows_to_buttons_json(rows: Optional[List[List[dict]]]) -> Optional[str]:
                 item["icon_char"] = icon_char
             if b.get("style") in STYLE_VALUES:
                 item["style"] = b["style"]
+            elif "style" in b and b["style"] is None:
+                item["style"] = None
             clean_row.append(item)
         if clean_row:
             cleaned.append(clean_row)
@@ -2220,7 +2195,7 @@ def rows_from_buttons_json(buttons_json) -> List[List[dict]]:
                 "cb": b.get("cb") or b.get("callback_data"),
                 "icon_id": str(b.get("icon_id")) if b.get("icon_id") else None,
                 "icon_char": b.get("icon_char") or emoji_char_for_id(b.get("icon_id")),
-                "style": b.get("style") if b.get("style") in STYLE_VALUES else "primary",
+                "style": b.get("style") if b.get("style") in STYLE_VALUES or ("style" in b and b["style"] is None) else "primary",
             }
             if item["url"] or item["cb"]:
                 clean_row.append(item)
@@ -2240,7 +2215,7 @@ def markup_from_rows(rows: Optional[List[List[dict]]], use_icons: bool = True):
                 continue
             text = (b.get("text") or "Button")[:64]
             icon_id = b.get("icon_id")
-            style = b.get("style") or "primary"
+            style = b.get("style", "primary")
             if not use_icons:
                 char = b.get("icon_char") or emoji_char_for_id(icon_id)
                 if char and char not in text:
@@ -2299,13 +2274,6 @@ def add_callback_button_to_json(buttons_json, text: str, cb: str, url: Optional[
 # The old "Label|link" bulk syntax stays available as "📄 Paste Many".
 BUTTON_WIZARD_KEY = "button_wizard"
 BUTTON_TARGET_KEY = "button_targets"
-# Mini App (webapp/index.html) ka https URL - .env me WEBAPP_URL=https://... set karo.
-# Set na ho to sirf purana wizard chalta hai (➕ Add Button / 📄 Paste Many).
-WEBAPP_API_URL = os.getenv("WEBAPP_API_URL", "").strip().rstrip("/")
-WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8110"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
-# Telegram URL ki limit ke andar rehne ke liye (rows/text prefill ki wajah se lamba na ho)
-MINI_APP_URL_MAX = 1900
 BUTTON_TARGET_TTL = 6 * 3600
 
 
@@ -2340,240 +2308,10 @@ def get_button_target(context, tid) -> Optional[dict]:
 
 
 def button_builder_row(context, target: dict) -> List[InlineKeyboardButton]:
-    """One direct Add/Edit web_app button when the authenticated backend is enabled.
-
-    Without WEBAPP_API_URL, preserve the legacy launcher for old installations.
-    """
+    """One row callers can drop into any keyboard: ➕ Add Button | 📄 Paste Many."""
     tid = register_button_target(context, target)
-    if WEBAPP_API_URL.startswith("https://") and getattr(context, "_user_id", None):
-        return [direct_mini_app_button(context, target, tid)]
-    # Legacy installation: no separate Mini App tab. Configure the direct backend.
-    return [btn("Add Button", f"bwz_start_{tid}", "success", "➕")]
-
-
-def direct_mini_app_button(context, target, tid):
-    from telegram import WebAppInfo
-    import miniapp_bridge
-
-    async def load(_data):
-        if not get_button_target(context, tid):
-            raise ValueError("Session expire ho gaya. Panel dobara kholo.")
-        return {"rows": json.loads(rows_to_buttons_json(target_rows(context, target)) or "[]"),
-                "text": _mini_app_text_payload(context, target), "label": _target_title(target)}
-
-    async def save(data):
-        if not get_button_target(context, tid):
-            raise ValueError("Session expire ho gaya. Panel dobara kholo.")
-        rows = data.get("rows")
-        if not isinstance(rows, list) or len(rows) > 100:
-            raise ValueError("Buttons ka format galat hai.")
-        for row in rows:
-            if not isinstance(row, list) or len(row) > 8:
-                raise ValueError("Ek row me maximum 8 buttons hain.")
-            for item in row:
-                if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item['text'].strip():
-                    raise ValueError("Button ka naam chahiye.")
-                url, cb = item.get('url'), item.get('cb') or item.get('callback_data')
-                if bool(url) == bool(cb):
-                    raise ValueError("Button me ek link ya action chahiye.")
-                if url and (not isinstance(url, str) or not url.startswith(('https://', 'http://', 'tg://'))):
-                    raise ValueError("Button link galat hai.")
-                if cb and (not isinstance(cb, str) or len(cb.encode()) > 64):
-                    raise ValueError("Bot action bahut lamba hai.")
-        rows = rows_from_buttons_json(json.dumps(rows))
-        mids = ([target.get('msg_id')] if target.get('kind') == 'message' else
-                target.get('msg_ids', []) if target.get('kind') == 'messages' else [])
-        if any(not db.get_message_by_id(mid) for mid in mids):
-            raise ValueError("Message delete ho gaya. Naya panel kholo.")
-        if not target_save_rows(context, target, rows):
-            raise ValueError("Buttons save nahi hue. Dobara try karo.")
-        # Verify persistence before telling the frontend to close.
-        if rows_to_buttons_json(target_rows(context, target)) != rows_to_buttons_json(rows):
-            raise ValueError("Save verify nahi hua. Dobara try karo.")
-        context.user_data.pop(BUTTON_WIZARD_KEY, None)
-        try:
-            await context.bot.send_message(chat_id=context._user_id,
-                text="✅ Buttons save hokar message/configuration me lag gaye.",
-                reply_markup=markup_from_rows(rows))
-            nav = target_nav_rows(target)
-            if nav:
-                await context.bot.send_message(chat_id=context._user_id, text="Aage ka option:",
-                                               reply_markup=InlineKeyboardMarkup(nav))
-        except Exception as ex:
-            logging.warning(f"Mini App saved, confirmation delivery failed: {mask_secrets(ex)}")
-        return {"saved": True}
-
-    async def packs(data):
-        import emoji_packs
-        return emoji_packs.page(db, data)
-
-    session = miniapp_bridge.register(context.bot.token, context._user_id, load, save, packs)
-    label = "Edit Buttons" if target_rows(context, target) else "Add Button"
-    return InlineKeyboardButton(label, web_app=WebAppInfo(url=f"{WEBAPP_API_URL}/?session={session}"))
-
-
-def _mini_app_rows_payload(context, target: dict) -> str:
-    """Mini App ko bhejne ke liye current buttons (base64 JSON) - taaki edit kar sake."""
-    try:
-        payload = rows_to_buttons_json(target_rows(context, target)) or "[]"
-    except Exception:
-        payload = "[]"
-    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
-
-
-def _mini_app_text_payload(context, target: dict) -> str:
-    """Mini App me message box prefill karne ke liye (jitna possible ho)."""
-    kind = target.get("kind")
-    try:
-        if kind in ("draft_user", "draft_admin"):
-            return str(_draft_for_target(context, target).get("text") or "")
-        if kind == "leave_msg":
-            messages = db.get_leave_recovery_config().get("messages", [])
-            idx = int(target.get("idx", 0))
-            if 0 <= idx < len(messages):
-                return str(messages[idx].get("text") or "")
-        if kind in ("message", "messages"):
-            mid = target.get("msg_id") or (target.get("msg_ids") or [None])[0]
-            row = db.get_message_by_id(mid) if mid else None
-            return str((row or {}).get("content_text") or "")
-    except Exception:
-        pass
-    return ""
-
-
-def mini_app_button(context, target: dict, tid: Optional[str] = None) -> Optional[InlineKeyboardButton]:
-    """`🌐 Mini App` button (web_app) - yaad rakho: HTTPS URL hi chalta hai.
-
-    URL me tid (target), existing buttons (rows) aur text prefill jate hain, isliye
-    Mini App kholte hi client ke purane buttons edit ke liye ready hote hain. URL bahut
-    lamba na ho jaye isliye text/rows ko zarurat par drop kar diya jata hai.
-    """
-    if not WEBAPP_URL or not isinstance(WEBAPP_URL, str) or not WEBAPP_URL.startswith("https://"):
-        return None
-    try:
-        from telegram import WebAppInfo
-    except Exception:
-        return None
-    tid = tid or register_button_target(context, target)
-    kind = str(target.get("kind") or "")
-    base = f"{WEBAPP_URL}?tid={tid}&kind={kind}&launch=keyboard"
-    label = ""
-    try:
-        label = str(_target_title(target) or "")
-    except Exception:
-        pass
-    if label:
-        base += f"&label={quote(label[:40])}"
-    text = _mini_app_text_payload(context, target)
-    if text:
-        base += f"&text={quote(text[:300])}"
-    with_rows = base + f"&rows={quote(_mini_app_rows_payload(context, target))}"
-    url = with_rows if len(with_rows) <= MINI_APP_URL_MAX else base
-    if len(url) > MINI_APP_URL_MAX:      # text bhi bohat lamba - wo bhi chhod do
-        url = f"{WEBAPP_URL}?tid={tid}&kind={kind}&launch=keyboard"
-    try:
-        return InlineKeyboardButton("Mini App", web_app=WebAppInfo(url=url))
-    except Exception as ex:
-        logging.debug(f"mini app button skip: {mask_secrets(ex)}")
-        return None
-
-
-def apply_mini_app_text(context, target: dict, text: str) -> bool:
-    """Mini App ke message box ka text wahi jagah save karo jahan wizard karta hai."""
-    kind = target.get("kind")
-    if not text:
-        return False
-    if kind in ("draft_user", "draft_admin"):
-        draft = dict(_draft_for_target(context, target))
-        draft["text"] = text
-        key = f"broadcast_draft_{target.get('bot_id')}" if kind == "draft_user" else "admin_broadcast_draft"
-        context.user_data[key] = draft
-        return True
-    if kind == "leave_msg":
-        cfg = db.get_leave_recovery_config()
-        messages = cfg.get("messages", [])
-        idx = int(target.get("idx", 0))
-        if 0 <= idx < len(messages):
-            messages[idx]["text"] = text
-            cfg["messages"] = messages
-            db.set_leave_recovery_config(cfg)
-            return True
-    return False
-
-
-async def process_web_app_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Mini App ka SAVE: `web_app_data` message -> buttons (aur text) wahi save karo.
-
-    Return True = ye update handle ho gaya (aage processing ki zarurat nahi).
-    """
-    msg = getattr(update, "effective_message", None) or getattr(update, "message", None)
-    data = getattr(msg, "web_app_data", None) if msg else None
-    raw = getattr(data, "data", None) if data else None
-    if not raw:
-        return False
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        payload = {}
-    target = None
-    try:
-        tid = (payload.get("target") or {}).get("id") or payload.get("tid")
-        target = get_button_target(context, tid)
-    except Exception:
-        target = None
-    if not target:
-        try:
-            await reply_premium_message(msg,
-                f"{pe('❌')} Ye builder session purana ho gaya.\n"
-                f"Panel me <b>➕ Add Button</b> (ya <b>🌐 Mini App</b>) dobara kholo aur phir save karo.",
-                parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        return True
-    rows = payload.get("rows") or []
-    text = str(payload.get("text") or "").strip()
-    try:
-        ok = target_save_rows(context, target, rows)
-    except Exception as ex:
-        logging.error(f"mini app save fail: {mask_secrets(ex)}")
-        ok = False
-    if not ok:
-        try:
-            await reply_premium_message(msg, f"{pe('❌')} Buttons save nahi ho paye. Dobara try karo.",
-                                        parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        return True
-    if text:
-        try:
-            apply_mini_app_text(context, target, text)
-        except Exception as ex:
-            logging.debug(f"mini app text save skip: {mask_secrets(ex)}")
-    context.user_data.pop(BUTTON_WIZARD_KEY, None)
-    try:
-        from telegram import ReplyKeyboardRemove
-        await reply_premium_message(msg, "✅ Buttons configuration me lag gaye. Neeche preview hai.",
-                                    reply_markup=ReplyKeyboardRemove())
-    except Exception:
-        pass
-    count = button_count(rows_to_buttons_json(rows))
-    logging.info(f"mini app: {count} buttons save hue (target={target.get('kind')})")
-    logging.info(f"mini app layout: {strip_premium_emojis(_wizard_layout(rows))}")
-    try:
-        await reply_premium_message(msg,
-            f"{pe('✅')} <b>Mini App se buttons save ho gaye!</b> ({count})\n\n"
-            f"{_wizard_layout(rows)}",
-            parse_mode=ParseMode.HTML, reply_markup=markup_from_rows(rows))
-    except Exception as ex:
-        logging.warning(f"mini app confirm reply fail: {mask_secrets(ex)}")
-    nav = target_nav_rows(target)
-    if nav:
-        try:
-            await reply_premium_message(msg, "Aage ka option chuno:",
-                                        reply_markup=InlineKeyboardMarkup(nav))
-        except Exception as ex:
-            logging.debug(f"mini app navigation: {mask_secrets(ex)}")
-    return True
+    return [btn("Add Button", f"bwz_start_{tid}", "success", "➕"),
+            btn("Paste Many", f"bwz_bulk_{tid}", "primary", "📄")]
 
 
 def _draft_for_target(context, target: dict) -> dict:
@@ -2713,6 +2451,10 @@ def _wizard_text(state: dict, target: dict) -> str:
         return body + (f"<b>Naam:</b> {EmojiManager._html_escape(name)}\n\n"
                        f"{pe('🔗')} <b>Ab is button ka link bhejo</b>\n"
                        "Example: <code>https://t.me/yourchannel</code>")
+    if step == "color":
+        return body + (f"{pe('🎨')} <b>Button ka color chuno</b>\n\n"
+                       "Neeche aapka button 4 colors me hai — pasand wale par tap karo.\n"
+                       "Uske baad aur buttons add karo ya <b>Save & Done</b> dabao.")
     if step == "bulk":
         return body + (f"{pe('📄')} <b>Bulk mode:</b> ek line me ek button bhejo\n\n"
                        "<code>Join Channel|https://t.me/channel</code>\n"
@@ -2727,6 +2469,17 @@ def _wizard_kb(state: dict, target: dict) -> Optional[InlineKeyboardMarkup]:
     step = state.get("step")
     rows = state.get("rows") or []
     kb: List[List[InlineKeyboardButton]] = []
+    if step == "color":
+        pending = state.get("pending") or {}
+        nonce = state.get("color_nonce", "")
+        options = [("blue", "Blue", "primary"), ("green", "Green", "success"),
+                   ("red", "Red", "danger"), ("default", "Default", None)]
+        choices = [build_button(
+            f"{(pending.get('text') or 'Button')[:45]} · {label}",
+            callback_data=f"bwz_color_{tid}_{key}_{nonce}", style=style,
+            icon_id=pending.get("icon_id")) for key, label, style in options]
+        return InlineKeyboardMarkup([choices[:2], choices[2:],
+            [btn("Cancel", f"bwz_cancel_{tid}", "danger", "❌")]])
     if step in ("name", "url", "bulk"):
         if rows:
             kb.append([btn("Save & Done", f"bwz_done_{tid}", "success", "✅")])
@@ -2802,37 +2555,6 @@ async def handle_button_wizard_callback(q, context, data: str) -> bool:
     parts = data.split("_")
     action = parts[1] if len(parts) > 1 else ""
     tid = parts[2] if len(parts) > 2 else ""
-    if action in ("start", "app"):
-        target = get_button_target(context, tid)
-        mini = mini_app_button(context, target, tid) if target else None
-        if mini is not None:
-            # sendData works only for Mini Apps launched from a reply-keyboard button.
-            from telegram import KeyboardButton, ReplyKeyboardMarkup
-            context.user_data.pop(BUTTON_WIZARD_KEY, None)
-            await context.bot.send_message(
-                chat_id=q.from_user.id,
-                text="🌐 Neeche keyboard me ‘Mini App kholo’ dabao. Buttons banao aur SAVE karo.\n"
-                     "Typing se banana ho to ‘Manual typing’ chuno.",
-                reply_markup=ReplyKeyboardMarkup(
-                    [[KeyboardButton("🌐 Mini App kholo", web_app=mini.web_app)]],
-                    resize_keyboard=True, one_time_keyboard=True))
-            await safe_edit_message_text(q, "🎛 Button Builder — Mini App ready hai.",
-                reply_markup=InlineKeyboardMarkup([
-                    [btn("Manual typing", f"bwz_manual_{tid}", "primary", "✏️")],
-                    [btn("Cancel", f"bwz_close_{tid}", "danger", "❌")]]))
-            return True
-    if action == "close":
-        from telegram import ReplyKeyboardRemove
-        context.user_data.pop(BUTTON_WIZARD_KEY, None)
-        await context.bot.send_message(chat_id=q.from_user.id, text="Builder band kar diya.",
-                                       reply_markup=ReplyKeyboardRemove())
-        return True
-    if action == "manual":
-        from telegram import ReplyKeyboardRemove
-        await context.bot.send_message(chat_id=q.from_user.id, text="✏️ Manual builder",
-                                       reply_markup=ReplyKeyboardRemove())
-        await start_button_wizard(q, context, tid, mode="wizard")
-        return True
     if action in ("start", "bulk"):
         await start_button_wizard(q, context, tid, mode="bulk" if action == "bulk" else "wizard")
         return True
@@ -2845,6 +2567,30 @@ async def handle_button_wizard_callback(q, context, data: str) -> bool:
     if not target:
         context.user_data.pop(BUTTON_WIZARD_KEY, None)
         await safe_edit_message_text(q, f"{pe('❌')} Target session expire ho gaya.", parse_mode=ParseMode.HTML)
+        return True
+    if action == "color":
+        colors = {"blue":"primary", "green":"success", "red":"danger", "default":None}
+        choice = parts[3] if len(parts) > 3 else ""
+        nonce = parts[4] if len(parts) > 4 else ""
+        if (state.get("step") != "color" or not state.get("pending") or
+                choice not in colors or nonce != state.get("color_nonce")):
+            return True  # Ignore old/double taps; never color a different pending button.
+        pending = dict(state["pending"])
+        pending["style"] = colors[choice]
+        rows = state.get("rows") or []
+        if state.get("placement") == "same" and rows and len(rows[-1]) < 8:
+            rows[-1].append(pending)
+        else:
+            rows.append([pending])
+        state["rows"] = rows
+        state["pending"] = None
+        state.pop("color_nonce", None)
+        state["step"] = "next"
+        await _wizard_render(context, state, target, q=q,
+            note=f"{pe('✅')} Button add ho gaya — <b>{choice.title()}</b> color.")
+        return True
+    if state.get("step") == "color" and action != "cancel":
+        await _wizard_render(context, state, target, q=q, note="Pehle neeche se color chuno.")
         return True
     if action in ("same", "row"):
         state["step"] = "name"
@@ -2959,16 +2705,13 @@ async def handle_button_wizard_message(msg, context) -> bool:
         pending = dict(state.get("pending") or {})
         pending["url"] = None if is_cb else url
         pending["cb"] = url[3:].strip() if is_cb else None
-        rows = state.get("rows") or []
-        if state.get("placement") == "same" and rows and len(rows[-1]) < 8:
-            rows[-1].append(pending)
-        else:
-            rows.append([pending])
-        state["rows"] = rows
-        state["pending"] = None
-        state["step"] = "next"
-        await _wizard_render(context, state, target,
-                            note=f"{pe('✅')} <b>{EmojiManager._html_escape(pending.get('text') or '')}</b> add ho gaya!")
+        state["pending"] = pending
+        state["color_nonce"] = os.urandom(4).hex()
+        state["step"] = "color"
+        await _wizard_render(context, state, target)
+        return True
+    if step == "color":
+        await _wizard_render(context, state, target, note="Color ke liye neeche button tap karo.")
         return True
     if step == "bulk":
         new_rows = parse_button_lines(msg.text or msg.caption or "", msg.entities or msg.caption_entities)
@@ -3625,16 +3368,11 @@ class _UserDataContext:
     ("'NoneType' object has no attribute 'pop'") aur broadcast album save hi nahi hota.
     Ab schedule karte waqt asli user_data dict job ke data me jaata hai."""
 
-    __slots__ = ("_wrapped", "_user_data", "_actor_id")
+    __slots__ = ("_wrapped", "_user_data")
 
-    def __init__(self, context, user_data: dict, user_id=None):
+    def __init__(self, context, user_data: dict):
         object.__setattr__(self, "_wrapped", context)
         object.__setattr__(self, "_user_data", user_data)
-        object.__setattr__(self, "_actor_id", user_id or getattr(context, "_user_id", None))
-
-    @property
-    def _user_id(self):
-        return object.__getattribute__(self, "_actor_id")
 
     @property
     def user_data(self) -> dict:
@@ -3644,10 +3382,10 @@ class _UserDataContext:
         return getattr(object.__getattribute__(self, "_wrapped"), item)
 
 
-def _context_with_user_data(context, user_data, user_id=None):
+def _context_with_user_data(context, user_data):
     """Job context (user_data None) ko live user_data ke saath usable banao."""
-    if isinstance(user_data, dict) and (user_id is not None or getattr(context, "user_data", None) is not user_data):
-        return _UserDataContext(context, user_data, user_id)
+    if isinstance(user_data, dict) and getattr(context, "user_data", None) is not user_data:
+        return _UserDataContext(context, user_data)
     return context
 
 
@@ -3724,10 +3462,6 @@ async def handle_public_userbot_callback(update: Update, context: ContextTypes.D
     user = q.from_user
     if data == "live_chat_support":
         await send_premium_message(context.bot, user.id, UIFormatter.live_chat_header(), parse_mode=ParseMode.HTML)
-        return
-    if data == "start_now":
-        # "Bot action" wale buttons ke liye readymade action: welcome/menu dobara bhejo
-        await send_saved_welcome(bot_id, user.id, context, user=user)
 
 
 async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -4001,7 +3735,10 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ])
         await safe_edit_message_text(q,
             f"{pe('🔘')} <b>Edit Inline Buttons</b>\n\n"
-            "<b>Add Button / Edit Buttons</b> dabao → builder me badlav karo → <b>SAVE</b>." ,
+            "<b>Add Button</b> = easy tarika (naam → link → color → same row / new row)\n"
+            "<b>Paste Many</b> = purana format\n"
+            "<code>Button Label|https://link</code>\n"
+            "<code>Label One|https://link1 || Label Two|https://link2</code>",
             parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
@@ -4083,7 +3820,8 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ])
         await safe_edit_message_text(q,
             f"{pe('🔘')} <b>Inline Buttons</b>\n\n"
-            "<b>Add Button / Edit Buttons</b> dabao aur SAVE karo.",
+            "<b>Add Button</b> = easy (naam → link → color → row)\n"
+            "<b>Paste Many</b> = bulk format",
             parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
@@ -4163,7 +3901,7 @@ async def _flush_media_group(bot_id: str, actor_uid: int, managed_uid: int, chat
 async def _flush_media_group_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
     # Job context me user_data None hota hai - captured dict se replace karo
-    ctx = _context_with_user_data(context, data.get("user_data"), data.get("actor_uid"))
+    ctx = _context_with_user_data(context, data.get("user_data"))
     await _flush_media_group(data.get("bot_id"), data.get("actor_uid"), data.get("managed_uid"),
                              data.get("chat_id"), ctx, data.get("media_group_id"))
 
@@ -4175,10 +3913,6 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
     uid = user.id
     msg = update.message
     if not msg:
-        return
-
-    # Mini App se aaye buttons (client ke apne bot me) -> wahi save karo
-    if await process_web_app_buttons(update, context):
         return
 
     # Handle support reply from admin to user
@@ -4453,7 +4187,8 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                                                "back_cb": f"manage_bot_{bot_id}"})
         await reply_premium_message(msg,
             f"{pe('✅')} <b>Message saved!</b>\n\n"
-            f"{pe('🔘')} <b>Add Button</b> dabao → buttons banao → <b>SAVE</b>.",
+            f"{pe('🔘')} Buttons add karne ke liye <b>Add Button</b> dabao (naam → link → color → row), "
+            f"ya <b>Paste Many</b> se purana <code>Label|link</code> format use karo.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
                 builder,
                 [btn("Set More Messages", f"setmsg_more_{bot_id}", "success", "➕")],
@@ -5034,7 +4769,7 @@ def _build_userbot_app(token: str, bot_id: str, owner_id: int):
     app.add_handler(CallbackQueryHandler(lambda u, c: user_bot_callback(u, c, bot_id, owner_id), pattern=f"^(ub_|ubm_|ubmm_|delmsg_|setbtn_|setbtng|setmsg_|bcast_|bwz_|removechan_|back_to_manage_|manage_bot_|toggleauto_|setbtn_addmore_|setbtng_addmore_).*{bot_id}|^main_menu$"))
     app.add_handler(CallbackQueryHandler(lambda u, c: userbot_wizard_callback(u, c, bot_id, owner_id), pattern=r"^bwz_"))
     app.add_handler(CallbackQueryHandler(lambda u, c: handle_set_buttons_callback(u, c, bot_id, owner_id), pattern=f"^setbtn_{bot_id}_"))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA | filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, lambda u, c: handle_user_bot_message(u, c, bot_id, owner_id)))
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
     return app
@@ -5376,7 +5111,6 @@ def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1
     "'NoneType' object has no attribute 'pop'" and the draft was never saved.
     """
     data = dict(data or {})
-    data.setdefault("actor_uid", getattr(context, "_user_id", None))
     if not isinstance(data.get("user_data"), dict):
         user_data = getattr(context, "user_data", None)
         if isinstance(user_data, dict):
@@ -5391,7 +5125,7 @@ def _schedule_broadcast_flush(context, job_key: str, data: dict, when: float = 1
             await asyncio.sleep(when)
             await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
                                         data.get("chat_id"), data.get("media_group_id"),
-                                        user_data=data.get("user_data"), actor_uid=data.get("actor_uid"))
+                                        user_data=data.get("user_data"))
         except Exception as ex:
             logging.error(f"broadcast album flush task failed: {mask_secrets(ex)}")
 
@@ -5438,7 +5172,6 @@ async def collect_broadcast_album(context, scope: str, bot_id: Optional[str], ms
                 pass
     _schedule_broadcast_flush(context, job_key,
                               {"scope": scope, "bot_id": bot_id, "chat_id": msg.chat_id,
-                               "actor_uid": getattr(getattr(msg, "from_user", None), "id", None) or getattr(context, "_user_id", None),
                                "media_group_id": media_group_id})
     return True
 
@@ -5447,12 +5180,12 @@ async def _flush_broadcast_album_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
     await flush_broadcast_album(context, data.get("scope"), data.get("bot_id"),
                                 data.get("chat_id"), data.get("media_group_id"),
-                                user_data=data.get("user_data"), actor_uid=data.get("actor_uid"))
+                                user_data=data.get("user_data"))
 
 
 async def flush_broadcast_album(context, scope: str, bot_id: Optional[str],
-                                chat_id, media_group_id, user_data: Optional[dict] = None, actor_uid=None):
-    ctx = _context_with_user_data(context, user_data, actor_uid)
+                                chat_id, media_group_id, user_data: Optional[dict] = None):
+    ctx = _context_with_user_data(context, user_data)
     user_data = getattr(ctx, "user_data", None)
     if not isinstance(user_data, dict):
         logging.error(f"album flush: user_data available nahi hai (scope={scope}, bot={bot_id})")
@@ -6278,34 +6011,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          parse_mode=ParseMode.HTML, reply_markup=diag_kb())
             return
 
-        if data.startswith("admin_ep"):
-            if not is_admin(uid):
-                await q.answer("Not authorized", show_alert=True)
-                return
-            import emoji_packs
-            if data == "admin_epadd":
-                context.user_data["emoji_pack_links"] = True
-                await safe_edit_message_text(q, "😀 Emoji pack links bhejo (har line me ek):\n"
-                    "https://t.me/addemoji/PackName\n\nEk message me 20 links tak. Aur packs agle message me bhej sakte ho.\n"
-                    "Ye packs sabhi clients ke Mini App me dikhenge.",
-                    reply_markup=InlineKeyboardMarkup([[btn("Cancel", "admin_epacks", "danger", "❌")]]))
-                return
-            context.user_data.pop("emoji_pack_links", None)
-            if data.startswith("admin_epdel_"):
-                # Short opaque index stored per admin; never put pack names in 64-byte callbacks.
-                name = context.user_data.get("emoji_pack_delete", {}).get(data.removeprefix("admin_epdel_"))
-                if name:
-                    await emoji_packs.remove_pack(db, name)
-            page = int(data.removeprefix("admin_epage_")) if data.startswith("admin_epage_") else 0
-            text, markup = emoji_pack_panel(context, page)
-            await safe_edit_message_text(q, text, reply_markup=markup)
-            return
-
         if data == "admin_panel":
             if not is_admin(uid):
                 await safe_edit_message_text(q, f"{pe('❌')} Not authorized", parse_mode=ParseMode.HTML)
                 return
-            context.user_data.pop("emoji_pack_links", None)
             # leaving the panel drops any half-finished broadcast (avoids a stale draft)
             for stale_key in ("admin_broadcast", "admin_broadcast_stage", "admin_broadcast_draft",
                               "admin_bcast_selected", "admin_broadcast_target"):
@@ -6544,7 +6253,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             await safe_edit_message_text(q,
                 f"<blockquote>{pp('🔘')} <b>BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
-                "<b>Add Button / Edit Buttons</b> dabao aur SAVE karo.",
+                "<b>Add Button</b> = easy tarika (naam → link → color → same row / new row)\n"
+                "<b>Paste Many</b> = bulk format (premium emoji supported)\n"
+                "<code>Button Label|https://link</code>\n"
+                "<code>Label1|https://url1 || Label2|https://url2</code>",
                 parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
@@ -7015,35 +6727,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # Mini App (webapp/index.html) ne buttons save kiye? -> sabse pehle wahi handle karo
-    if await process_web_app_buttons(update, context):
-        return
-
-    if context.user_data.get("emoji_pack_links") and is_admin(user.id):
-        import emoji_packs
-        names = emoji_packs.names_from_text(msg.text or "")
-        if not names or len(names) > 20:
-            await reply_premium_message(msg, "1–20 valid t.me/addemoji/... links bhejo, har line me ek.")
-            return
-        if context.user_data.get("emoji_pack_busy"):
-            await reply_premium_message(msg, "Pehla import chal raha hai. Complete hone do.")
-            return
-        context.user_data["emoji_pack_busy"] = True
-        try:
-            await reply_premium_message(msg, f"⏳ {len(names)} packs download ho rahe hain…")
-            for name in names:
-                try:
-                    count = await emoji_packs.add_pack(db, context.bot, name)
-                    await reply_premium_message(msg, f"✅ {name}: {count} emojis add/update hue.")
-                except Exception:
-                    # Telegram exceptions can contain bot file URLs; do not echo them.
-                    await reply_premium_message(msg, f"❌ {name}: import nahi hua. Emoji-pack link check karke dobara bhejo.")
-            await reply_premium_message(msg, "Aur links bhej sakte ho. Mini App dobara kholne par packs dikhenge.",
-                reply_markup=InlineKeyboardMarkup([[btn("Done / Packs", "admin_epacks", "success", "✅")]]))
-        finally:
-            context.user_data.pop("emoji_pack_busy", None)
-        return
-
     # Easy button builder (➕ Add Button wizard) has priority over everything else
     if await handle_button_wizard_message(msg, context):
         return
@@ -7397,9 +7080,6 @@ async def start_bots_on_boot():
 
 
 async def main():
-    if WEBAPP_API_URL.startswith("https://"):
-        import miniapp_bridge
-        miniapp_bridge.start(WEBAPP_PORT)
     logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
     install_log_masking()
     if install_force_ipv4():
@@ -7458,7 +7138,7 @@ async def main():
     app.add_handler(CommandHandler("proof", proof_text_command))
     app.add_handler(CommandHandler("prooftext", proof_text_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA | filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.Sticker.ALL, handle_message))
     app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(subscription_reminder_job, interval=43200, first=60, name="subscription_reminders")
