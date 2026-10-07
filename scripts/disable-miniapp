@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Retire only the Quick Tunnel created by scripts/enable-miniapp.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 - <<'PY'
+import os
+from pathlib import Path
+import signal
+import stat
+p = Path('.env')
+if p.exists():
+    mode = stat.S_IMODE(p.stat().st_mode)
+    lines = p.read_text().splitlines()
+    keys = {'WEBAPP_URL', 'WEBAPP_API_URL', 'WEBAPP_PORT'}
+    kept = [line for line in lines if line.split('=',1)[0].strip().removeprefix('export ').strip() not in keys]
+    p.write_text('\n'.join(kept)+'\n')
+    p.chmod(mode)
+pidfile = Path.home() / '.advanced-miniapp' / 'tunnel.pid'
+if pidfile.exists():
+    pid = pidfile.read_text().strip()
+    try:
+        if not pid.isdigit() or int(pid) <= 1:
+            raise ValueError('invalid PID')
+        cmd = Path('/proc', pid, 'cmdline').read_bytes().replace(b'\0', b' ')
+        if b'cloudflared' in cmd and b'tunnel' in cmd and b'http://127.0.0.1:8110' in cmd:
+            os.kill(int(pid), signal.SIGTERM)
+            pidfile.unlink(missing_ok=True)
+            print('Mini App Quick Tunnel stopped.')
+        else:
+            print('Stored PID is not our Quick Tunnel; left untouched.')
+    except (FileNotFoundError, ProcessLookupError):
+        pidfile.unlink(missing_ok=True)
+    except (ValueError, PermissionError):
+        print('Tunnel PID could not be checked; left untouched.')
+print('Mini App env disabled. Saved messages/buttons and cached packs were not deleted.')
+PY

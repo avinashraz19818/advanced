@@ -359,6 +359,40 @@ class FakeDB:
     def set_leave_recovery_config(self, cfg):
         self.leave = cfg
 
+    def add_leave_recovery_pending(self, bot_id, user_id, source_channel_id, target_channel_id):
+        rows = self.leave.setdefault("pending_rows", {})
+        rows[(bot_id, user_id, target_channel_id)] = {
+            "bot_id": bot_id, "user_id": user_id,
+            "source_channel_id": source_channel_id, "target_channel_id": target_channel_id}
+        self.leave.setdefault("pending_adds", []).append(
+            (bot_id, user_id, source_channel_id, target_channel_id))
+
+    def get_leave_recovery_pending(self, bot_id, user_id):
+        rows = self.leave.get("pending_rows", {})
+        return [dict(v) for k, v in rows.items() if k[0] == bot_id and k[1] == user_id]
+
+    def clear_leave_recovery_pending(self, bot_id, user_id, target_channel_id=None):
+        rows = self.leave.setdefault("pending_rows", {})
+        for k in list(rows):
+            if k[0] == bot_id and k[1] == user_id and (
+                    target_channel_id is None or k[2] == target_channel_id):
+                rows.pop(k, None)
+        self.leave.setdefault("pending_clears", []).append((bot_id, user_id, target_channel_id))
+
+    def _execute(self, sql, params=()):
+        # real DB jaisa: raw SQL calls record karo (test me kaam ke liye)
+        self.sql_calls = getattr(self, "sql_calls", [])
+        self.sql_calls.append(sql.strip().split()[0] if sql and sql.strip() else sql)
+        if "leave_recovery_messages" in (sql or "") and "UPDATE" in (sql or ""):
+            self.leave["messages_cleared"] = True
+        return None
+
+    def clear_all_leave_recovery_pending(self):
+        rows = self.leave.setdefault("pending_rows", {})
+        count = len(rows)
+        rows.clear()
+        return count
+
     def add_leave_recovery_message(self, *a, **k):
         self.leave.setdefault("sent", []).append(a)
 
@@ -433,9 +467,19 @@ class FakeDB:
         return None
 
     def get_bot_channels(self, bot_id):
-        if hasattr(self, "bot_channels"):
-            return list(self.bot_channels)
+        bc = getattr(self, "bot_channels", None)
+        if isinstance(bc, dict):          # per-bot channels
+            return list(bc.get(bot_id, []))
+        if bc is not None:
+            return list(bc)
         return [{"channel_id": -100123, "channel_title": "Test Channel", "auto_approve": 0}]
+
+    def get_setting(self, key, default=None):
+        return getattr(self, "settings", {}).get(key, default)
+
+    def set_setting(self, key, value):
+        self.settings = getattr(self, "settings", {})
+        self.settings[key] = value
 
     def get_total_requesters_count(self, bot_id):
         return 7
@@ -452,12 +496,29 @@ class FakeDB:
     # --- reachability
     def mark_reachable(self, *a):
         self.reachable_calls.append(tuple(a))
+        # real DB: mark_reachable() purana soft (initiate) mark hata deta hai
+        self.gone_calls = [c for c in self.gone_calls if not (
+            len(c) > 1 and c[0] == a[0] and c[1] == a[1]
+            and "initiate" in str(c[2] if len(c) > 2 else "").lower())]
 
     def mark_unreachable(self, *a):
         self.unreachable_calls.append(tuple(a))
 
     def mark_permanently_unreachable(self, *a):
         self.gone_calls.append(tuple(a))
+
+    def mark_initiate_blocked(self, bot_id, uid, reason=""):
+        self.gone_calls.append((bot_id, uid, f"initiate: {reason}"))
+        self.initiate_calls = getattr(self, "initiate_calls", [])
+        self.initiate_calls.append((bot_id, uid, str(reason)))
+
+    def is_initiate_blocked(self, bot_id, uid):
+        return any(c[0] == bot_id and c[1] == uid and "initiate" in str(c[2] if len(c) > 2 else "").lower()
+                   for c in self.gone_calls)
+
+    def count_initiate_blocked(self, bot_id):
+        return sum(1 for c in self.gone_calls if c[0] == bot_id
+                   and "initiate" in str(c[2] if len(c) > 2 else "").lower())
 
     def is_permanently_unreachable(self, bot_id, uid):
         return any(c[0] == bot_id and c[1] == uid for c in self.gone_calls)
@@ -599,6 +660,14 @@ def test_button_wizard():
     check("name step consumed", run(A.handle_button_wizard_message(msg, ctx)) is True)
     check("premium icon captured", state["pending"]["icon_id"] == "5000000001", str(state["pending"]))
     run(A.handle_button_wizard_message(FakeMsg("https://t.me/join"), ctx))
+    check("link ke baad color step", state["step"] == "color")
+    choices = A._wizard_kb(state, A.get_button_target(ctx, tid)).to_dict()["inline_keyboard"]
+    check("color: real colored buttons", [choices[0][0].get("style"),choices[0][1].get("style"),choices[1][0].get("style")]
+          == ["primary","success","danger"])
+    check("color: default has no style", "style" not in choices[1][1])
+    check("color: actual label + premium icon", "Join Now" in choices[0][0]["text"] and choices[0][0].get("icon_custom_emoji_id") == "5000000001")
+    green_callback = choices[0][1]["callback_data"]
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, green_callback))
     check("button stored in row 1", len(state["rows"]) == 1 and len(state["rows"][0]) == 1, str(state["rows"]))
 
     run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, f"bwz_same_{tid}"))
@@ -607,6 +676,15 @@ def test_button_wizard():
     run(A.handle_button_wizard_message(FakeMsg("not-a-link"), ctx))
     check("invalid link rejected", state["step"] == "url", str(state.get("step")))
     run(A.handle_button_wizard_message(FakeMsg("https://site.com"), ctx))
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, green_callback))
+    check("old color tap ignored for next button", state["step"] == "color" and len(state["rows"][0]) == 1)
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, f"bwz_done_{tid}"))
+    check("cannot skip pending color using stale Done", state["step"] == "color")
+    run(A.handle_button_wizard_message(FakeMsg("Red please"), ctx))
+    check("typed color does not become another label", state["step"] == "color")
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, f"bwz_color_{tid}_red_{state['color_nonce']}"))
+    run(A.handle_button_wizard_callback(FakeQuery(ctx), ctx, green_callback))
+    check("double tap cannot duplicate row", len(state["rows"][0]) == 2)
     check("2 buttons in one row", len(state["rows"][0]) == 2, str(state["rows"]))
 
     qd = FakeQuery(ctx)
@@ -615,6 +693,19 @@ def test_button_wizard():
     check("buttons saved to DB", len(saved) == 1 and len(saved[0]) == 2, str(saved))
     check("premium icon persisted", saved[0][0]["icon_id"] == "5000000001", str(saved))
     check("wizard state cleared", A.BUTTON_WIZARD_KEY not in ctx.user_data)
+    check("chosen green/red persist in DB", [b["style"] for b in saved[0]] == ["success","danger"])
+    markup = A.markup_from_rows(saved).to_dict()["inline_keyboard"]
+    check("saved markup uses chosen colors", [b.get("style") for b in markup[0]] == ["success","danger"])
+    for style in (None, "primary", "success", "danger"):
+        original = [[{"text":"Test", "url":"https://t.me/test", "style":style}]]
+        restored = A.rows_from_buttons_json(A.rows_to_buttons_json(original))
+        check(f"style roundtrip: {style}", restored[0][0]["style"] == style)
+        check(f"render style: {style}", A.markup_from_rows(restored).to_dict()["inline_keyboard"][0][0].get("style") == style)
+    panel = A.button_builder_row(FakeCtx(), {"kind":"draft_admin"})
+    check("old Add Button + Paste Many restored", len(panel) == 2 and all(b.web_app is None for b in panel))
+    source = open(A.__file__, encoding="utf-8").read()
+    check("Mini App backend removed", "miniapp_bridge" not in source and "WEBAPP_API_URL" not in source)
+
 
     # bulk paste mode
     ctx2 = FakeCtx()
@@ -1075,6 +1166,7 @@ def test_network_noise_and_retry():
 def test_leave_recovery():
     print("\n[9] leave recovery DM (blocked users)")
     A.db.leave = {"enabled": True, "target_channel_id": -100999, "target_channel_link": "https://t.me/joinchat/x",
+                  "channel_configs": {"-100123": True},   # default OFF hai, isliye explicitly ON
                   "messages": [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""},
                                {"text": "Second message", "buttons_json": ""}]}
     A.db.gone_calls = []
@@ -1473,6 +1565,269 @@ def test_diagnostics():
           str([t[:60] for t, _ in rq.edits]))
 
 
+class InitiateBlockedBot(FakeBot):
+    """User ne bot ko /start nahi kiya -> Telegram 403 deta hai (permanent NAHI)."""
+
+    async def send_message(self, chat_id, text, **kw):
+        self._log("send_message", chat_id, text, kw)
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+    async def send_photo(self, chat_id, media, **kw):
+        self._log("send_photo", chat_id, media, kw)
+        raise A.Forbidden("Forbidden: bot can't initiate conversation with a user")
+
+
+def test_initiate_blocked_flow():
+    print("\n[16] initiate-blocked: soft mark + pending DM + /start par delivery")
+    A._DM_INITIATE_WARNED.clear()
+    A.db.user_bots = [{"bot_id": "b1", "bot_username": "one", "bot_token": "t1", "user_id": 999}]
+    A.db.gone_calls = []
+    A.db.reachable_calls = []
+    A.db.leave = {"enabled": True, "target_channel_id": -100999,
+                  "target_channel_link": "https://t.me/joinchat/x",
+                  "channel_configs": {"-100123": True},   # default OFF hai, isliye explicitly ON
+                  "messages": [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""}]}
+
+    bot = InitiateBlockedBot("initiate")
+    ctx = FakeCtx()
+    ctx.bot = bot
+    member = SimpleNamespace(id=6661, first_name="NoStart", is_bot=False)
+    update = SimpleNamespace(chat_member=SimpleNamespace(
+        chat=SimpleNamespace(id=-100123, title="Chan"),
+        new_chat_member=SimpleNamespace(status="left", user=member),
+        old_chat_member=SimpleNamespace(status="member")))
+
+    handler, root, old = _capture_logs()
+    try:
+        run(A.handle_channel_member_update(update, ctx, "b1", 999))
+    finally:
+        _stop_capture(handler, root, old)
+    warns = [r.getMessage() for r in handler.records if r.levelno == logging.WARNING]
+    infos = [r.getMessage() for r in handler.records if r.levelno == logging.INFO]
+    check("initiate: koi WARNING nahi (ye normal Telegram rule hai)", not warns, str(warns))
+    check("initiate: ek INFO line", sum(1 for m in infos if "/start nahi kiya" in m) == 1, str(infos))
+    check("initiate: soft mark mila", A.db.is_initiate_blocked("b1", 6661), str(A.db.gone_calls))
+    check("initiate: hard (permanent) mark nahi mila",
+          not any(c[1] == 6661 and "initiate" not in str(c[2]).lower() for c in A.db.gone_calls),
+          str(A.db.gone_calls))
+    check("initiate: DM pending me save hui",
+          ("b1", 6661, -100123, -100999) in A.db.leave.get("pending_adds", []),
+          str(A.db.leave.get("pending_adds")))
+
+    # dobara leave -> koi API call nahi, koi nayi warning nahi
+    bot.calls = []
+    handler2, root2, old2 = _capture_logs()
+    try:
+        run(A.handle_channel_member_update(update, ctx, "b1", 999))
+    finally:
+        _stop_capture(handler2, root2, old2)
+    check("initiate: dobara API call nahi", bot.calls == [], str(bot.calls))
+    check("initiate: dobara warning/log spam nahi",
+          not [r for r in handler2.records if r.levelno >= logging.WARNING],
+          str([r.getMessage()[:60] for r in handler2.records if r.levelno >= logging.WARNING]))
+
+    # user ne /start kiya -> pending leave-recovery DM apne aap chali jaye
+    good = FakeBot("good")
+    ctx2 = FakeCtx()
+    ctx2.bot = good
+    ctx2.args = []
+    run(A.user_bot_start(_fake_update(uid=6661, msg=FakeMsg(chat_id=6661)), ctx2, "b1", 999))
+    texts = [c[2] for c in good.calls if c[0] == "send_message" and c[1] == 6661]
+    check("start: pending leave-recovery DM chali", any("wapas aao" in str(t) for t in texts), str(texts[:2]))
+    check("start: soft mark clear ho gaya", not A.db.is_initiate_blocked("b1", 6661), str(A.db.gone_calls))
+    check("start: pending row delete ho gayi", not A.db.leave.get("pending_rows"),
+          str(A.db.leave.get("pending_rows")))
+    check("start: bheji hui message history me save hui", bool(A.db.leave.get("sent")), str(A.db.leave.get("sent")))
+
+    # target channel ki join request -> pending clear (user wapas aa gaya)
+    A.db.leave["pending_rows"] = {("b1", 7772, -100999): {"bot_id": "b1", "user_id": 7772,
+                                                          "source_channel_id": -100123,
+                                                          "target_channel_id": -100999}}
+    requester = SimpleNamespace(id=7772, first_name="Back", username="back", last_name="", is_bot=False)
+    run(A.process_join_request("b1", 999, requester, -100999, "Target", None,
+                               sender=good, approve=None, auto=True))
+    check("target join: pending row clear", not A.db.leave.get("pending_rows"),
+          str(A.db.leave.get("pending_rows")))
+
+    # broadcast: initiate-blocked user hard-drop na ho (pehle yahi bug tha)
+    A.db.leave = {"messages": []}
+    A.db.gone_calls = []
+    A.db.requesters = {"b2": [7771]}
+    A.db.user_bots = A.db.user_bots + [{"bot_id": "b2", "bot_username": "two", "bot_token": "t2", "user_id": 999}]
+    A.user_bot_applications["b2"] = SimpleNamespace(bot=InitiateBlockedBot("ib2"))
+    bctx = FakeCtx()
+    bctx.user_data["broadcast_draft_b2"] = {"text": "hi", "album": None, "buttons_json": None,
+                                            "media": None, "media_type": None}
+    handler3, root3, old3 = _capture_logs()
+    try:
+        run(A.send_user_broadcast(FakeQuery(bctx, uid=999), bctx, "b2", 999))
+    finally:
+        _stop_capture(handler3, root3, old3)
+        A.user_bot_applications.pop("b2", None)
+    infos3 = [r.getMessage() for r in handler3.records if r.levelno == logging.INFO]
+    check("broadcast: initiate user hard mark nahi hua",
+          not any(c[1] == 7771 and "initiate" not in str(c[2]).lower() for c in A.db.gone_calls),
+          str(A.db.gone_calls))
+    check("broadcast: soft mark mila", A.db.is_initiate_blocked("b2", 7771), str(A.db.gone_calls))
+    check("broadcast: summary me start_baaki dikha",
+          any("start_baaki=1" in m for m in infos3), str([m for m in infos3 if "broadcast b2" in m]))
+
+    # source-level: nayi cheezein waqai code me hain (regression guard)
+    source = open(A.__file__, encoding="utf-8").read()
+    for needle in ("def mark_initiate_blocked", "def is_initiate_blocked",
+                   "CREATE TABLE IF NOT EXISTS leave_recovery_pending",
+                   "def deliver_pending_leave_recovery", "def record_dm_failure"):
+        check(f"source: {needle}", needle in source)
+
+
+def test_network_hiccup_throttle():
+    print("\n[17] network hiccup log throttle")
+    A._NETWORK_HICCUP_STATE.clear()
+    fmt = A.MaskingFormatter("%(message)s")
+    filt = A.TransientNetworkFilter()
+    recs = []
+    for i in range(3):
+        rec = logging.LogRecord("telegram.ext.Updater.test", logging.ERROR, __file__, 1,
+                                "Exception happened while polling for updates.", (), None)
+        rec.exc_info = (A.NetworkError, A.NetworkError("httpx.ReadError"), None)
+        rec.exc_text = "Traceback ... 40 lines"
+        filt.filter(rec)
+        recs.append(rec)
+    check("hiccup: pehli line WARNING", recs[0].levelno == logging.WARNING, str(recs[0].levelno))
+    check("hiccup: baaki lines DEBUG (throttle)",
+          all(r.levelno == logging.DEBUG for r in recs[1:]), str([r.levelno for r in recs]))
+    text = fmt.format(recs[0])
+    check("hiccup: line me FORCE_IPV4 hint + chhoti line",
+          "FORCE_IPV4" in text and len(text) < 300, text)
+    # window khatam -> agli hiccup phir WARNING par (repeat count ke saath)
+    A._NETWORK_HICCUP_STATE[("telegram.ext.Updater.test", "NetworkError")] = [0.0, 3]
+    rec4 = logging.LogRecord("telegram.ext.Updater.test", logging.ERROR, __file__, 1,
+                             "Exception happened while polling for updates.", (), None)
+    rec4.exc_info = (A.NetworkError, A.NetworkError("httpx.ReadError"), None)
+    filt.filter(rec4)
+    check("hiccup: naye window par summary me repeat count",
+          rec4.levelno == logging.WARNING and "min me" in fmt.format(rec4), fmt.format(rec4))
+
+
+def _lr_admin_q(ctx, data):
+    q = FakeQuery(ctx, uid=A.ADMIN_USER_ID)
+    q.data = data
+    run(A.callback_handler(_fake_update(q=q, uid=A.ADMIN_USER_ID), ctx))
+    return q
+
+
+def _lr_kb(q):
+    """Aakhri edit ka reply_markup (safe_edit_message_text -> q.edits)."""
+    return (q.edits[-1][1] or {}).get("reply_markup")
+
+
+def test_leave_recovery_channels_panel():
+    print("\n[18] leave recovery: saare channels + default OFF + Sab ON/OFF")
+    # 25 channels (2 bots) - pehle panel sirf pehle 20 dikhata tha
+    A.db.user_bots = [{"bot_id": "b1", "bot_username": "one", "bot_token": "t1", "user_id": 999},
+                      {"bot_id": "b2", "bot_username": "two", "bot_token": "t2", "user_id": 999}]
+    A.db.bot_channels = {
+        "b1": [{"channel_id": -100000 - i, "channel_title": f"Chan {i:02d}", "auto_approve": 0}
+               for i in range(15)],
+        "b2": [{"channel_id": -100100 - i, "channel_title": f"Chan {i + 15}", "auto_approve": 0}
+               for i in range(10)],
+    }
+    A.db.leave = {"enabled": True, "target_channel_id": -100999,
+                  "target_channel_link": "https://t.me/x", "messages": [], "channel_configs": {}}
+    A.db.settings = {}
+
+    all_channels = A.leave_recovery_all_channels()
+    check("panel: saare 25 channels milte hain (koi 20-cap nahi)", len(all_channels) == 25, str(len(all_channels)))
+
+    ctx = FakeCtx()
+    q = _lr_admin_q(ctx, "admin_leave_channels")
+    labels = _kb_labels(_lr_kb(q))
+    check("panel: default sab OFF (🔴)", all(l.startswith("🔴") for l in labels if "Chan" in l), str(labels))
+    check("panel: Sab OFF / Sab ON buttons", any("Sab OFF" in l for l in labels) and any("Sab ON" in l for l in labels), str(labels))
+    check("panel: text me default OFF likha hai", "Default sab channels OFF" in q.edits[-1][0], q.edits[-1][0][:80])
+    check("panel: page 1/4 (8 per page, 25 channels)",
+          "Page 1/4" in q.edits[-1][0], q.edits[-1][0][-120:])
+
+    # pagination -> aage ke channels bhi dikhein
+    q2 = _lr_admin_q(ctx, "admin_leave_chan_page_3")
+    labels3 = _kb_labels(_lr_kb(q2))
+    check("panel: page 4 par aakhri channel dikhta hai", any("Chan 24" in l for l in labels3), str(labels3))
+    check("panel: page 4 text", "Page 4/4" in q2.edits[-1][0], q2.edits[-1][0][-120:])
+
+    # toggle: default OFF -> ek tap me ON
+    q3 = _lr_admin_q(ctx, "admin_leave_chan_toggle_-100000")
+    check("toggle: channel ON ho gaya", A.db.leave["channel_configs"].get("-100000") is True,
+          str(A.db.leave["channel_configs"]))
+    check("toggle: toggle ke baad usi page par wapas", "Page 1/4" in q3.edits[-1][0], q3.edits[-1][0][-120:])
+    check("toggle: current ON channels list me",
+          A.leave_recovery_on_channels(A.db.leave) == ["-100000"],
+          str(A.leave_recovery_on_channels(A.db.leave)))
+
+    # status text: sirf ON channels dikhein + default OFF ka note
+    status = A.leave_recovery_status_text()
+    plain_status = A.strip_premium_emojis(status)
+    check("status: ON channel dikhta hai", "-100000" in status and "Chan 00" in status, plain_status[:220])
+    check("status: counts sahi (total 25, ON 1, OFF 24)",
+          "total 25 | 🟢 ON 1 | 🔴 OFF 24" in plain_status, plain_status[:260])
+
+    # Sab ON / Sab OFF
+    q4 = _lr_admin_q(ctx, "admin_leave_all_on")
+    on_ids = A.leave_recovery_on_channels(A.db.leave)
+    check("sab ON: 25 channels ON", len(on_ids) == 25, str(len(on_ids)))
+    check("sab ON: text me sab ON",
+          "ON: 25" in A.strip_premium_emojis(q4.edits[-1][0]), A.strip_premium_emojis(q4.edits[-1][0])[:200])
+    q5 = _lr_admin_q(ctx, "admin_leave_all_off")
+    check("sab OFF: sab OFF ho gaye", A.leave_recovery_on_channels(A.db.leave) == [],
+          str(A.db.leave["channel_configs"]))
+    check("sab OFF: text me sab OFF",
+          "ON: 0" in A.strip_premium_emojis(q5.edits[-1][0]), A.strip_premium_emojis(q5.edits[-1][0])[:200])
+
+    # default OFF par leave recovery bilkul nahi chalti
+    member = SimpleNamespace(id=9991, first_name="NoDM", is_bot=False)
+    update = SimpleNamespace(chat_member=SimpleNamespace(
+        chat=SimpleNamespace(id=-100000, title="Chan 00"),
+        new_chat_member=SimpleNamespace(status="left", user=member),
+        old_chat_member=SimpleNamespace(status="member")))
+    lctx = FakeCtx()
+    lctx.bot = FakeBot("lr")
+    run(A.handle_channel_member_update(update, lctx, "b1", 999))
+    check("default OFF: koi DM nahi jati", not lctx.bot.calls, str(lctx.bot.calls))
+
+    # channel ON karne par DM chalti hai
+    A.db.leave["channel_configs"]["-100000"] = True
+    A.db.leave["messages"] = [{"text": "Hello {first_name}, wapas aao", "buttons_json": ""}]
+    lctx2 = FakeCtx()
+    lctx2.bot = FakeBot("lr2")
+    run(A.handle_channel_member_update(update, lctx2, "b1", 999))
+    check("channel ON: DM chali", any(c[0] == "send_message" and c[1] == 9991 for c in lctx2.bot.calls),
+          str(lctx2.bot.calls[:2]))
+
+    # one-time migration: purane ON channels OFF + dobara restart par kuch na chhedo
+    A.db.leave = {"enabled": True, "target_channel_id": -100999, "target_channel_link": "https://t.me/x",
+                  "messages": [], "channel_configs": {"-100000": True, "-100001": True}}
+    A.db.settings = {}
+    changed = A.migrate_leave_recovery_default_off()
+    check("migration: purane ON channels OFF", changed >= 2 and A.leave_recovery_on_channels(A.db.leave) == [],
+          f"changed={changed} cfg={A.db.leave['channel_configs']}")
+    A.db.leave["channel_configs"]["-100002"] = True     # admin ne khud ON kiya
+    changed2 = A.migrate_leave_recovery_default_off()
+    check("migration: dobara restart par admin ka ON safe",
+          changed2 == 0 and A.db.leave["channel_configs"].get("-100002") is True,
+          f"changed2={changed2} cfg={A.db.leave['channel_configs']}")
+    # Clear Pending Records -> queued DMs bhi saaf
+    A.db.leave["pending_rows"] = {("b1", 5, -100999): {"bot_id": "b1", "user_id": 5,
+                                                       "source_channel_id": -100000,
+                                                       "target_channel_id": -100999}}
+    A.db.bot_channels = {}
+    _lr_admin_q(ctx, "admin_leave_clear_pending")
+    check("clear pending: queued recovery DMs bhi clear",
+          not A.db.leave.get("pending_rows"), str(A.db.leave.get("pending_rows")))
+
+    source = open(A.__file__, encoding="utf-8").read()
+    check("source: migration main() me chalti hai",
+          "migrate_leave_recovery_default_off()" in source and "turned_off = migrate" in source)
+
+
 def _check_non_admin_diag():
     """Non-admin /diag bheje to kuch na aaye."""
     msg = FakeMsg(text="/diag", chat_id=555,
@@ -1514,6 +1869,9 @@ def main():
     A.reset_premium_styling_state()
     A.reset_premium_styling_state()
     test_subscription_picker_and_style_memory()
+    test_initiate_blocked_flow()
+    test_leave_recovery_channels_panel()
+    test_network_hiccup_throttle()
     test_diagnostics()
     print(f"\n==== tests: {len(PASS)} passed, {len(FAIL)} failed ====")
     if FAIL:

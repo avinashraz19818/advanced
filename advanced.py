@@ -160,14 +160,38 @@ NETWORK_NOISE_MARKERS = (
     "ReadTimeout", "httpx.", "NetworkError", "TimedOut", "ServerDisconnected",
 )
 
+# Ek hi hiccup window me sirf ek line chhape (baaki DEBUG par). Warna polling VPS par
+# har 2 minute me ek warning deti rehti hai aur log phir bhar jata hai.
+NETWORK_HICCUP_WINDOW = 300.0
+_NETWORK_HICCUP_STATE: Dict[tuple, list] = {}
+
 
 class TransientNetworkFilter(logging.Filter):
-    """PTB ke polling network errors ko chhote warning me badlo.
+    """PTB ke polling network errors ko chhote (throttled) warning me badlo.
 
     VPS <-> Telegram link par transient hiccup (httpx.ReadError etc.) PTB khud retry
     karta hai, par har baar ek poora 40-line traceback ERROR par log karta hai - log
     itna bhar jata hai ki asli bug chhup jate hain. Ye filter un records ko ek line ka
-    WARNING bana deta hai (aur traceback hata deta hai)."""
+    WARNING bana deta hai (aur traceback hata deta hai). Ek hi tarah ka hiccup
+    NETWORK_HICCUP_WINDOW seconds me sirf ek baar WARNING par aata hai, baaki DEBUG."""
+
+    def _summary(self, key: tuple, exc_name: str, message: str) -> Optional[str]:
+        """Window ke hisaab se ek line banao, ya None (is window me pehle hi chhap chuka)."""
+        now = time.time()
+        state = _NETWORK_HICCUP_STATE.get(key)
+        if state and (now - state[0]) < NETWORK_HICCUP_WINDOW:
+            state[1] += 1
+            return None
+        if len(_NETWORK_HICCUP_STATE) > 200:     # memory bound (bohat se loggers na banein)
+            _NETWORK_HICCUP_STATE.clear()
+        _NETWORK_HICCUP_STATE[key] = [now, 1]
+        detail = f" ({exc_name})" if exc_name else ""
+        repeat = ""
+        if state:
+            repeat = f" (pichhle {int(NETWORK_HICCUP_WINDOW // 60)} min me {state[1]} baar)"
+        hint = "" if force_ipv4_enabled() else " | badhta rahe to .env me FORCE_IPV4=1 karo"
+        return ("Telegram network hiccup (PTB khud retry kar raha hai, koi action "
+                f"zaroori nahi): {message[:140]}{detail}{repeat}{hint}")
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -187,13 +211,18 @@ class TransientNetworkFilter(logging.Filter):
                 pass
         if not any(m in haystack for m in NETWORK_NOISE_MARKERS):
             return True
-        record.levelno = logging.WARNING
-        record.levelname = "WARNING"
         record.exc_info = None
         record.exc_text = None
-        detail = f" ({exc_name})" if exc_name else ""
-        record.msg = ("Telegram network hiccup (PTB khud retry kar raha hai, koi action "
-                      f"zaroori nahi): {message[:140]}{detail}")
+        summary = self._summary((record.name, exc_name or "network"), exc_name, message)
+        if summary is None:
+            record.levelno = logging.DEBUG
+            record.levelname = "DEBUG"
+            record.msg = ("Telegram network hiccup (repeat - is window me ek hi line chhapti "
+                          f"hai): {message[:140]}")
+        else:
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+            record.msg = summary
         record.args = ()
         return True
 
@@ -277,7 +306,7 @@ ADMIN_USER_ID = 8015937475
 ADMIN_USERNAME = "@zayro_o"
 # Konsa code chal raha hai - server par purana process pada ho to turant pata chale
 # (./start ke baad log me is line ka hona zaroori hai)
-BUILD_TAG = "2026-09-27-r17"
+BUILD_TAG = "2026-10-05-r27"
 START_TS = time.time()
 _ADMIN_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = {ADMIN_USER_ID}
@@ -286,6 +315,23 @@ if _ADMIN_IDS_RAW:
         _x = _x.strip()
         if _x.isdigit():
             ADMIN_USER_IDS.add(int(_x))
+
+
+# ================= DM REACHABILITY (soft vs permanent) =================
+# unreachable_users.reason me ye prefix = "user ne bot ko /start nahi kiya" (SOFT mark).
+# Ye permanent NAHI hai: user ke /start ya join-request par mark_reachable() ise hata
+# deta hai. Hard marks (block / chat not found / deactivated) isse alag rehte hain -
+# isliye broadcast inhe "gone" nahi ginta (pehle yahi bug tha: jin users ne kabhi
+# bot ko /start nahi kiya tha wo hamesha ke liye broadcast se drop ho jate the).
+INITIATE_BLOCKED_PREFIX = "initiate:"
+INITIATE_BLOCKED_MARKERS = (INITIATE_BLOCKED_PREFIX, "initiate conversation", "can't initiate")
+
+
+def reason_is_initiate_blocked(reason) -> bool:
+    """unreachable_users.reason dekh kar batao ki ye soft (initiate) mark hai ya hard."""
+    text = (reason or "").strip().lower()
+    return any(m in text for m in INITIATE_BLOCKED_MARKERS)
+
 
 
 SUPPORT_REPLY_MAP: Dict[int, Dict] = {}
@@ -691,6 +737,10 @@ def build_diag_text() -> str:
             gone = db.count_permanently_unreachable(bot_id)
         except Exception:
             gone = "?"
+        try:
+            need_start = db.count_initiate_blocked(bot_id)
+        except Exception:
+            need_start = "?"
         sub = db.get_subscription_for_bot(bot_id)
         plan = "no plan"
         if sub:
@@ -698,6 +748,9 @@ def build_diag_text() -> str:
         lines.append(f"{pe('🆔')} <code>{bot_id}</code> | {account_display_name(row, bot_id)}")
         lines.append(f"   {pe('▶️')} chalu: {'🟢 haan' if running else '🔴 NAHI'}"
                      f" | channels: {chans} | unreachable users: {gone} | plan: {plan}")
+        if need_start:
+            lines.append(f"   {pe('ℹ️')} {need_start} users ne abhi bot ko /start nahi kiya "
+                         f"(inhe DM tab jayegi jab wo /start karenge)")
     lines.append("")
     lines.append(f"{pe('📌')} Kisi bot ko DM me <code>/start</code> bhejo - welcome panel aana chahiye.")
     return "\n".join(lines)
@@ -888,6 +941,7 @@ class Database:
             """CREATE TABLE IF NOT EXISTS user_emoji_maps (\n                bot_id TEXT REFERENCES user_bots(bot_id) ON DELETE CASCADE,\n                msg_id BIGINT, emoji_map JSONB DEFAULT '{}',\n                updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (bot_id, msg_id)\n            )""",
             """CREATE TABLE IF NOT EXISTS system_settings (\n                key TEXT PRIMARY KEY, value_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT now()\n            )""",
             """CREATE TABLE IF NOT EXISTS leave_recovery_messages (\n                id BIGSERIAL PRIMARY KEY, bot_id TEXT, user_id BIGINT,\n                source_channel_id BIGINT, target_channel_id BIGINT, message_id BIGINT,\n                sent_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ\n            )""",
+            """CREATE TABLE IF NOT EXISTS leave_recovery_pending (\n                bot_id TEXT, user_id BIGINT, source_channel_id BIGINT,\n                target_channel_id BIGINT, created_at TIMESTAMPTZ DEFAULT now(),\n                PRIMARY KEY (bot_id, user_id, target_channel_id)\n            )""",
             # user-account system hata diya - purani entity-cache table ho to saaf karo
             "DROP TABLE IF EXISTS user_entity_cache",
             "CREATE INDEX IF NOT EXISTS idx_bot_subscriptions ON bot_subscriptions(bot_id, expiry_date)",
@@ -896,6 +950,7 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_messages_bot ON user_bot_messages(bot_id, channel_id)",
             "CREATE INDEX IF NOT EXISTS idx_reachable_bot ON reachable_users(bot_id, last_ok_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_unreachable_bot ON unreachable_users(bot_id)",
+            "CREATE INDEX IF NOT EXISTS idx_leave_pending_user ON leave_recovery_pending(bot_id, user_id)",
             # Migration: purane DB me user-account columns add ho jayein
             "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS account_type TEXT DEFAULT 'bot'",
             "ALTER TABLE user_bots ADD COLUMN IF NOT EXISTS phone TEXT",
@@ -1211,6 +1266,32 @@ class Database:
                DO UPDATE SET reason=EXCLUDED.reason, failed_at=now()""",
             (bot_id, requester_id, (reason or "")[:200]))
 
+    def mark_initiate_blocked(self, bot_id: str, requester_id, reason: str = ""):
+        """SOFT mark: bot DM shuru nahi kar sakta (user ne bot ko /start nahi kiya).
+
+        Ise hard (permanent) nahi samjho - user ke /start ya join-request par
+        `mark_reachable()` ye mark hata deta hai. Fayda: aise users par baar-baar
+        API call / warning nahi hoti, aur leave-recovery DM "pending" me reh jati hai.
+        """
+        text = (reason or "").strip() or "bot can't initiate conversation with a user"
+        self._execute("""INSERT INTO unreachable_users (bot_id, requester_id, reason, failed_at)
+               VALUES (%s,%s,%s,now()) ON CONFLICT (bot_id, requester_id)
+               DO UPDATE SET reason=EXCLUDED.reason, failed_at=now()""",
+            (bot_id, requester_id, f"{INITIATE_BLOCKED_PREFIX} {text}"[:200]))
+
+    def is_initiate_blocked(self, bot_id: str, requester_id) -> bool:
+        """User ne bot ko /start nahi kiya (soft mark) - to DM attempt skip kar sakte hain."""
+        row = self._fetchone("SELECT reason FROM unreachable_users WHERE bot_id=%s AND requester_id=%s",
+                             (bot_id, requester_id))
+        return bool(row) and reason_is_initiate_blocked(row["reason"])
+
+    def count_initiate_blocked(self, bot_id: str) -> int:
+        """Kitne users ko sirf /start karna baaki hai (hard-blocked nahi hain)."""
+        row = self._fetchone("""SELECT COUNT(*) AS c FROM unreachable_users
+               WHERE bot_id=%s AND (reason ILIKE %s OR reason ILIKE %s)""",
+                             (bot_id, "%" + INITIATE_BLOCKED_PREFIX + "%", "%initiate conversation%"))
+        return int(row["c"]) if row else 0
+
     def clear_initiate_blocked_unreachable(self) -> int:
         """Sirf wo marks hatao jinka reason "bot can't initiate conversation" tha.
 
@@ -1219,8 +1300,9 @@ class Database:
         """
         try:
             rows = self._fetchall("""DELETE FROM unreachable_users
-                   WHERE reason ILIKE %s OR reason ILIKE %s RETURNING requester_id""",
-                                  ("%initiate conversation%", "%can't initiate%"))
+                   WHERE reason ILIKE %s OR reason ILIKE %s OR reason ILIKE %s RETURNING requester_id""",
+                                  ("%" + INITIATE_BLOCKED_PREFIX + "%", "%initiate conversation%",
+                                   "%can't initiate%"))
             return len(rows or [])
         except Exception as ex:
             logging.warning(f"unreachable marks clear nahi hua: {mask_secrets(ex)}")
@@ -1276,6 +1358,37 @@ class Database:
 
     def set_default_first_message(self, text: str):
         self.set_setting("default_first_message", text)
+
+    def add_leave_recovery_pending(self, bot_id: str, user_id, source_channel_id, target_channel_id):
+        """Leave-recovery DM abhi nahi ja saki (user ne /start nahi kiya) - yaad rakho.
+
+        User jab bot ko /start karega to `deliver_pending_leave_recovery()` ye DM
+        bhej dega. Pehle ye message sirf log me "skip" hota tha aur hamesha ke liye
+        kho jata tha.
+        """
+        self._execute("""INSERT INTO leave_recovery_pending (bot_id, user_id, source_channel_id, target_channel_id)
+               VALUES (%s,%s,%s,%s) ON CONFLICT (bot_id, user_id, target_channel_id)
+               DO UPDATE SET source_channel_id=EXCLUDED.source_channel_id, created_at=now()""",
+            (bot_id, user_id, source_channel_id, target_channel_id))
+
+    def get_leave_recovery_pending(self, bot_id: str, user_id):
+        rows = self._fetchall("""SELECT * FROM leave_recovery_pending
+               WHERE bot_id=%s AND user_id=%s ORDER BY created_at""", (bot_id, user_id))
+        return [dict(r) for r in rows]
+
+    def clear_leave_recovery_pending(self, bot_id: str, user_id, target_channel_id=None):
+        if target_channel_id is None:
+            self._execute("DELETE FROM leave_recovery_pending WHERE bot_id=%s AND user_id=%s",
+                          (bot_id, user_id))
+        else:
+            self._execute("""DELETE FROM leave_recovery_pending
+                   WHERE bot_id=%s AND user_id=%s AND target_channel_id=%s""",
+                          (bot_id, user_id, target_channel_id))
+
+    def clear_all_leave_recovery_pending(self) -> int:
+        """Admin ka 'Clear Pending Records': queue me padi saari recovery DM hata do."""
+        rows = self._fetchall("DELETE FROM leave_recovery_pending RETURNING user_id")
+        return len(rows or [])
 
     def add_leave_recovery_message(self, bot_id: str, user_id, source_channel_id, target_channel_id, message_id):
         self._execute("INSERT INTO leave_recovery_messages (bot_id, user_id, source_channel_id, target_channel_id, message_id) VALUES (%s,%s,%s,%s,%s)", (bot_id, user_id, source_channel_id, target_channel_id, message_id))
@@ -2045,6 +2158,8 @@ def rows_to_buttons_json(rows: Optional[List[List[dict]]]) -> Optional[str]:
                 item["icon_char"] = icon_char
             if b.get("style") in STYLE_VALUES:
                 item["style"] = b["style"]
+            elif "style" in b and b["style"] is None:
+                item["style"] = None
             clean_row.append(item)
         if clean_row:
             cleaned.append(clean_row)
@@ -2080,7 +2195,7 @@ def rows_from_buttons_json(buttons_json) -> List[List[dict]]:
                 "cb": b.get("cb") or b.get("callback_data"),
                 "icon_id": str(b.get("icon_id")) if b.get("icon_id") else None,
                 "icon_char": b.get("icon_char") or emoji_char_for_id(b.get("icon_id")),
-                "style": b.get("style") if b.get("style") in STYLE_VALUES else "primary",
+                "style": b.get("style") if b.get("style") in STYLE_VALUES or ("style" in b and b["style"] is None) else "primary",
             }
             if item["url"] or item["cb"]:
                 clean_row.append(item)
@@ -2100,7 +2215,7 @@ def markup_from_rows(rows: Optional[List[List[dict]]], use_icons: bool = True):
                 continue
             text = (b.get("text") or "Button")[:64]
             icon_id = b.get("icon_id")
-            style = b.get("style") or "primary"
+            style = b.get("style", "primary")
             if not use_icons:
                 char = b.get("icon_char") or emoji_char_for_id(icon_id)
                 if char and char not in text:
@@ -2336,6 +2451,10 @@ def _wizard_text(state: dict, target: dict) -> str:
         return body + (f"<b>Naam:</b> {EmojiManager._html_escape(name)}\n\n"
                        f"{pe('🔗')} <b>Ab is button ka link bhejo</b>\n"
                        "Example: <code>https://t.me/yourchannel</code>")
+    if step == "color":
+        return body + (f"{pe('🎨')} <b>Button ka color chuno</b>\n\n"
+                       "Neeche aapka button 4 colors me hai — pasand wale par tap karo.\n"
+                       "Uske baad aur buttons add karo ya <b>Save & Done</b> dabao.")
     if step == "bulk":
         return body + (f"{pe('📄')} <b>Bulk mode:</b> ek line me ek button bhejo\n\n"
                        "<code>Join Channel|https://t.me/channel</code>\n"
@@ -2350,6 +2469,17 @@ def _wizard_kb(state: dict, target: dict) -> Optional[InlineKeyboardMarkup]:
     step = state.get("step")
     rows = state.get("rows") or []
     kb: List[List[InlineKeyboardButton]] = []
+    if step == "color":
+        pending = state.get("pending") or {}
+        nonce = state.get("color_nonce", "")
+        options = [("blue", "Blue", "primary"), ("green", "Green", "success"),
+                   ("red", "Red", "danger"), ("default", "Default", None)]
+        choices = [build_button(
+            f"{(pending.get('text') or 'Button')[:45]} · {label}",
+            callback_data=f"bwz_color_{tid}_{key}_{nonce}", style=style,
+            icon_id=pending.get("icon_id")) for key, label, style in options]
+        return InlineKeyboardMarkup([choices[:2], choices[2:],
+            [btn("Cancel", f"bwz_cancel_{tid}", "danger", "❌")]])
     if step in ("name", "url", "bulk"):
         if rows:
             kb.append([btn("Save & Done", f"bwz_done_{tid}", "success", "✅")])
@@ -2437,6 +2567,30 @@ async def handle_button_wizard_callback(q, context, data: str) -> bool:
     if not target:
         context.user_data.pop(BUTTON_WIZARD_KEY, None)
         await safe_edit_message_text(q, f"{pe('❌')} Target session expire ho gaya.", parse_mode=ParseMode.HTML)
+        return True
+    if action == "color":
+        colors = {"blue":"primary", "green":"success", "red":"danger", "default":None}
+        choice = parts[3] if len(parts) > 3 else ""
+        nonce = parts[4] if len(parts) > 4 else ""
+        if (state.get("step") != "color" or not state.get("pending") or
+                choice not in colors or nonce != state.get("color_nonce")):
+            return True  # Ignore old/double taps; never color a different pending button.
+        pending = dict(state["pending"])
+        pending["style"] = colors[choice]
+        rows = state.get("rows") or []
+        if state.get("placement") == "same" and rows and len(rows[-1]) < 8:
+            rows[-1].append(pending)
+        else:
+            rows.append([pending])
+        state["rows"] = rows
+        state["pending"] = None
+        state.pop("color_nonce", None)
+        state["step"] = "next"
+        await _wizard_render(context, state, target, q=q,
+            note=f"{pe('✅')} Button add ho gaya — <b>{choice.title()}</b> color.")
+        return True
+    if state.get("step") == "color" and action != "cancel":
+        await _wizard_render(context, state, target, q=q, note="Pehle neeche se color chuno.")
         return True
     if action in ("same", "row"):
         state["step"] = "name"
@@ -2551,16 +2705,13 @@ async def handle_button_wizard_message(msg, context) -> bool:
         pending = dict(state.get("pending") or {})
         pending["url"] = None if is_cb else url
         pending["cb"] = url[3:].strip() if is_cb else None
-        rows = state.get("rows") or []
-        if state.get("placement") == "same" and rows and len(rows[-1]) < 8:
-            rows[-1].append(pending)
-        else:
-            rows.append([pending])
-        state["rows"] = rows
-        state["pending"] = None
-        state["step"] = "next"
-        await _wizard_render(context, state, target,
-                            note=f"{pe('✅')} <b>{EmojiManager._html_escape(pending.get('text') or '')}</b> add ho gaya!")
+        state["pending"] = pending
+        state["color_nonce"] = os.urandom(4).hex()
+        state["step"] = "color"
+        await _wizard_render(context, state, target)
+        return True
+    if step == "color":
+        await _wizard_render(context, state, target, note="Color ke liye neeche button tap karo.")
         return True
     if step == "bulk":
         new_rows = parse_button_lines(msg.text or msg.caption or "", msg.entities or msg.caption_entities)
@@ -3289,6 +3440,14 @@ async def user_bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot
         await send_premium_message(context.bot, user.id, UIFormatter.live_chat_header(), parse_mode=ParseMode.HTML)
         return
     await send_saved_welcome(bot_id, user.id, context, user=user)
+    # /start = private chat khul gayi -> purana "user ne /start nahi kiya" wala soft mark
+    # clear karo aur jo leave-recovery DM pending thi wo ab bhej do (pehle wo hamesha ke
+    # liye kho jati thi aur log me sirf "skip" aata tha).
+    try:
+        db.mark_reachable(bot_id, user.id)
+    except Exception:
+        pass
+    await deliver_pending_leave_recovery(bot_id, user, context.bot)
 
 
 async def handle_public_userbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str):
@@ -3576,7 +3735,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ])
         await safe_edit_message_text(q,
             f"{pe('🔘')} <b>Edit Inline Buttons</b>\n\n"
-            "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
+            "<b>Add Button</b> = easy tarika (naam → link → color → same row / new row)\n"
             "<b>Paste Many</b> = purana format\n"
             "<code>Button Label|https://link</code>\n"
             "<code>Label One|https://link1 || Label Two|https://link2</code>",
@@ -3661,7 +3820,7 @@ async def user_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         ])
         await safe_edit_message_text(q,
             f"{pe('🔘')} <b>Inline Buttons</b>\n\n"
-            "<b>Add Button</b> = easy (naam → link → row)\n"
+            "<b>Add Button</b> = easy (naam → link → color → row)\n"
             "<b>Paste Many</b> = bulk format",
             parse_mode=ParseMode.HTML, reply_markup=kb)
         return
@@ -4028,7 +4187,7 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                                                "back_cb": f"manage_bot_{bot_id}"})
         await reply_premium_message(msg,
             f"{pe('✅')} <b>Message saved!</b>\n\n"
-            f"{pe('🔘')} Buttons add karne ke liye <b>Add Button</b> dabao (naam → link → row), "
+            f"{pe('🔘')} Buttons add karne ke liye <b>Add Button</b> dabao (naam → link → color → row), "
             f"ya <b>Paste Many</b> se purana <code>Label|link</code> format use karo.",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
                 builder,
@@ -4139,9 +4298,13 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
     leave_cfg = db.get_leave_recovery_config() or {}
     if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id")
             and int(leave_cfg["target_channel_id"]) == int(chat_id)):
-        chan_enabled = (leave_cfg.get("channel_configs") or {}).get(str(chat_id), True)
-        if chan_enabled:
-            await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat_id), sender)
+        # User wapas target channel me aa gaya -> purane "waps aao" DM hata do aur pending
+        # recovery DM ki zarurat khatam (ye cleanup per-channel toggle se independent hai).
+        await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat_id), sender)
+        try:
+            db.clear_leave_recovery_pending(bot_id, requester.id, int(chat_id))
+        except Exception:
+            pass
         if approve is not None:
             try:
                 await approve()
@@ -4216,6 +4379,9 @@ async def process_join_request(bot_id: str, owner_id: int, requester, chat_id: i
         except Exception as ex:
             if 'User_already_participant' not in str(ex) and 'USER_ALREADY_PARTICIPANT' not in str(ex):
                 logging.error(f"Approve error: {mask_secrets(ex)}")
+    # Join request = user ne bot se baat ki (5 min ka DM window) -> pending leave-recovery
+    # DM ab bhej do (agar koi thi). Warna wo message hamesha ke liye kho jata tha.
+    await deliver_pending_leave_recovery(bot_id, requester, sender)
 
 
 async def _send_leave_message(bot_id: str, user_id, owner_id, primary, do_send):
@@ -4230,63 +4396,192 @@ async def _send_leave_message(bot_id: str, user_id, owner_id, primary, do_send):
     return ok, box["sent"], err, used_alt
 
 
+def leave_recovery_plan(leave_cfg: dict, user, source_channel_id: int,
+                        chat_title: Optional[str] = None):
+    """Leave-recovery DM ka plan: (target_channel_id, target_link, [(text, markup), ...]).
+
+    Return None = is channel ke liye recovery off / possible nahi hai.
+    """
+    if not leave_cfg or not user:
+        return None
+    target_channel_id = leave_cfg.get("target_channel_id")
+    target_link = (leave_cfg.get("target_channel_link") or "").strip()
+    if not leave_cfg.get("enabled") or not target_channel_id or not target_link:
+        return None
+    try:
+        if int(target_channel_id) == int(source_channel_id):
+            return None
+    except (TypeError, ValueError):
+        return None
+    # Default OFF: jab tak admin is channel ko khud ON na kare, leave recovery nahi chalti.
+    if not (leave_cfg.get("channel_configs") or {}).get(str(source_channel_id), False):
+        logging.info(f"Leave recovery is channel ({source_channel_id}) ke liye OFF hai, skipping "
+                     f"(Admin Panel -> Leave Recovery -> Per-Channel Settings me ON karo).")
+        return None
+    extra = {"source_channel_title": chat_title or str(source_channel_id),
+             "source_channel_id": source_channel_id,
+             "target_channel_link": target_link, "target_channel_id": target_channel_id}
+    leave_messages = leave_cfg.get("messages") or []
+    if not leave_messages and leave_cfg.get("message"):
+        leave_messages = [{"text": leave_cfg["message"], "buttons_json": leave_cfg.get("buttons_json", "")}]
+    if not leave_messages:
+        leave_messages = [{"text": "Hello {first_name}, aap channel se leave ho gaye. Wapas access ke "
+                                   "liye neeche wale channel par request bheje.", "buttons_json": ""}]
+    messages = []
+    for lm in leave_messages:
+        text = render_dynamic_text(lm.get("text", ""), user, extra)
+        lm_buttons = lm.get("buttons_json") or ""
+        markup = buttons_to_markup(lm_buttons) if lm_buttons \
+            else InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
+        messages.append((text, markup))
+    return int(target_channel_id), target_link, messages
+
+
+async def send_leave_recovery_messages(bot_id: str, user, source_channel_id: int, sender,
+                                       chat_title: Optional[str] = None,
+                                       leave_cfg: Optional[dict] = None) -> str:
+    """Leave-recovery DM(s) bhejo.
+
+    Return: 'sent' (kam se kam pehla message gaya) | 'initiate' (user ne /start nahi
+    kiya) | 'gone' (block/dead) | 'none' (channel ke liye off) | 'failed' (transient).
+    """
+    if sender is None:
+        return "failed"
+    leave_cfg = leave_cfg or db.get_leave_recovery_config() or {}
+    plan = leave_recovery_plan(leave_cfg, user, source_channel_id, chat_title)
+    if not plan:
+        return "none"
+    target_channel_id, _target_link, messages = plan
+    owner_id = (db.get_user_bot(bot_id) or {}).get("user_id") or 0
+    delivered = False
+    try:
+        await delete_pending_leave_recovery_messages(bot_id, user.id, target_channel_id, sender)
+    except Exception as ex:
+        logging.debug(f"leave recovery purane messages delete nahi hue: {mask_secrets(ex)}")
+    for text, markup in messages:
+        sent_ok, sent, err, _ = await _send_leave_message(
+            bot_id, user.id, owner_id, sender,
+            lambda snd: send_user_message(snd, user.id, text,
+                                          parse_mode=ParseMode.HTML, reply_markup=markup))
+        if not sent_ok:
+            failure = record_dm_failure(bot_id, user.id, err)
+            log_dm_failure("leave recovery DM", bot_id, user.id, err, failure)
+            if failure == "initiate":
+                return "sent" if delivered else "initiate"     # pehla message gaya to wahi kaafi
+            return "gone" if failure == "gone" else ("sent" if delivered else "failed")
+        if sent:
+            delivered = True
+            try:
+                db.add_leave_recovery_message(bot_id, user.id, source_channel_id,
+                                              target_channel_id, sent.message_id)
+            except Exception as ex:
+                logging.debug(f"leave recovery message record skip: {mask_secrets(ex)}")
+    if delivered:
+        try:
+            db.mark_reachable(bot_id, user.id)
+        except Exception:
+            pass
+        return "sent"
+    return "failed"
+
+
+async def deliver_pending_leave_recovery(bot_id: str, user, sender=None) -> int:
+    """User ne bot ko /start kiya (ya join request bheji) -> pending leave-recovery DM bhejo.
+
+    Ye wahi DM hai jo channel chhodte waqt fail hui thi ("bot can't initiate
+    conversation"). Ab private chat ban chuki hai, isliye ye message ja sakta hai.
+    """
+    if user is None or getattr(user, "is_bot", False):
+        return 0
+    try:
+        sender = sender or get_account_sender(bot_id)
+        if sender is None:
+            return 0
+        leave_cfg = db.get_leave_recovery_config() or {}
+        if not leave_cfg.get("enabled"):
+            return 0
+        pending = db.get_leave_recovery_pending(bot_id, user.id) or []
+    except Exception as ex:
+        logging.debug(f"pending leave recovery check skip: {mask_secrets(ex)}")
+        return 0
+    delivered = 0
+    for row in pending:
+        target_channel_id = row.get("target_channel_id")
+        source_channel_id = row.get("source_channel_id")
+        if not target_channel_id or not source_channel_id:
+            try:
+                db.clear_leave_recovery_pending(bot_id, user.id, target_channel_id)
+            except Exception:
+                pass
+            continue
+        status = "failed"
+        try:
+            channel_row = db.get_channel_owner_data(source_channel_id, bot_id) or {}
+            status = await send_leave_recovery_messages(
+                bot_id, user, source_channel_id, sender,
+                channel_row.get("channel_title"), leave_cfg)
+        except Exception as ex:
+            logging.debug(f"pending leave recovery send skip: {mask_secrets(ex)}")
+        try:
+            if status in ("sent", "gone", "none"):
+                db.clear_leave_recovery_pending(bot_id, user.id, target_channel_id)
+        except Exception:
+            pass
+        if status == "sent":
+            delivered += 1
+    if delivered:
+        logging.info(f"pending leave recovery: user {user.id} ko {delivered} message bhej diya "
+                     f"(bot {bot_id})")
+    return delivered
+
+
 async def process_member_left(bot_id: str, member_user, chat_id: int,
                               chat_title: Optional[str] = None, sender=None) -> None:
-    """Member ne channel leave kiya -> leave-recovery DM (blocked users ko yaad rakho)."""
+    """Member ne channel leave kiya -> leave-recovery DM.
+
+    Do cheezein yahan fix hain:
+    * User ne bot ko /start nahi kiya -> API call se pehle hi pata hai (soft mark se),
+      isliye koi Forbidden/WARNING nahi: ek INFO line aur message "pending" list me.
+      User /start karega to `deliver_pending_leave_recovery()` use bhej dega.
+    * DM fail ho (network etc.) to bhi message pending me - agli baar bhej denge.
+    """
     channel_row = db.get_channel_owner_data(chat_id, bot_id)
     if not channel_row:
         return
     sender = sender or get_account_sender(bot_id)
     if sender is None:
         return
-    db.mark_unreachable(bot_id, member_user.id)
+    leave_cfg = db.get_leave_recovery_config() or {}
+    plan = leave_recovery_plan(leave_cfg, member_user, chat_id, chat_title)
+    if not plan:
+        return
+    target_channel_id = plan[0]
+
     try:
+        if db.is_initiate_blocked(bot_id, member_user.id):
+            # Pehle hi pata hai ki DM nahi ja sakti (user ne /start nahi kiya) - API call
+            # ki zarurat nahi. Message pending me rakho, /start par chala jayega.
+            db.add_leave_recovery_pending(bot_id, member_user.id, chat_id, target_channel_id)
+            log_dm_failure("leave recovery DM", bot_id, member_user.id,
+                           "bot can't initiate conversation with a user", "initiate")
+            return
         if db.is_permanently_unreachable(bot_id, member_user.id):
             logging.info(f"leave recovery skip: user {member_user.id} pehle hi unreachable mark hai")
             return
     except Exception:
         pass
-    leave_cfg = db.get_leave_recovery_config() or {}
-    target_channel_id = leave_cfg.get("target_channel_id")
-    target_link = (leave_cfg.get("target_channel_link") or "").strip()
-    if not leave_cfg.get("enabled") or not target_channel_id or not target_link \
-            or int(target_channel_id) == int(chat_id):
-        return
-    if not (leave_cfg.get("channel_configs") or {}).get(str(chat_id), True):
-        logging.info(f"Leave recovery disabled for channel {chat_id}, skipping.")
-        return
+
     try:
-        await delete_pending_leave_recovery_messages(bot_id, member_user.id, int(target_channel_id), sender)
-        extra = {"source_channel_title": chat_title or str(chat_id), "source_channel_id": chat_id,
-                 "target_channel_link": target_link, "target_channel_id": target_channel_id}
-        leave_messages = leave_cfg.get("messages", [])
-        if not leave_messages and leave_cfg.get("message"):
-            leave_messages = [{"text": leave_cfg["message"], "buttons_json": leave_cfg.get("buttons_json", "")}]
-        if not leave_messages:
-            leave_messages = [{"text": "Hello {first_name}, aap channel se leave ho gaye. Wapas access ke liye neeche wale channel par request bheje.", "buttons_json": ""}]
-        for lm in leave_messages:
-            text = render_dynamic_text(lm.get("text", ""), member_user, extra)
-            lm_buttons = lm.get("buttons_json") or ""
-            if lm_buttons:
-                leave_markup = buttons_to_markup(lm_buttons)
-            else:
-                leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
-            owner_id = (db.get_user_bot(bot_id) or {}).get("user_id") or 0
-            try:
-                sent_ok, sent, err, _ = await _send_leave_message(
-                    bot_id, member_user.id, owner_id, sender,
-                    lambda snd: send_user_message(snd, member_user.id, text,
-                                                  parse_mode=ParseMode.HTML, reply_markup=leave_markup))
-                if not sent_ok:
-                    dm_failure_log_and_mark(bot_id, member_user.id, err, "leave recovery DM")
-                    break
-            except Exception as ex:
-                logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
-                break
-            if sent:
-                db.add_leave_recovery_message(bot_id, member_user.id, chat_id, int(target_channel_id), sent.message_id)
+        status = await send_leave_recovery_messages(bot_id, member_user, chat_id, sender,
+                                                    chat_title, leave_cfg)
     except Exception as ex:
         logging.error(f"Leave recovery DM failed: {mask_secrets(ex)}", exc_info=True)
+        status = "failed"
+    if status in ("initiate", "failed"):
+        try:
+            db.add_leave_recovery_pending(bot_id, member_user.id, chat_id, target_channel_id)
+        except Exception:
+            pass
 
 
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id: str, owner_id: int):
@@ -4308,11 +4603,13 @@ async def _legacy_handle_join_request(update: Update, context: ContextTypes.DEFA
 
     leave_cfg = db.get_leave_recovery_config()
     if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id") and int(leave_cfg["target_channel_id"]) == int(chat.id)):
-        channel_configs = leave_cfg.get("channel_configs", {})
-        chan_key = str(chat.id)
-        chan_enabled = channel_configs.get(chan_key, True)
-        if chan_enabled:
-            await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
+        # Target channel ki join request -> user wapas aa gaya: purane recovery DM delete
+        # karo aur pending recovery DM clear kar do (per-channel toggle se independent).
+        await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
+        try:
+            db.clear_leave_recovery_pending(bot_id, requester.id, int(chat.id))
+        except Exception:
+            pass
         try:
             await jr.approve()
         except Exception as ex:
@@ -4395,81 +4692,6 @@ async def handle_channel_member_update(update: Update, context: ContextTypes.DEF
         return
     await process_member_left(bot_id, member_user, cmu.chat.id,
                               getattr(cmu.chat, "title", None), sender=context.bot)
-    return
-
-    # (purana inline leave-recovery code - ab process_member_left me hai)
-    db.mark_unreachable(bot_id, member_user.id)
-    try:
-        if db.is_permanently_unreachable(bot_id, member_user.id):
-            # Pehle hi block/can't-initiate nikla tha - dobara try karne ka fayda nahi
-            logging.info(f"leave recovery skip: user {member_user.id} pehle hi unreachable mark hai")
-            return
-    except Exception:
-        pass
-    leave_cfg = db.get_leave_recovery_config()
-    target_channel_id = leave_cfg.get("target_channel_id")
-    target_link = (leave_cfg.get("target_channel_link") or "").strip()
-
-    if not leave_cfg.get("enabled") or not target_channel_id or not target_link or int(target_channel_id) == int(cmu.chat.id):
-        return
-
-    channel_configs = leave_cfg.get("channel_configs", {})
-    source_chan_key = str(cmu.chat.id)
-    if not channel_configs.get(source_chan_key, True):
-        logging.info(f"Leave recovery disabled for channel {cmu.chat.id}, skipping.")
-        return
-
-    try:
-        await delete_pending_leave_recovery_messages(bot_id, member_user.id, int(target_channel_id), context.bot)
-        extra = {
-            "source_channel_title": cmu.chat.title or str(cmu.chat.id),
-            "source_channel_id": cmu.chat.id,
-            "target_channel_link": target_link,
-            "target_channel_id": target_channel_id
-        }
-
-        leave_messages = leave_cfg.get("messages", [])
-
-        if not leave_messages and leave_cfg.get("message"):
-            leave_messages = [{"text": leave_cfg["message"], "buttons_json": leave_cfg.get("buttons_json", "")}]
-
-        if not leave_messages:
-            leave_messages = [{"text": "Hello {first_name}, aap channel se leave ho gaye. Wapas access ke liye neeche wale channel par request bheje.", "buttons_json": ""}]
-
-        for lm in leave_messages:
-            text = render_dynamic_text(lm.get("text", ""), member_user, extra)
-            lm_buttons = lm.get("buttons_json") or ""
-            if lm_buttons:
-                leave_markup = buttons_to_markup(lm_buttons)
-            else:
-                leave_markup = InlineKeyboardMarkup([[btn_url("Join Channel", target_link, "success", "🔔")]])
-
-            try:
-                sent = await send_user_message(context.bot, member_user.id, text,
-                                               parse_mode=ParseMode.HTML, reply_markup=leave_markup)
-            except Forbidden as ex:
-                # User ne bot block kiya / DM shuru nahi ho sakti -> aage ke messages bhi
-                # fail honge. Ek hi line log karo (ERROR spam nahi) + yaad rakho.
-                db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
-                logging.warning(f"leave recovery DM skip (user {member_user.id} reachable nahi): "
-                                f"{mask_secrets(ex)}")
-                break
-            except BadRequest as ex:
-                if is_user_gone_error(ex):
-                    db.mark_permanently_unreachable(bot_id, member_user.id, str(ex))
-                    logging.warning(f"leave recovery DM skip (user {member_user.id}): {mask_secrets(ex)}")
-                else:
-                    logging.error(f"leave recovery DM failed for {member_user.id}: {mask_secrets(ex)}")
-                break
-            except (NetworkError, TimedOut) as ex:
-                # Transient - agli member-update par dobara try ho jayega
-                logging.warning(f"leave recovery DM network hiccup (transient): {mask_secrets(ex)}")
-                break
-            if sent:
-                db.add_leave_recovery_message(bot_id, member_user.id, cmu.chat.id, int(target_channel_id), sent.message_id)
-
-    except Exception as ex:
-        logging.error(f"Leave recovery DM failed: {mask_secrets(ex)}", exc_info=True)
 
 
 # ================= USER BOT LIFECYCLE =================
@@ -4676,32 +4898,76 @@ async def send_dm_fallback(bot_id: str, user_id, do_send, *, primary=None, kind:
     return True, None, False
 
 
+def classify_dm_failure(ex) -> str:
+    """DM failure ka type: 'initiate' | 'gone' | 'network' | 'other'.
+
+    * initiate -> user ne bot ko /start nahi kiya (Telegram rule, permanent NAHI)
+    * gone     -> block / deactivated / chat not found (permanent)
+    """
+    if is_dm_initiate_blocked(ex):
+        return "initiate"
+    if is_user_gone_error(ex) or isinstance(ex, Forbidden):
+        return "gone"
+    if isinstance(ex, (NetworkError, TimedOut)):
+        return "network"
+    return "other"
+
+
+def record_dm_failure(bot_id: str, user_id, ex) -> str:
+    """DM failure ek hi jagah DB me likho (broadcast + leave recovery + welcome sab).
+
+    Return: classification ('initiate' | 'gone' | 'network' | 'other').
+    """
+    kind = classify_dm_failure(ex)
+    try:
+        if kind in ("initiate", "gone"):
+            db.mark_unreachable(bot_id, user_id)
+        if kind == "initiate":
+            # SOFT mark - user ke /start karte hi mark_reachable() ise hata deta hai.
+            db.mark_initiate_blocked(bot_id, user_id, str(ex))
+        elif kind == "gone":
+            db.mark_permanently_unreachable(bot_id, user_id, str(ex))
+    except Exception as ex2:
+        logging.debug(f"record_dm_failure: {mask_secrets(ex2)}")
+    return kind
+
+
+def log_dm_failure(kind_label: str, bot_id: str, user_id, ex, kind: str) -> None:
+    """DM failure ki ek line - level classification ke hisaab se.
+
+    'initiate' normal Telegram rule hai (bug nahi), isliye INFO - aur ek hi user ke
+    liye baar-baar nahi chhapta (warna log bhar jata hai, yehi user ke log me dikh
+    raha tha). Hard failures WARNING rehte hain.
+    """
+    if kind == "network":
+        logging.warning(f"{kind_label} network hiccup (transient): {mask_secrets(ex)}")
+        return
+    if kind == "initiate":
+        key = (bot_id, user_id)
+        if len(_DM_INITIATE_WARNED) > 5000:
+            _DM_INITIATE_WARNED.clear()
+        if key in _DM_INITIATE_WARNED:
+            return
+        _DM_INITIATE_WARNED.add(key)
+        logging.info(f"{kind_label} skip (user {user_id}): user ne bot ko /start nahi kiya, "
+                     f"isliye bot DM shuru nahi kar sakta. User /start karega to pending "
+                     f"message apne aap chala jayega ({mask_secrets(ex)})")
+        return
+    if kind == "gone":
+        logging.warning(f"{kind_label} skip (user {user_id} reachable nahi): "
+                        f"{type(ex).__name__}: {mask_secrets(ex)}")
+        return
+    logging.error(f"{kind_label} error: {type(ex).__name__}: {mask_secrets(ex)}")
+
+
 def dm_failure_log_and_mark(bot_id: str, user_id, ex, kind: str) -> bool:
-    """Ek jagah DM failure ka faisla: log + (permanent) unreachable marking.
+    """Ek jagah DM failure ka faisla: log + unreachable marking.
 
     Return True = caller yahin ruk jaye (aage ke messages bhejne ka fayda nahi).
     """
-    if isinstance(ex, (NetworkError, TimedOut)):
-        logging.warning(f"{kind} network hiccup (transient): {mask_secrets(ex)}")
-        return True
-    if is_dm_initiate_blocked(ex):
-        # Bot DM shuru nahi kar sakta (user ne /start nahi kiya). Permanent mark NAHI
-        # karte: user ke /start karte hi ye DM ja sakti hai.
-        db.mark_unreachable(bot_id, user_id)
-        key = (bot_id, user_id, "initiate")
-        if key not in _DM_INITIATE_WARNED:
-            _DM_INITIATE_WARNED.add(key)
-            logging.warning(f"{kind} skip (user {user_id}): {mask_secrets(ex)} - "
-                            f"user ne bot ko /start nahi kiya (user /start kare to DM ja sakti hai)")
-        return True
-    if is_user_gone_error(ex) or isinstance(ex, Forbidden):
-        db.mark_unreachable(bot_id, user_id)
-        db.mark_permanently_unreachable(bot_id, user_id, str(ex))
-        logging.warning(f"{kind} skip (user {user_id} reachable nahi): "
-                        f"{type(ex).__name__}: {mask_secrets(ex)}")
-        return True
-    logging.error(f"{kind} error: {type(ex).__name__}: {mask_secrets(ex)}")
-    return False
+    failure = record_dm_failure(bot_id, user_id, ex)
+    log_dm_failure(kind, bot_id, user_id, ex, failure)
+    return failure in ("initiate", "gone", "network")
 
 
 def is_account_running(bot_id: str) -> bool:
@@ -5019,6 +5285,7 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
     sent = 0
     fail = 0
     gone = 0
+    pending = 0
     degraded = 0
     reasons: Dict[str, int] = {}
     for r in reqs:
@@ -5029,14 +5296,21 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
             if status == "degraded":
                 degraded += 1
         except Forbidden as ex:
-            gone += 1
-            db.mark_unreachable(bot_id, r)
-            db.mark_permanently_unreachable(bot_id, r, str(ex))
-        except BadRequest as ex:
-            if is_user_gone_error(ex):
+            # "bot can't initiate conversation" (user ne /start nahi kiya) permanent nahi
+            # hai - use soft mark milta hai aur wo audience me wapas aa jata hai jab user
+            # /start kare. Pehle yahi bug tha: aise users hamesha ke liye drop ho jate the.
+            if record_dm_failure(bot_id, r, ex) == "initiate":
+                pending += 1
+                log_dm_failure("user broadcast", bot_id, r, ex, "initiate")
+            else:
                 gone += 1
-                db.mark_unreachable(bot_id, r)
-                db.mark_permanently_unreachable(bot_id, r, str(ex))
+        except BadRequest as ex:
+            failure = record_dm_failure(bot_id, r, ex)
+            if failure == "initiate":
+                pending += 1
+                log_dm_failure("user broadcast", bot_id, r, ex, failure)
+            elif failure == "gone":
+                gone += 1
             else:
                 fail += 1
                 key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
@@ -5061,7 +5335,7 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
         logging.warning(f"user broadcast {bot_id}: {fail} failed — " +
                         ", ".join(f"{k} x{v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]))
     logging.info(f"user broadcast {bot_id}: sent={sent} unreachable={gone} failed={fail} "
-                 f"media_issues={degraded}")
+                 f"media_issues={degraded}" + (f" start_baaki={pending}" if pending else ""))
     await safe_edit_message_text(q, UIFormatter.broadcast_confirm(sent, fail), parse_mode=ParseMode.HTML, reply_markup=bot_management_kb(bot_id, owner_id))
     context.user_data.pop(f"broadcast_draft_{bot_id}", None)
 
@@ -5423,6 +5697,79 @@ async def start_all_userbots(q):
 
 
 # ================= LEAVE RECOVERY =================
+LEAVE_CHAN_PAGE_SIZE = 8
+
+
+def leave_recovery_all_channels() -> List[Tuple[str, str]]:
+    """Saare bots ke saare channels: [(channel_id_str, title), ...] (dedupe + sorted).
+
+    Pehle panel sirf pehle 20 channels dikhata tha (`[:20]`), isliye baaki channels
+    list me aate hi nahi the - ab poori list aati hai (pagination ke saath).
+    """
+    found: Dict[str, str] = {}
+    try:
+        bots = db.get_all_user_bots() or []
+    except Exception as ex:
+        logging.warning(f"leave recovery channels list fail: {mask_secrets(ex)}")
+        return []
+    for bot in bots:
+        bot_id = bot.get("bot_id") if isinstance(bot, dict) else None
+        if not bot_id:
+            continue
+        try:
+            channels = db.get_bot_channels(bot_id) or []
+        except Exception:
+            continue
+        for ch in channels:
+            try:
+                cid = str(int(ch["channel_id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            title = (ch.get("channel_title") or ch.get("channel_username") or cid)
+            found.setdefault(cid, str(title))
+    return sorted(found.items(), key=lambda kv: (kv[1] or "").lower())
+
+
+def leave_recovery_on_channels(cfg: Optional[dict] = None) -> List[str]:
+    """Jo channels admin ne khud ON kiye hain (default sab OFF hai)."""
+    cfg = cfg or db.get_leave_recovery_config()
+    channel_configs = cfg.get("channel_configs") or {}
+    return [str(cid) for cid, val in channel_configs.items() if val]
+
+
+def leave_recovery_set_all(enabled: bool) -> int:
+    """Saare known channels ko ek saath ON/OFF karo. Return: kitne channels chhue."""
+    cfg = db.get_leave_recovery_config()
+    channel_configs = {str(k): bool(v) for k, v in (cfg.get("channel_configs") or {}).items()}
+    ids = {cid for cid, _ in leave_recovery_all_channels()}
+    ids.update(channel_configs)
+    for cid in ids:
+        channel_configs[str(cid)] = bool(enabled)
+    cfg["channel_configs"] = channel_configs
+    db.set_leave_recovery_config(cfg)
+    return len(ids)
+
+
+def migrate_leave_recovery_default_off() -> int:
+    """One-time: purane config me jo bhi channel ON tha, use OFF kar do.
+
+    Pehle default ON tha (config me channel na ho to ON maana jata tha), isliye purane
+    bots bina puche DM bhej rahe the. Ab default OFF hai - aur ye migration purane
+    ON channels ko bhi ek baar OFF kar deta hai, taaki admin khud decide kare.
+    """
+    try:
+        if db.get_setting("leave_recovery_default_off_v1"):
+            return 0
+    except Exception:
+        return 0
+    try:
+        changed = leave_recovery_set_all(False)
+        db.set_setting("leave_recovery_default_off_v1", True)
+        return changed
+    except Exception as ex:
+        logging.warning(f"leave recovery default-off migration skip: {mask_secrets(ex)}")
+        return 0
+
 
 def leave_recovery_status_text() -> str:
     cfg = db.get_leave_recovery_config()
@@ -5432,11 +5779,21 @@ def leave_recovery_status_text() -> str:
     messages = cfg.get("messages", [])
     msg_count = len(messages)
 
-    channel_configs = cfg.get("channel_configs", {})
+    all_channels = dict(leave_recovery_all_channels())
+    on_ids = leave_recovery_on_channels(cfg)
+    total_channels = len(all_channels)
     chan_lines = []
-    for cid, enabled in channel_configs.items():
-        chan_lines.append(f"  • <code>{cid}</code> → {'🟢 ON' if enabled else '🔴 OFF'}")
-    chan_text = "\n".join(chan_lines) if chan_lines else "  (Global setting applies to all)"
+    for cid in on_ids[:8]:
+        title = all_channels.get(cid, "")
+        chan_lines.append(f"  🟢 <code>{cid}</code> {EmojiManager._html_escape(title)[:30]}".rstrip())
+    if len(on_ids) > 8:
+        chan_lines.append(f"  … +{len(on_ids) - 8} more ON")
+    if not chan_lines:
+        chan_lines.append("  🔴 Sab channels OFF hain — jis channel par chahiye use "
+                          "Per-Channel Settings me ON karo.")
+    chan_text = "\n".join(chan_lines)
+    chan_counts = (f"total {total_channels} | 🟢 ON {len(on_ids)} | "
+                   f"🔴 OFF {max(0, total_channels - len(on_ids))}")
 
     msgs_preview = ""
     for i, m in enumerate(messages[:3]):
@@ -5454,7 +5811,8 @@ def leave_recovery_status_text() -> str:
         f"<b>Target Channel ID:</b> <code>{target_id}</code>\n"
         f"<b>Target Link:</b> {EmojiManager._html_escape(str(link))}\n\n"
         f"<b>Messages ({msg_count}):</b>{msgs_preview}\n\n"
-        f"<b>Per-Channel Config:</b>\n{chan_text}\n\n"
+        f"<b>Per-Channel Config:</b> {chan_counts}\n"
+        f"<i>Default: 🔴 OFF (jab tak khud ON na karo)</i>\n{chan_text}\n\n"
         f"<i>Global setting. All userbots use this config.</i>"
     )
 
@@ -5489,23 +5847,55 @@ def leave_recovery_msgs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def leave_recovery_channels_kb() -> InlineKeyboardMarkup:
+def leave_recovery_channels_text(page: int = 0) -> str:
+    channels = leave_recovery_all_channels()
+    on_ids = set(leave_recovery_on_channels())
+    total = len(channels)
+    pages = max(1, (total + LEAVE_CHAN_PAGE_SIZE - 1) // LEAVE_CHAN_PAGE_SIZE)
+    page = max(0, min(int(page or 0), pages - 1))
+    on_count = len(on_ids)
+    return (
+        f"<blockquote>{pp('⚙️')} <b>PER-CHANNEL LEAVE RECOVERY</b></blockquote>\n\n"
+        f"Jis channel par leave-recovery chahiye usko <b>ON</b> karo (tap = toggle).\n"
+        f"🟢 = ON   |   🔴 = OFF\n\n"
+        f"<b>Total:</b> {total} channels | 🟢 ON: {on_count} | 🔴 OFF: {total - on_count}\n\n"
+        f"<i>Default sab channels OFF hain.</i>\n"
+        f"<i>Page {page + 1}/{pages}</i>"
+    )
+
+
+def leave_recovery_channels_kb(page: int = 0) -> InlineKeyboardMarkup:
     cfg = db.get_leave_recovery_config()
-    channel_configs = cfg.get("channel_configs", {})
-    all_channels = {}
-    for bot in db.get_all_user_bots():
-        for ch in db.get_bot_channels(bot["bot_id"]):
-            cid = str(ch["channel_id"])
-            all_channels[cid] = ch.get("channel_title", cid)
+    channel_configs = cfg.get("channel_configs") or {}
+    channels = leave_recovery_all_channels()
+    total = len(channels)
+    pages = max(1, (total + LEAVE_CHAN_PAGE_SIZE - 1) // LEAVE_CHAN_PAGE_SIZE)
+    page = max(0, min(int(page or 0), pages - 1))
+    start = page * LEAVE_CHAN_PAGE_SIZE
+    page_items = channels[start:start + LEAVE_CHAN_PAGE_SIZE]
 
     rows = []
-    for cid, title in list(all_channels.items())[:20]:
-        enabled = channel_configs.get(cid, True)
+    for cid, title in page_items:
+        # Default OFF - sirf wahi channel ON hai jise admin ne khud ON kiya ho.
+        enabled = bool(channel_configs.get(cid, False))
         status_icon = "🟢" if enabled else "🔴"
-        rows.append([btn(f"{status_icon} {title[:25]}", f"admin_leave_chan_toggle_{cid}", "primary", "⚙️")])
+        rows.append([btn(f"{status_icon} {title[:25]}", f"admin_leave_chan_toggle_{cid}",
+                         "success" if enabled else "primary", "⚙️")])
 
     if not rows:
         rows.append([btn("No channels found", "admin_leave_channels", "primary", "❌")])
+
+    rows.append([btn("🔴 Sab OFF", "admin_leave_all_off", "danger", "🛑"),
+                 btn("🟢 Sab ON", "admin_leave_all_on", "success", "✅")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("⬅️ Prev", f"admin_leave_chan_page_{page - 1}", "primary", "⬅️"))
+        nav.append(btn(f"{page + 1}/{pages}", "admin_leave_channels", "primary", "📄"))
+        if page < pages - 1:
+            nav.append(btn("Next ➡️", f"admin_leave_chan_page_{page + 1}", "primary", "➡️"))
+        rows.append(nav)
 
     rows.append([btn("Back", "admin_leave_recovery", "primary", "🔙")])
     return InlineKeyboardMarkup(rows)
@@ -5863,7 +6253,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             await safe_edit_message_text(q,
                 f"<blockquote>{pp('🔘')} <b>BUTTONS FOR MESSAGE #{idx+1}</b></blockquote>\n\n"
-                "<b>Add Button</b> = easy tarika (naam → link → same row / new row)\n"
+                "<b>Add Button</b> = easy tarika (naam → link → color → same row / new row)\n"
                 "<b>Paste Many</b> = bulk format (premium emoji supported)\n"
                 "<code>Button Label|https://link</code>\n"
                 "<code>Label1|https://url1 || Label2|https://url2</code>",
@@ -5873,13 +6263,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_leave_channels":
             if not is_admin(uid):
                 return
-            await safe_edit_message_text(q,
-                f"<blockquote>{pp('⚙️')} <b>PER-CHANNEL LEAVE RECOVERY</b></blockquote>\n\n"
-                "Toggle leave recovery ON/OFF for each channel.\n"
-                "🟢 = Leave recovery active for this channel\n"
-                "🔴 = Leave recovery disabled for this channel\n\n"
-                "<i>By default all channels are ON.</i>",
-                parse_mode=ParseMode.HTML, reply_markup=leave_recovery_channels_kb())
+            await safe_edit_message_text(q, leave_recovery_channels_text(0),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(0))
+            return
+
+        if data.startswith("admin_leave_chan_page_"):
+            if not is_admin(uid):
+                return
+            try:
+                page = int(data.replace("admin_leave_chan_page_", ""))
+            except ValueError:
+                page = 0
+            await safe_edit_message_text(q, leave_recovery_channels_text(page),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(page))
             return
 
         if data.startswith("admin_leave_chan_toggle_"):
@@ -5888,20 +6286,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chan_id = data.replace("admin_leave_chan_toggle_", "")
             cfg = db.get_leave_recovery_config()
             channel_configs = cfg.get("channel_configs", {})
-            current = channel_configs.get(chan_id, True)
+            current = bool(channel_configs.get(chan_id, False))   # default OFF
             channel_configs[chan_id] = not current
             cfg["channel_configs"] = channel_configs
             db.set_leave_recovery_config(cfg)
-            new_status = "🟢 ON" if not current else "🔴 OFF"
-            await safe_edit_message_text(q,
-                f"{pe('✅')} Channel <code>{chan_id}</code> leave recovery set to <b>{new_status}</b>",
-                parse_mode=ParseMode.HTML, reply_markup=leave_recovery_channels_kb())
+            # Toggle ke baad usi page par wapas (channel list me apni jagah rehne de)
+            channels = [cid for cid, _ in leave_recovery_all_channels()]
+            try:
+                page = channels.index(chan_id) // LEAVE_CHAN_PAGE_SIZE
+            except ValueError:
+                page = 0
+            await safe_edit_message_text(q, leave_recovery_channels_text(page),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(page))
+            return
+
+        if data in ("admin_leave_all_off", "admin_leave_all_on"):
+            if not is_admin(uid):
+                return
+            enabled = data == "admin_leave_all_on"
+            try:
+                count = leave_recovery_set_all(enabled)
+            except Exception as ex:
+                count = 0
+                logging.error(f"leave recovery all-{'on' if enabled else 'off'} fail: {mask_secrets(ex)}")
+            logging.info(f"leave recovery: {count} channels ko {'ON' if enabled else 'OFF'} kiya "
+                         f"(admin {uid})")
+            await safe_edit_message_text(q, leave_recovery_channels_text(0),
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=leave_recovery_channels_kb(0))
             return
 
         if data == "admin_leave_clear_pending":
             if not is_admin(uid):
                 return
             db._execute("UPDATE leave_recovery_messages SET deleted_at=now() WHERE deleted_at IS NULL")
+            try:
+                queued = db.clear_all_leave_recovery_pending()
+            except Exception as ex:
+                queued = 0
+                logging.warning(f"pending leave recovery clear skip: {mask_secrets(ex)}")
+            logging.info(f"leave recovery: pending records clear kiye (queued DMs: {queued}, admin {uid})")
             await show_leave_recovery_panel(q)
             return
 
@@ -6180,6 +6605,7 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
         bot_sent = 0
         bot_fail = 0
         bot_gone = 0
+        bot_pending = 0
         bot_degraded = 0
         reasons: Dict[str, int] = {}
         # Media main bot ne receive ki hoti hai -> is userbot ke liye refs translate karo
@@ -6197,15 +6623,20 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
                     bot_degraded += 1
                 db.mark_reachable(bot_id, r)
             except Forbidden as ex:
-                # blocked by user / "Bot can't initiate conversation with a user"
-                bot_gone += 1
-                db.mark_unreachable(bot_id, r)
-                db.mark_permanently_unreachable(bot_id, r, str(ex))
-            except BadRequest as ex:
-                if is_user_gone_error(ex):
+                # "bot can't initiate conversation" (user ne /start nahi kiya) permanent
+                # nahi hai -> soft mark. Baaki Forbidden (block etc.) permanent hai.
+                if record_dm_failure(bot_id, r, ex) == "initiate":
+                    bot_pending += 1
+                    log_dm_failure("admin broadcast", bot_id, r, ex, "initiate")
+                else:
                     bot_gone += 1
-                    db.mark_unreachable(bot_id, r)
-                    db.mark_permanently_unreachable(bot_id, r, str(ex))
+            except BadRequest as ex:
+                failure = record_dm_failure(bot_id, r, ex)
+                if failure == "initiate":
+                    bot_pending += 1
+                    log_dm_failure("admin broadcast", bot_id, r, ex, failure)
+                elif failure == "gone":
+                    bot_gone += 1
                 else:
                     bot_fail += 1
                     key = "media error" if is_media_error(ex) else f"BadRequest: {mask_secrets(ex)[:60]}"
@@ -6227,7 +6658,8 @@ async def send_admin_broadcast(q, context: ContextTypes.DEFAULT_TYPE):
                             ", ".join(f"{k} x{v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]))
         logging.info(f"admin broadcast {bot_id}: recipients={len(recipients)} sent={bot_sent} "
                      f"unreachable={bot_gone} failed={bot_fail} media_issues={bot_degraded} "
-                     f"media_translated={media_translated}")
+                     f"media_translated={media_translated}"
+                     + (f" start_baaki={bot_pending}" if bot_pending else ""))
         total_sent += bot_sent
         total_fail += bot_gone + bot_fail
         per_bot_lines.append(f"• @{bot.get('bot_username') or bot_id}: {bot_sent} sent, "
@@ -6665,6 +7097,17 @@ async def main():
                          f"marks saaf kiye - user ke /start karne par inhe DM ja sakti hai")
     except Exception as ex:
         logging.warning(f"unreachable cleanup skip: {mask_secrets(ex)}")
+
+    # Leave recovery ab har channel par default OFF hai (pehle default ON tha). Ek baar
+    # purane ON channels ko bhi OFF kar do, phir admin khud jis channel par chahiye ON kare.
+    try:
+        turned_off = migrate_leave_recovery_default_off()
+        if turned_off:
+            logging.info(f"{pp('🔕')} Leave recovery: {turned_off} channels OFF kar diye "
+                         f"(naya default OFF - Admin Panel -> Leave Recovery -> Per-Channel "
+                         f"Settings se ON karo)")
+    except Exception as ex:
+        logging.warning(f"leave recovery default-off migration skip: {mask_secrets(ex)}")
 
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:
